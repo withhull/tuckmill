@@ -258,9 +258,9 @@ fn build(cfg: &SyntheticConfig) -> Result<Vec<u8>> {
     token_types.push(KV::I32(3));
     tokens.push(KV::Str("<|pad|>".into()));
     token_types.push(KV::I32(3));
-    let bos_id = (cfg.vocab - 3) as u32;
-    let eos_id = (cfg.vocab - 2) as u32;
-    let pad_id = (cfg.vocab - 1) as u32;
+    let bos_id = cfg.vocab - 3;
+    let eos_id = cfg.vocab - 2;
+    let pad_id = cfg.vocab - 1;
 
     kvs.push(("tokenizer.ggml.tokens".into(), KV::Array(8, tokens)));
     kvs.push((
