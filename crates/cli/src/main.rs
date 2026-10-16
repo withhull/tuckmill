@@ -1,0 +1,239 @@
+//! Tuckmill command line interface.
+//!
+//! Exit codes: 0 success, 1 typed failure (printed to stderr with a safe next
+//! action), 2 usage error (clap), 130 interrupted.
+//! Data goes to stdout; diagnostics go to stderr.
+
+mod commands;
+
+use std::path::PathBuf;
+use std::process::ExitCode;
+use std::sync::atomic::{AtomicBool, Ordering};
+
+use clap::{Parser, Subcommand};
+
+use tuckmill_manifest::error::TuckmillError;
+
+/// Set by the SIGINT handler.
+pub static INTERRUPTED: AtomicBool = AtomicBool::new(false);
+
+extern "C" fn handle_sigint(_sig: libc::c_int) {
+    INTERRUPTED.store(true, Ordering::SeqCst);
+    if let Some(flag) = commands::serve_shutdown_flag() {
+        flag.store(true, Ordering::SeqCst);
+    }
+}
+
+pub fn install_sigint_handler() {
+    // SAFETY: installing a signal handler for SIGINT with a function that
+    // only performs atomic stores (async-signal-safe).
+    unsafe {
+        libc::signal(libc::SIGINT, handle_sigint as *const () as usize);
+    }
+}
+
+#[derive(Parser, Debug)]
+#[command(
+    name = "tuckmill",
+    version,
+    about = "Big models. Small footprint. Local-first model inference for Apple Silicon (uncertified engineering build).",
+    propagate_version = true
+)]
+struct Cli {
+    /// Machine-readable JSON output on stdout.
+    #[arg(long, global = true)]
+    json: bool,
+
+    /// Data directory (defaults to ~/Library/Application Support/Tuckmill).
+    #[arg(long, global = true, env = "TUCKMILL_DATA_DIR", hide_env_values = true)]
+    data_dir: Option<PathBuf>,
+
+    #[command(subcommand)]
+    cmd: Cmd,
+}
+
+#[derive(Subcommand, Debug)]
+enum Cmd {
+    /// Report chip, memory, OS, backends, storage, and missing requirements.
+    Doctor {
+        /// Run the explicit, bounded storage probe (writes a temporary file
+        /// under the data directory; never reads personal files).
+        #[arg(long)]
+        probe_storage: bool,
+    },
+
+    /// Inspect a model artifact without loading weights.
+    Inspect {
+        /// Path to a .gguf or .safetensors file.
+        path: PathBuf,
+    },
+
+    /// Import a local artifact into the managed store (validated, atomic).
+    Import {
+        path: PathBuf,
+        /// Register an alias for the imported artifact.
+        #[arg(long)]
+        alias: Option<String>,
+        /// License note recorded with the artifact (not a license review).
+        #[arg(long)]
+        license: Option<String>,
+        /// Source revision note recorded with the artifact.
+        #[arg(long)]
+        revision: Option<String>,
+    },
+
+    /// Pack an imported artifact into the bounded, layout-preserving format.
+    Pack {
+        /// Alias or artifact id.
+        model: String,
+    },
+
+    /// Produce an execution plan or a typed infeasibility explanation.
+    Plan {
+        /// Alias or artifact id.
+        model: String,
+        /// Requested process budget, e.g. 2GiB or 3GiB (binary units).
+        #[arg(long, default_value = "2GiB")]
+        memory_budget: String,
+        /// Total sequence allowance in tokens, including output.
+        #[arg(long, default_value_t = 2048)]
+        context: u64,
+        /// Maximum output tokens (part of --context).
+        #[arg(long, default_value_t = 256)]
+        max_output: u64,
+    },
+
+    /// Run one generation request.
+    Run {
+        /// Alias or artifact id.
+        model: String,
+        /// Prompt text (reads stdin when omitted).
+        #[arg(long)]
+        prompt: Option<String>,
+        #[arg(long, default_value = "2GiB")]
+        memory_budget: String,
+        #[arg(long, default_value_t = 2048)]
+        context: u64,
+        #[arg(long, default_value_t = 256)]
+        max_output: u64,
+        /// Accept the reference test engine (synthetic output; executes no
+        /// model weights). Without this flag, non-certified profiles are
+        /// refused.
+        #[arg(long)]
+        allow_test_engine: bool,
+        /// Engine placement: isolated (worker process, default) or
+        /// in-process (debugging only).
+        #[arg(long, default_value = "isolated")]
+        engine: String,
+        /// Suppress state messages on stderr.
+        #[arg(long)]
+        quiet: bool,
+    },
+
+    /// Serve the local API on loopback.
+    Serve {
+        #[arg(long, default_value_t = tuckmill_supervisor::api::DEFAULT_PORT)]
+        port: u16,
+        /// Accept the reference test engine for incoming requests.
+        #[arg(long)]
+        allow_test_engine: bool,
+        #[arg(long, default_value = "isolated")]
+        engine: String,
+        /// Start and exit immediately (used by tests to validate binding).
+        #[arg(long, hide = true)]
+        probe_only: bool,
+    },
+
+    /// Verify equivalence: identical token IDs through resident and
+    /// forced-streaming tuckcore configurations, comparing teacher-forced
+    /// logits and generated text (ADR-005).
+    Verify {
+        /// Alias or artifact id.
+        model: String,
+        #[arg(long, default_value = "2GiB")]
+        memory_budget: String,
+        #[arg(long, default_value_t = 2048)]
+        context: u64,
+        /// Number of deterministic token ids scored per side.
+        #[arg(long, default_value_t = 6)]
+        positions: u64,
+        /// Tokens generated per side for text equality.
+        #[arg(long, default_value_t = 8)]
+        generate: u64,
+    },
+
+    /// Run the standard benchmark suite and write a machine-readable record.
+    Bench {
+        /// Alias or artifact id.
+        model: String,
+        #[arg(long, default_value = "standard-v1")]
+        suite: String,
+        #[arg(long, default_value_t = 512)]
+        input: u32,
+        #[arg(long, default_value_t = 256)]
+        output: u32,
+        #[arg(long, default_value_t = 3)]
+        repetitions: u32,
+        #[arg(long, default_value = "2GiB")]
+        memory_budget: String,
+        #[arg(long, default_value_t = 2048)]
+        context: u64,
+        #[arg(long)]
+        allow_test_engine: bool,
+        /// Backend selection: reference-test (default) or tuckcore.
+        #[arg(long, default_value = "isolated")]
+        engine: String,
+    },
+
+    /// Cache inventory and garbage collection.
+    Cache {
+        #[command(subcommand)]
+        cmd: CacheCmd,
+    },
+
+    /// Internal: serve an inference backend over the framed protocol on a
+    /// private socket.
+    #[command(name = "__worker-reference", hide = true)]
+    WorkerReference {
+        #[arg(long)]
+        socket: PathBuf,
+        /// Backend: reference-test or tuckcore.
+        #[arg(long, default_value = "reference-test")]
+        engine: String,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum CacheCmd {
+    /// Show installed artifacts and reclaimable space.
+    List,
+    /// Remove derived, inactive data (never artifacts or source files).
+    Prune {
+        #[arg(long)]
+        dry_run: bool,
+    },
+}
+
+fn main() -> ExitCode {
+    install_sigint_handler();
+    let cli = Cli::parse();
+    match commands::dispatch(&cli.cmd, cli.json, cli.data_dir.as_deref()) {
+        Ok(code) => code,
+        Err(e) => {
+            print_error(&e, cli.json);
+            ExitCode::from(1)
+        }
+    }
+}
+
+fn print_error(e: &TuckmillError, json: bool) {
+    if json {
+        eprintln!(
+            "{}",
+            serde_json::to_string_pretty(&e.to_json()).unwrap_or_else(|_| e.to_string())
+        );
+    } else {
+        eprintln!("error[{}]: {}", e.code(), e.message());
+        eprintln!("  next: {}", e.action());
+    }
+}

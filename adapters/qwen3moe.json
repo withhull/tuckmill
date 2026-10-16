@@ -1,0 +1,51 @@
+{
+  "schema_version": 1,
+  "id": "qwen3moe",
+  "display_name": "Qwen3 MoE (GGUF)",
+  "family": "qwen3",
+  "architecture": "qwen3moe",
+  "traits": {
+    "dense": false,
+    "moe": true,
+    "hybrid_linear_attention": false,
+    "ternary_quantized": false
+  },
+  "status": "specified",
+  "certification": {
+    "state": "unmeasured",
+    "notes": [
+      "Stage G: native-router MoE streaming after the small-model executor is stable.",
+      "Routing must always be the target's native configuration; a predicted expert may be prefetched but never replaces the router decision."
+    ]
+  },
+  "required_kernels": ["K01", "K02", "K03", "K08"],
+  "required_transforms": [],
+  "metadata_requirements": [
+    { "key": "general.architecture", "kind": "string", "required": true },
+    { "key": "qwen3moe.block_count", "kind": "u32", "required": true },
+    { "key": "qwen3moe.context_length", "kind": "u32", "required": true },
+    { "key": "qwen3moe.embedding_length", "kind": "u32", "required": true },
+    { "key": "qwen3moe.attention.head_count", "kind": "u32", "required": true },
+    { "key": "qwen3moe.attention.head_count_kv", "kind": "u32", "required": true },
+    { "key": "qwen3moe.feed_forward_length", "kind": "u32", "required": true },
+    { "key": "qwen3moe.expert_count", "kind": "u32", "required": true },
+    { "key": "qwen3moe.expert_used_count", "kind": "u32", "required": true },
+    { "key": "tokenizer.ggml.tokens", "kind": "array", "required": true }
+  ],
+  "kv": {
+    "layers_key": "qwen3moe.block_count",
+    "head_count_key": "qwen3moe.attention.head_count",
+    "kv_head_count_key": "qwen3moe.attention.head_count_kv",
+    "embedding_key": "qwen3moe.embedding_length",
+    "key_length_key": "qwen3moe.attention.key_length",
+    "value_length_key": "qwen3moe.attention.value_length"
+  },
+  "expert_meta": {
+    "count_key": "qwen3moe.expert_count",
+    "used_key": "qwen3moe.expert_used_count"
+  },
+  "notes": [
+    "Prefill touches many experts (union per microbatch); first-token latency is measured separately from decode.",
+    "FR-06 (stream every required expert) gates any MoE-streaming certification."
+  ]
+}

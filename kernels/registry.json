@@ -1,0 +1,103 @@
+{
+  "schema_version": 1,
+  "revision_note": "Work packages K01-K09 from PRD v0.2 section 11.3. Statuses reflect this build: nothing is implemented yet. A kernel must never be selected before its correctness gate passes; every selection retains a validated reference fallback decision.",
+  "kernels": [
+    {
+      "id": "K01",
+      "name": "Q8/Q4 packed matrix-vector decode",
+      "status": "specified",
+      "reference_fallback": true,
+      "gates": [
+        "exact format/scale decoding",
+        "bounded tiles, no full dequantized matrix",
+        "per-operation error checks registered before tuning"
+      ]
+    },
+    {
+      "id": "K02",
+      "name": "Shape-specific prompt matrix multiplication",
+      "status": "specified",
+      "reference_fallback": true,
+      "gates": [
+        "same projection semantics as reference",
+        "microbatch size recorded in plan",
+        "no unbounded prompt workspace"
+      ]
+    },
+    {
+      "id": "K03",
+      "name": "RMSNorm, activation and residual fusion",
+      "status": "specified",
+      "reference_fallback": true,
+      "gates": [
+        "epsilon, operation dependencies and rounding profile preserved",
+        "no approximate activation substitution"
+      ]
+    },
+    {
+      "id": "K04",
+      "name": "Ternary PQ2_0 / PTQ1_0 projection and embedding kernels",
+      "status": "specified",
+      "reference_fallback": true,
+      "gates": [
+        "native code and scale handling",
+        "group alignment and transform metadata enforced",
+        "malformed trits rejected"
+      ]
+    },
+    {
+      "id": "K05",
+      "name": "Hadamard/sign transforms and safe fusion",
+      "status": "specified",
+      "reference_fallback": true,
+      "gates": [
+        "normalization, sign vector, block size, direction, rounding matched",
+        "whole rotation block processed"
+      ]
+    },
+    {
+      "id": "K06",
+      "name": "Capability-compatible arithmetic (BF16/F16/F32)",
+      "status": "specified",
+      "reference_fallback": true,
+      "gates": [
+        "stored bits and defined conversion/rounding preserved",
+        "software BF16 conversion where hardware lacks it",
+        "no silent FP16 substitute"
+      ]
+    },
+    {
+      "id": "K07",
+      "name": "Hybrid linear-attention/state kernels",
+      "status": "specified",
+      "reference_fallback": true,
+      "gates": [
+        "recurrent precision and update order preserved",
+        "full prefill, chunked prefill and decode consistency proven",
+        "state rollback machinery before any speculation"
+      ]
+    },
+    {
+      "id": "K08",
+      "name": "Attention/KV and MoE dispatch",
+      "status": "specified",
+      "reference_fallback": true,
+      "gates": [
+        "positions, masks and native expert set preserved",
+        "bounded state and dispatch lifetime",
+        "MoE routing uses the target's native configuration only"
+      ]
+    },
+    {
+      "id": "K09",
+      "name": "Verified candidate-block evaluation",
+      "status": "specified",
+      "reference_fallback": true,
+      "gates": [
+        "added only after K01-K08 as applicable",
+        "correct sampling/rollback",
+        "committed tokens only; drafts never presented as final"
+      ]
+    }
+  ]
+}

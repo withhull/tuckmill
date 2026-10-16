@@ -1,0 +1,20 @@
+[package]
+name = "tuckmill-store"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Tuckmill artifact store: imports, controlled downloads, packing, and cache lifecycle"
+
+[dependencies]
+tuckmill-manifest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+libc.workspace = true
+
+[dev-dependencies]
+tempfile = "3"
+
+[lints]
+workspace = true

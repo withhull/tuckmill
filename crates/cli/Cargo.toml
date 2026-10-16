@@ -1,0 +1,29 @@
+[package]
+name = "tuckmill-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Tuckmill command line interface"
+
+[[bin]]
+name = "tuckmill"
+path = "src/main.rs"
+
+[dependencies]
+tuckmill-manifest.workspace = true
+tuckmill-backend.workspace = true
+tuckmill-planner.workspace = true
+tuckmill-store.workspace = true
+tuckmill-supervisor.workspace = true
+clap = { workspace = true, features = ["derive", "env"] }
+serde.workspace = true
+serde_json.workspace = true
+libc.workspace = true
+
+[dev-dependencies]
+tempfile = "3"
+serde.workspace = true
+
+[lints]
+workspace = true

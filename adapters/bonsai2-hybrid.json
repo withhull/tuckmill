@@ -1,0 +1,46 @@
+{
+  "schema_version": 1,
+  "id": "bonsai2-hybrid",
+  "display_name": "PrismML Bonsai 2 ternary hybrid (GGUF)",
+  "family": "qwen3.5",
+  "architecture": "bonsai2",
+  "traits": {
+    "dense": false,
+    "moe": true,
+    "hybrid_linear_attention": true,
+    "ternary_quantized": true
+  },
+  "status": "specified",
+  "certification": {
+    "state": "unmeasured",
+    "notes": [
+      "The artifact is a complete execution contract: compact codes require matching activation transforms and higher-precision sensitive tensors.",
+      "Signs must not simply replace the original weights; a pinned vendor-compatible reference backend must reproduce the vendor path first.",
+      "The published 27B card warns about missing transform support at some upstream revisions; pin a working commit and run transform fixtures (S21, S24).",
+      "Architecture string must be confirmed from the published GGUF's general.architecture before promotion from 'specified'."
+    ]
+  },
+  "required_kernels": ["K01", "K02", "K03", "K04", "K05", "K06", "K07"],
+  "required_transforms": ["prismml-activation-rotation"],
+  "metadata_requirements": [
+    { "key": "general.architecture", "kind": "string", "required": true },
+    { "key": "general.file_type", "kind": "u32", "required": false },
+    { "key": "tokenizer.ggml.tokens", "kind": "array", "required": true }
+  ],
+  "kv": {
+    "layers_key": "bonsai2.block_count",
+    "head_count_key": "bonsai2.attention.head_count",
+    "kv_head_count_key": "bonsai2.attention.head_count_kv",
+    "embedding_key": "bonsai2.embedding_length",
+    "key_length_key": "bonsai2.attention.key_length",
+    "value_length_key": "bonsai2.attention.value_length"
+  },
+  "expert_meta": {
+    "count_key": "bonsai2.expert_count",
+    "used_key": "bonsai2.expert_used_count"
+  },
+  "notes": [
+    "PQ2_0 and PTQ1_0 formats are certified independently (FR-30); each needs its own kernel evidence.",
+    "No mandatory draft: a compact model's draft can be a large fraction of available 8GB RAM."
+  ]
+}

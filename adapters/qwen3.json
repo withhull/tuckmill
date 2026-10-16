@@ -1,0 +1,50 @@
+{
+  "schema_version": 1,
+  "id": "qwen3",
+  "display_name": "Qwen3 dense (GGUF)",
+  "family": "qwen3",
+  "architecture": "qwen3",
+  "traits": {
+    "dense": true,
+    "moe": false,
+    "hybrid_linear_attention": false,
+    "ternary_quantized": false
+  },
+  "status": "specified",
+  "certification": {
+    "state": "unmeasured",
+    "notes": [
+      "Stage A/B/C development anchor (Qwen3-0.6B -> 1.7B -> 4B).",
+      "No plan may claim certification before the G1 kernel gates pass on a physical 8GB Mac."
+    ]
+  },
+  "required_kernels": ["K01", "K02", "K03", "K08"],
+  "required_transforms": [],
+  "metadata_requirements": [
+    { "key": "general.architecture", "kind": "string", "required": true },
+    { "key": "qwen3.block_count", "kind": "u32", "required": true },
+    { "key": "qwen3.context_length", "kind": "u32", "required": true },
+    { "key": "qwen3.embedding_length", "kind": "u32", "required": true },
+    { "key": "qwen3.attention.head_count", "kind": "u32", "required": true },
+    { "key": "qwen3.attention.head_count_kv", "kind": "u32", "required": true },
+    { "key": "qwen3.feed_forward_length", "kind": "u32", "required": true },
+    { "key": "qwen3.attention.key_length", "kind": "u32", "required": false },
+    { "key": "qwen3.attention.value_length", "kind": "u32", "required": false },
+    { "key": "general.name", "kind": "string", "required": false },
+    { "key": "tokenizer.ggml.tokens", "kind": "array", "required": true },
+    { "key": "tokenizer.ggml.merges", "kind": "array", "required": false },
+    { "key": "tokenizer.ggml.model", "kind": "string", "required": false }
+  ],
+  "kv": {
+    "layers_key": "qwen3.block_count",
+    "head_count_key": "qwen3.attention.head_count",
+    "kv_head_count_key": "qwen3.attention.head_count_kv",
+    "embedding_key": "qwen3.embedding_length",
+    "key_length_key": "qwen3.attention.key_length",
+    "value_length_key": "qwen3.attention.value_length"
+  },
+  "notes": [
+    "Grouped-query attention. KV payload estimate follows the PRD section 14 formula.",
+    "Dense execution must process every required dense weight; a router does not apply."
+  ]
+}

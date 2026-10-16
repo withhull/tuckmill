@@ -1,0 +1,52 @@
+{
+  "schema_version": 1,
+  "id": "qwen3.5-hybrid",
+  "display_name": "Qwen3.5 text-only hybrid (GGUF)",
+  "family": "qwen3.5",
+  "architecture": "qwen3.5",
+  "traits": {
+    "dense": false,
+    "moe": true,
+    "hybrid_linear_attention": true,
+    "ternary_quantized": false
+  },
+  "status": "specified",
+  "certification": {
+    "state": "unmeasured",
+    "notes": [
+      "FR-29: text-only hybrid adapter is mandatory before any Bonsai small-model certification.",
+      "Metadata key namespace must be confirmed against the first pinned published artifact before this adapter is promoted from 'specified'.",
+      "Hybrid recurrent state rollback (K07) is not implemented; speculative execution stays disabled."
+    ]
+  },
+  "required_kernels": ["K01", "K02", "K03", "K05", "K06", "K07", "K08"],
+  "required_transforms": [],
+  "metadata_requirements": [
+    { "key": "general.architecture", "kind": "string", "required": true },
+    { "key": "qwen3.5.block_count", "kind": "u32", "required": true },
+    { "key": "qwen3.5.context_length", "kind": "u32", "required": true },
+    { "key": "qwen3.5.embedding_length", "kind": "u32", "required": true },
+    { "key": "qwen3.5.attention.head_count", "kind": "u32", "required": true },
+    { "key": "qwen3.5.attention.head_count_kv", "kind": "u32", "required": true },
+    { "key": "qwen3.5.feed_forward_length", "kind": "u32", "required": true },
+    { "key": "qwen3.5.expert_count", "kind": "u32", "required": false },
+    { "key": "qwen3.5.expert_used_count", "kind": "u32", "required": false },
+    { "key": "tokenizer.ggml.tokens", "kind": "array", "required": true }
+  ],
+  "kv": {
+    "layers_key": "qwen3.5.block_count",
+    "head_count_key": "qwen3.5.attention.head_count",
+    "kv_head_count_key": "qwen3.5.attention.head_count_kv",
+    "embedding_key": "qwen3.5.embedding_length",
+    "key_length_key": "qwen3.5.attention.key_length",
+    "value_length_key": "qwen3.5.attention.value_length"
+  },
+  "expert_meta": {
+    "count_key": "qwen3.5.expert_count",
+    "used_key": "qwen3.5.expert_used_count"
+  },
+  "notes": [
+    "Hybrid state checks (full prefill, chunked prefill, one-token updates from identical states) are a certification prerequisite.",
+    "KV truncation alone does not undo recurrent state (PRD section 12)."
+  ]
+}

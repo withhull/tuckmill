@@ -1,0 +1,19 @@
+{
+  "schema_version": 1,
+  "suite": "standard-v1",
+  "notes": [
+    "frozen workload definition; prompts are synthetic token-id sets derived deterministically from prompt ids, so no private user prompts are collected",
+    "standard measurement shape: 512 input / 256 output tokens with exact recorded prompt ids and cache conditions",
+    "cache labels are explicit: cold-declared, warm, prefix-hit, or cache-uncontrolled; a first run is not automatically a cold-storage run",
+    "reference inputs are compared only through the four-way identity in PRD section 20.1 (R0/R1/T0/T1)",
+    "draft tokens are never reported as final throughput"
+  ],
+  "default_input_tokens": 512,
+  "default_output_tokens": 256,
+  "default_repetitions": 3,
+  "input_lengths_short": [128, 512, 1024],
+  "output_lengths_short": [128, 256],
+  "calibration_prompt_ids": ["cal-001", "cal-002", "cal-003", "cal-004", "cal-005"],
+  "qualification_prompt_set": "frozen-heterogeneous-100",
+  "qualification_prompt_topics": ["code", "general-text", "structured-output", "long-prefill-stress"]
+}

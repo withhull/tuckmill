@@ -1,0 +1,50 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/manifest",
+    "crates/backend",
+    "crates/planner",
+    "crates/store",
+    "crates/tuckcore",
+    "crates/supervisor",
+    "crates/cli",
+]
+
+[workspace.package]
+version = "0.2.0"
+edition = "2021"
+rust-version = "1.80"
+# Provisional: open-source core is recommended by the PRD (S17); final licensing
+# decision (ADR) is still pending. Do not publish artifacts before clearance.
+license = "Apache-2.0"
+repository = "https://example.invalid/tuckmill"
+description = "Tuckmill: local-first model inference framework for Apple Silicon Macs"
+
+[workspace.dependencies]
+tuckmill-manifest = { path = "crates/manifest", version = "0.2.0" }
+tuckmill-backend = { path = "crates/backend", version = "0.2.0" }
+tuckmill-tuckcore = { path = "crates/tuckcore", version = "0.2.0" }
+tuckmill-planner = { path = "crates/planner", version = "0.2.0" }
+tuckmill-store = { path = "crates/store", version = "0.2.0" }
+tuckmill-supervisor = { path = "crates/supervisor", version = "0.2.0" }
+
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0"
+sha2 = "0.10"
+thiserror = "1.0.69"
+libc = "0.2.189"
+clap = { version = "4.5", features = ["derive"] }
+
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+
+[workspace.lints.clippy]
+all = "warn"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "debuginfo"
+
+[profile.dev]
+debug = "line-tables-only"

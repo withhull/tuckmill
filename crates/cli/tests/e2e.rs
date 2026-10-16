@@ -1,0 +1,588 @@
+//! End-to-end CLI tests: the full path from doctor through serve.
+//!
+//! These tests run the real `tuckmill` binary (including the isolated worker
+//! process path) against a synthetic fixture and a temporary data directory.
+
+use std::io::{BufRead, BufReader, Read, Write};
+use std::net::TcpStream;
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
+use std::time::Duration;
+
+use tuckmill_manifest::adapter::AdapterRegistry;
+use tuckmill_manifest::testing::{write_synthetic, SyntheticConfig};
+
+fn bin() -> &'static str {
+    env!("CARGO_BIN_EXE_tuckmill")
+}
+
+struct TestEnv {
+    _dir: tempfile::TempDir,
+    data_dir: PathBuf,
+    fixture: PathBuf,
+}
+
+impl TestEnv {
+    fn new() -> Self {
+        let dir = tempfile::tempdir().unwrap();
+        let data_dir = dir.path().join("store");
+        let fixture = dir.path().join("tiny-qwen3.gguf");
+        write_synthetic(&fixture, &SyntheticConfig::tiny_qwen3()).unwrap();
+        Self {
+            _dir: dir,
+            data_dir,
+            fixture,
+        }
+    }
+
+    fn run(&self, args: &[&str]) -> (i32, String, String) {
+        let output = Command::new(bin())
+            .args(args)
+            .env("TUCKMILL_DATA_DIR", &self.data_dir)
+            .output()
+            .expect("spawn tuckmill");
+        (
+            output.status.code().unwrap_or(-1),
+            String::from_utf8_lossy(&output.stdout).to_string(),
+            String::from_utf8_lossy(&output.stderr).to_string(),
+        )
+    }
+
+    fn run_ok(&self, args: &[&str]) -> String {
+        let (code, stdout, stderr) = self.run(args);
+        assert_eq!(
+            code, 0,
+            "command {args:?} failed\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        );
+        stdout
+    }
+}
+
+#[test]
+fn doctor_reports_the_real_machine_and_never_guesses() {
+    let env = TestEnv::new();
+    let out = env.run_ok(&["doctor", "--json"]);
+    let v: serde_json::Value = serde_json::from_str(&out).expect("doctor json");
+    assert!(v["chip"].as_str().unwrap().contains("Apple"), "chip: {v}");
+    assert!(v["memory_bytes"].as_u64().unwrap() > 0);
+    assert_eq!(v["kernels"].as_array().unwrap().len(), 9);
+    let statuses: Vec<&str> = v["kernels"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|k| k["status"].as_str().unwrap())
+        .collect();
+    assert!(
+        statuses.iter().all(|s| *s == "specified"),
+        "nothing implemented yet"
+    );
+    // Human output too.
+    let out = env.run_ok(&["doctor"]);
+    assert!(out.contains("no certified execution engine"), "{out}");
+}
+
+#[test]
+fn inspect_import_plan_run_bench_flow() {
+    let env = TestEnv::new();
+    let fixture = env.fixture.display().to_string();
+
+    // inspect --json carries identity hashes and tensor stats.
+    let out = env.run_ok(&["inspect", &fixture, "--json"]);
+    let v: serde_json::Value = serde_json::from_str(&out).expect("inspect json");
+    assert_eq!(v["format"], "gguf");
+    assert_eq!(v["architecture"], "qwen3");
+    assert_eq!(v["tensor_stats"]["total_tensors"], 25);
+    assert!(v["identity_hash"].as_str().unwrap().len() == 64);
+
+    // import with alias.
+    let out = env.run_ok(&["import", &fixture, "--alias", "local-model", "--json"]);
+    let v: serde_json::Value = serde_json::from_str(&out).expect("import json");
+    let artifact_id = v["artifact"]["artifact_id"].as_str().unwrap().to_string();
+    assert_eq!(artifact_id.len(), 64);
+
+    // Re-import is idempotent.
+    let out = env.run_ok(&["import", &fixture, "--json"]);
+    let v: serde_json::Value = serde_json::from_str(&out).expect("import json");
+    assert_eq!(v["already_present"], true);
+
+    // cache list shows it.
+    let out = env.run_ok(&["cache", "list"]);
+    assert!(out.contains("local-model"), "{out}");
+    assert!(out.contains(&artifact_id[..12]), "{out}");
+
+    // plan --json: resident, estimated, honest engine availability.
+    let out = env.run_ok(&["plan", "local-model", "--json"]);
+    let v: serde_json::Value = serde_json::from_str(&out).expect("plan json");
+    assert_eq!(v["mode"], "resident");
+    assert_eq!(v["confidence"], "estimated");
+    assert_eq!(v["engine"]["availability"], "reference_test_only");
+    assert!(v["assumptions"].as_array().unwrap().len() >= 5);
+
+    // run without the gate must refuse with a typed error.
+    let (code, _, stderr) = env.run(&["run", "local-model", "--prompt", "hi", "--max-output", "4"]);
+    assert_eq!(code, 1);
+    assert!(stderr.contains("UNAVAILABLE"), "{stderr}");
+    assert!(stderr.contains("--allow-test-engine"), "{stderr}");
+
+    // run with the gate: isolated worker path, synthetic tokens stream out.
+    let out = env.run_ok(&[
+        "run",
+        "local-model",
+        "--prompt",
+        "hi",
+        "--max-output",
+        "5",
+        "--allow-test-engine",
+        "--json",
+    ]);
+    let v: serde_json::Value = serde_json::from_str(&out).expect("run json");
+    assert_eq!(v["reason"], "length");
+    assert_eq!(v["committed_tokens"], 5);
+    assert_eq!(v["synthetic_output"], true);
+
+    // pack is idempotent and verified.
+    let out = env.run_ok(&["pack", "local-model", "--json"]);
+    let v: serde_json::Value = serde_json::from_str(&out).expect("pack json");
+    assert!(v["packed"]["segments"].as_u64().unwrap() >= 1);
+    let out = env.run_ok(&["pack", "local-model", "--json"]);
+    let v: serde_json::Value = serde_json::from_str(&out).expect("pack json");
+    assert_eq!(v["already_packed"], true);
+
+    // bench writes a machine-readable record with honest caveats.
+    let out = env.run_ok(&[
+        "bench",
+        "local-model",
+        "--input",
+        "32",
+        "--output",
+        "8",
+        "--repetitions",
+        "1",
+        "--allow-test-engine",
+        "--json",
+    ]);
+    let v: serde_json::Value = serde_json::from_str(&out).expect("bench json");
+    assert_eq!(v["engine"]["certified"], false);
+    assert_eq!(v["performance_class"], "interactive");
+    let caveats = v["caveats"].as_array().unwrap();
+    assert!(caveats
+        .iter()
+        .any(|c| c.as_str().unwrap().contains("synthetic")));
+    assert!(v["samples"].as_array().unwrap().len() == 1);
+}
+
+#[test]
+fn rejected_plan_surfaces_as_typed_error() {
+    let env = TestEnv::new();
+    let fixture = env.fixture.display().to_string();
+    env.run_ok(&["import", &fixture, "--alias", "m"]);
+    // Budget far below minimum live state: typed rejection with next action.
+    let (code, stdout, stderr) = env.run(&[
+        "run",
+        "m",
+        "--prompt",
+        "x",
+        "--memory-budget",
+        "300MiB",
+        "--allow-test-engine",
+    ]);
+    assert_eq!(code, 1, "stdout: {stdout}\nstderr: {stderr}");
+    assert!(
+        stderr.contains("CONTEXT_EXCEEDS_BUDGET") || stderr.contains("INVALID_PLAN"),
+        "{stderr}"
+    );
+    // The plan command still shows the rejected plan document rather than failing.
+    let out = env.run_ok(&["plan", "m", "--memory-budget", "300MiB", "--json"]);
+    let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(v["mode"], "rejected");
+    assert!(v["rejection"]["code"].as_str().is_some());
+}
+
+#[test]
+fn context_beyond_advertised_is_rejected() {
+    let env = TestEnv::new();
+    let fixture = env.fixture.display().to_string();
+    env.run_ok(&["import", &fixture, "--alias", "m"]);
+    let (code, _, stderr) = env.run(&[
+        "run",
+        "m",
+        "--prompt",
+        "x",
+        "--context",
+        "8192",
+        "--allow-test-engine",
+    ]);
+    assert_eq!(code, 1);
+    assert!(stderr.contains("CONTEXT_EXCEEDS_BUDGET"), "{stderr}");
+}
+
+#[test]
+fn cache_prune_dry_run_reports_without_deleting() {
+    let env = TestEnv::new();
+    let fixture = env.fixture.display().to_string();
+    env.run_ok(&["import", &fixture, "--alias", "m"]);
+    let out = env.run_ok(&["cache", "prune", "--dry-run", "--json"]);
+    let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(v["dry_run"], true);
+    // Artifact payload must still exist afterwards.
+    let out = env.run_ok(&["cache", "list"]);
+    assert!(out.contains("m "));
+}
+
+#[test]
+fn serve_end_to_end_with_auth_and_streaming() {
+    let env = TestEnv::new();
+    let fixture = env.fixture.display().to_string();
+    env.run_ok(&["import", &fixture, "--alias", "local-model"]);
+
+    let mut child = Command::new(bin())
+        .args(["serve", "--port", "0", "--allow-test-engine"])
+        .env("TUCKMILL_DATA_DIR", &env.data_dir)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn serve");
+
+    // Read the startup line to learn the bound port.
+    let stdout = child.stdout.take().unwrap();
+    let mut reader = BufReader::new(stdout);
+    let mut addr_line = String::new();
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let mut addr = None;
+    while std::time::Instant::now() < deadline {
+        addr_line.clear();
+        if reader.read_line(&mut addr_line).unwrap_or(0) == 0 {
+            break;
+        }
+        if let Some(rest) = addr_line
+            .trim()
+            .strip_prefix("tuckmill serve: listening on http://")
+        {
+            addr = Some(rest.to_string());
+            break;
+        }
+    }
+    let addr = addr.expect("serve should print its bound address");
+    // Drain remaining stdout lines in a thread so the pipe never blocks.
+    std::thread::spawn(move || {
+        let mut sink = String::new();
+        let _ = reader.read_to_string(&mut sink);
+    });
+
+    let token = std::fs::read_to_string(env.data_dir.join("control/api-token")).unwrap();
+    let token = token.trim();
+
+    // healthz needs no auth.
+    let resp = http_request(
+        &addr,
+        "GET /healthz HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n",
+        None,
+    );
+    assert!(resp.contains("200"), "{resp}");
+
+    // Unauthorized.
+    let resp = http_request(
+        &addr,
+        "GET /v1/models HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n",
+        None,
+    );
+    assert!(resp.contains("401"), "{resp}");
+
+    // Models list.
+    let req = format!(
+        "GET /v1/models HTTP/1.1\r\nHost: 127.0.0.1\r\nAuthorization: Bearer {token}\r\nConnection: close\r\n\r\n"
+    );
+    let resp = http_request(&addr, &req, None);
+    assert!(resp.contains("local-model"), "{resp}");
+
+    // Non-streaming completion.
+    let body = serde_json::json!({
+        "model": "local-model",
+        "messages": [{"role": "user", "content": "hello"}],
+        "max_tokens": 4
+    })
+    .to_string();
+    let req = format!(
+        "POST /v1/chat/completions HTTP/1.1\r\nHost: 127.0.0.1\r\nAuthorization: Bearer {token}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    );
+    let resp = http_request(&addr, &req, None);
+    assert!(resp.contains("200"), "{resp}");
+    assert!(resp.contains("[ref:"), "{resp}");
+
+    // Streaming completion.
+    let body = serde_json::json!({
+        "model": "local-model",
+        "messages": [{"role": "user", "content": "stream"}],
+        "max_tokens": 3,
+        "stream": true
+    })
+    .to_string();
+    let req = format!(
+        "POST /v1/chat/completions HTTP/1.1\r\nHost: 127.0.0.1\r\nAuthorization: Bearer {token}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    );
+    let resp = http_request(&addr, &req, None);
+    assert!(resp.contains("text/event-stream"), "{resp}");
+    assert!(resp.contains("data: [DONE]"), "{resp}");
+
+    // Control status.
+    let req = format!(
+        "GET /control/status HTTP/1.1\r\nHost: 127.0.0.1\r\nAuthorization: Bearer {token}\r\nConnection: close\r\n\r\n"
+    );
+    let resp = http_request(&addr, &req, None);
+    assert!(resp.contains("\"governor\""), "{resp}");
+    assert!(resp.contains("\"queue_capacity\""), "{resp}");
+
+    // Stop the server.
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+fn http_request(addr: &str, request: &str, _unused: Option<()>) -> String {
+    let mut stream = TcpStream::connect(addr).expect("connect");
+    stream
+        .set_read_timeout(Some(Duration::from_secs(30)))
+        .unwrap();
+    stream.write_all(request.as_bytes()).unwrap();
+    let mut out = String::new();
+    let _ = stream.read_to_string(&mut out);
+    out
+}
+
+#[test]
+fn import_of_missing_file_is_a_clean_typed_error() {
+    let env = TestEnv::new();
+    let missing = env._dir.path().join("nope.gguf");
+    let (code, _, stderr) = env.run(&["import", missing.to_str().unwrap()]);
+    assert_eq!(code, 1);
+    assert!(stderr.contains("INVALID_REQUEST"), "{stderr}");
+    assert!(stderr.contains("next:"), "{stderr}");
+}
+
+#[test]
+fn corrupt_artifact_is_rejected_before_publish() {
+    let env = TestEnv::new();
+    let path = env._dir.path().join("corrupt.gguf");
+    let mut bytes = std::fs::read(&env.fixture).unwrap();
+    bytes[100] ^= 0xff; // metadata corruption
+    std::fs::write(&path, &bytes).unwrap();
+    let (code, _, stderr) = env.run(&["import", path.to_str().unwrap()]);
+    assert_eq!(code, 1);
+    assert!(
+        stderr.contains("INVALID_ARTIFACT") || stderr.contains("INTEGRITY_FAILURE"),
+        "{stderr}"
+    );
+    // Nothing published.
+    let out = env.run_ok(&["cache", "list", "--json"]);
+    let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(v["artifacts"].as_array().unwrap().len(), 0);
+}
+
+#[test]
+fn adversarial_metadata_is_bounded() {
+    // A GGUF with an absurd tensor count must be rejected without allocation.
+    let env = TestEnv::new();
+    let path = env._dir.path().join("absurd.gguf");
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(b"GGUF");
+    bytes.extend_from_slice(&3u32.to_le_bytes());
+    bytes.extend_from_slice(&u64::MAX.to_le_bytes()); // tensor count
+    bytes.extend_from_slice(&0u64.to_le_bytes());
+    std::fs::write(&path, &bytes).unwrap();
+    let (code, _, stderr) = env.run(&["inspect", path.to_str().unwrap()]);
+    assert_eq!(code, 1);
+    assert!(stderr.contains("INVALID_ARTIFACT"), "{stderr}");
+}
+
+#[test]
+fn worker_crash_surfaces_as_worker_failed_and_supervisor_survives() {
+    let env = TestEnv::new();
+    let fixture = env.fixture.display().to_string();
+    env.run_ok(&["import", &fixture, "--alias", "m"]);
+
+    let child = Command::new(bin())
+        .args([
+            "run",
+            "m",
+            "--prompt",
+            "crash me",
+            "--context",
+            "4096",
+            "--max-output",
+            "3000",
+            "--allow-test-engine",
+        ])
+        .env("TUCKMILL_DATA_DIR", &env.data_dir)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn run");
+
+    // Wait for the isolated worker to appear as a child of the run process.
+    let run_pid = child.id();
+    let mut worker_pid: Option<i32> = None;
+    for _ in 0..200 {
+        if let Ok(out) = Command::new("pgrep")
+            .args(["-P", &run_pid.to_string(), "-f", "__worker-reference"])
+            .output()
+        {
+            if let Some(pid) = String::from_utf8_lossy(&out.stdout)
+                .lines()
+                .next()
+                .and_then(|l| l.trim().parse::<i32>().ok())
+            {
+                worker_pid = Some(pid);
+                break;
+            }
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let worker_pid = worker_pid.expect("worker process should be running");
+    std::thread::sleep(Duration::from_millis(200)); // let some tokens commit
+
+    // Kill -9: no cleanup, no farewell.
+    assert_eq!(
+        unsafe { libc::kill(worker_pid, libc::SIGKILL) },
+        0,
+        "kill worker"
+    );
+
+    let output = child.wait_with_output().expect("wait run");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(1), "stderr: {stderr}");
+    assert!(
+        stderr.contains("WORKER_FAILED"),
+        "crash must surface as WORKER_FAILED: {stderr}"
+    );
+    // The supervisor itself must still be usable afterwards.
+    let out = env.run_ok(&["cache", "list"]);
+    assert!(out.contains("m "), "{out}");
+}
+
+#[test]
+fn sigint_cancels_a_run_at_a_committed_token_boundary() {
+    let env = TestEnv::new();
+    let fixture = env.fixture.display().to_string();
+    env.run_ok(&["import", &fixture, "--alias", "m"]);
+
+    let child = Command::new(bin())
+        .args([
+            "run",
+            "m",
+            "--prompt",
+            "interrupt me",
+            "--context",
+            "4096",
+            "--max-output",
+            "3000",
+            "--allow-test-engine",
+            "--json",
+            "--quiet",
+        ])
+        .env("TUCKMILL_DATA_DIR", &env.data_dir)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn run");
+
+    // Let a few tokens commit, then interrupt.
+    std::thread::sleep(Duration::from_millis(500));
+    assert_eq!(
+        unsafe { libc::kill(child.id() as i32, libc::SIGINT) },
+        0,
+        "send SIGINT"
+    );
+    let output = child.wait_with_output().expect("wait run");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(
+        output.status.code(),
+        Some(130),
+        "interrupted runs exit 130\nstdout: {stdout}\nstderr: {stderr}"
+    );
+    let v: serde_json::Value = serde_json::from_str(&stdout).expect("json record");
+    assert_eq!(v["reason"], "cancelled");
+    let committed = v["committed_tokens"].as_u64().unwrap();
+    assert!(
+        committed > 0,
+        "some tokens should have committed before SIGINT"
+    );
+    assert!(committed < 3000, "cancellation must stop the run");
+}
+
+#[test]
+fn tuckcore_executes_real_weights_with_honest_labels() {
+    let env = TestEnv::new();
+    let fixture = env.fixture.display().to_string();
+    env.run_ok(&["import", &fixture, "--alias", "local-model"]);
+
+    let out = env.run_ok(&[
+        "run",
+        "local-model",
+        "--prompt",
+        "hello core",
+        "--max-output",
+        "5",
+        "--engine",
+        "tuckcore",
+        "--json",
+    ]);
+    let v: serde_json::Value = serde_json::from_str(&out).expect("run json");
+    assert_eq!(v["backend"], "tuckcore");
+    assert_eq!(v["certified"], false);
+    assert_eq!(v["synthetic_output"], false, "real weights were executed");
+    assert_eq!(v["committed_tokens"], 5);
+    assert_eq!(v["reason"], "length");
+    let text = v["text"].as_str().unwrap();
+    assert!(!text.is_empty());
+    assert!(!text.contains("[ref:"), "not synthetic output: {text}");
+}
+
+#[test]
+fn verify_proves_streaming_equivalence_bit_exact() {
+    let env = TestEnv::new();
+    let fixture = env.fixture.display().to_string();
+    env.run_ok(&["import", &fixture, "--alias", "m"]);
+
+    let out = env.run_ok(&["verify", "m", "--json"]);
+    let v: serde_json::Value = serde_json::from_str(&out).expect("verify json");
+    assert_eq!(v["passed"], true, "verify must pass: {v}");
+    assert_eq!(v["logits"]["exact_equal"], true);
+    assert_eq!(v["logits"]["max_abs_diff"], 0.0);
+    assert_eq!(v["generated_texts_equal"], true);
+    assert_eq!(v["streaming_exercised"], true);
+    let evictions = v["streamed"]["stats"]["evictions"].as_u64().unwrap();
+    assert!(evictions > 0, "forced streaming must evict: {evictions}");
+    let reads = v["streamed"]["stats"]["logical_read_bytes"]
+        .as_u64()
+        .unwrap();
+    assert!(reads > 0, "streaming must read weights from storage");
+    assert_eq!(v["resident"]["stats"]["in_flight_leases"], 0);
+    assert!(v["caveats"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|c| c.as_str().unwrap().contains("llama.cpp")));
+
+    // The record is persisted under records/verify/.
+    let verify_dir = env.data_dir.join("records/verify");
+    let entries: Vec<_> = std::fs::read_dir(&verify_dir).unwrap().flatten().collect();
+    assert_eq!(entries.len(), 1);
+}
+
+#[test]
+fn worker_and_adapter_consistency() {
+    // The fixture must resolve the builtin qwen3 adapter metadata fully; this
+    // guards against fixture/adapter drift that would shadow real bugs.
+    let env = TestEnv::new();
+    let registry = AdapterRegistry::builtin().unwrap();
+    let adapter = registry.find("qwen3").unwrap();
+    let insp = tuckmill_manifest::gguf::inspect(
+        Path::new(&env.fixture),
+        &tuckmill_manifest::gguf::Limits::default(),
+    )
+    .unwrap();
+    adapter.validate_metadata(&insp).unwrap();
+    adapter.kv_geometry(&insp).unwrap();
+}
