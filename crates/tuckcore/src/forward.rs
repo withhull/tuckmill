@@ -157,6 +157,41 @@ impl ModelWeights {
     }
 }
 
+/// KV cache precision. Mirrors llama.cpp's explicit `type_k`/`type_v`
+/// selection so diagnostic comparisons can match both sides; entries stored
+/// "f16" are f16-representable f32 values, never a different cache
+/// implementation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum KvPrecision {
+    F32,
+    F16,
+}
+
+impl KvPrecision {
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "f32" => Some(Self::F32),
+            "f16" => Some(Self::F16),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::F32 => "f32",
+            Self::F16 => "f16",
+        }
+    }
+
+    fn round(self, v: f32) -> f32 {
+        match self {
+            Self::F32 => v,
+            Self::F16 => f16_to_f32(f32_to_f16_bits(v)),
+        }
+    }
+}
+
 /// Bounded KV state for one sequence. Capacity is fixed at admission time.
 #[derive(Debug)]
 pub struct KvState {
@@ -166,6 +201,7 @@ pub struct KvState {
     cap: usize,
     key_len: u64,
     value_len: u64,
+    precision: KvPrecision,
 }
 
 impl KvState {
@@ -178,7 +214,7 @@ impl KvState {
             .saturating_mul(4)
     }
 
-    pub fn new(cfg: &Qwen3Config, cap: u64) -> Result<Self> {
+    pub fn new(cfg: &Qwen3Config, cap: u64, precision: KvPrecision) -> Result<Self> {
         let total = Self::bytes_for(cfg, cap);
         if total > Self::MAX_KV_BYTES {
             return Err(TuckmillError::new(
@@ -200,6 +236,7 @@ impl KvState {
             cap: cap as usize,
             key_len: cfg.key_length,
             value_len: cfg.value_length,
+            precision,
         })
     }
 
@@ -209,9 +246,15 @@ impl KvState {
 
     fn store(&mut self, layer: usize, head: u64, pos: usize, k_row: &[f32], v_row: &[f32]) {
         let k_off = ((head as usize) * self.cap + pos) * self.key_len as usize;
-        self.k[layer][k_off..k_off + self.key_len as usize].copy_from_slice(k_row);
+        let k_slot = &mut self.k[layer][k_off..k_off + self.key_len as usize];
+        for (slot, value) in k_slot.iter_mut().zip(k_row.iter()) {
+            *slot = self.precision.round(*value);
+        }
         let v_off = ((head as usize) * self.cap + pos) * self.value_len as usize;
-        self.v[layer][v_off..v_off + self.value_len as usize].copy_from_slice(v_row);
+        let v_slot = &mut self.v[layer][v_off..v_off + self.value_len as usize];
+        for (slot, value) in v_slot.iter_mut().zip(v_row.iter()) {
+            *slot = self.precision.round(*value);
+        }
     }
 
     fn k_row(&self, layer: usize, head: u64, pos: usize) -> &[f32] {
@@ -263,6 +306,10 @@ pub struct Forward<'a> {
     pub tracker: &'a CompletionTracker,
     pub weights: &'a ModelWeights,
     pub profile: NumericalProfile,
+    /// Called between chunks/layers: services external control (poll hook)
+    /// and applies pending cache trims at a safe point. Never releases
+    /// in-flight buffers (pinned chunks are protected by the loader).
+    pub control: &'a dyn Fn(),
 }
 
 /// Cancellation hook checked between layers and chunks.
@@ -309,6 +356,7 @@ impl<'a> Forward<'a> {
             if cancelled() {
                 return Err(cancelled_error());
             }
+            (self.control)();
             // ---- attention block ----
             let normed = rmsnorm(&x, &self.weights.norms.attn_norm[layer], cfg.rms_eps);
             let mut q = vec![0.0f32; heads * head_dim];
@@ -486,6 +534,7 @@ impl<'a> Forward<'a> {
             if cancelled() {
                 return Err(cancelled_error());
             }
+            (self.control)();
             let block = self.loader.block(tensor, chunk as u32)?;
             self.loader.pin(tensor, chunk as u32);
             let fence = self.tracker.submit(vec![block.clone()]);
@@ -592,6 +641,7 @@ impl<'a> Forward<'a> {
             if cancelled() {
                 return Err(cancelled_error());
             }
+            (self.control)();
             let block = self.loader.block(tensor, chunk as u32)?;
             self.loader.pin(tensor, chunk as u32);
             let fence = self.tracker.submit(vec![block.clone()]);
@@ -633,6 +683,7 @@ impl<'a> Forward<'a> {
             if cancelled() {
                 return Err(cancelled_error());
             }
+            (self.control)();
             let block = self.loader.block(tensor, chunk as u32)?;
             self.loader.pin(tensor, chunk as u32);
             let fence = self.tracker.submit(vec![block.clone()]);
@@ -667,7 +718,7 @@ impl<'a> Forward<'a> {
                 "scoring position is outside the token sequence",
             ));
         }
-        let mut kv = KvState::new(&self.weights.cfg, (position + 1) as u64)?;
+        let mut kv = KvState::new(&self.weights.cfg, (position + 1) as u64, KvPrecision::F32)?;
         let mut logits = Vec::new();
         for (pos, token) in tokens[..=position].iter().enumerate() {
             logits = self.forward_token(&mut kv, *token, pos, cancelled)?;
@@ -842,6 +893,7 @@ mod tests {
             tracker: &f.tracker,
             weights: &f.weights,
             profile: NumericalProfile::OracleF32,
+            control: &|| {},
         };
         let tokens = [1u32, 2, 3];
         let a = fwd.logits_at(&tokens, 2, &|| false).unwrap();
@@ -870,6 +922,7 @@ mod tests {
             tracker: &resident.tracker,
             weights: &resident.weights,
             profile: NumericalProfile::OracleF32,
+            control: &|| {},
         }
         .logits_at(&tokens, 3, &|| false)
         .unwrap();
@@ -878,6 +931,7 @@ mod tests {
             tracker: &streamed.tracker,
             weights: &streamed.weights,
             profile: NumericalProfile::OracleF32,
+            control: &|| {},
         }
         .logits_at(&tokens, 3, &|| false)
         .unwrap();
@@ -904,6 +958,7 @@ mod tests {
             tracker: &f.tracker,
             weights: &f.weights,
             profile: NumericalProfile::OracleF32,
+            control: &|| {},
         };
         let err = fwd.logits_at(&[1, 2, 3], 2, &|| true).unwrap_err();
         assert_eq!(err.code(), ErrorCode::Cancelled);
@@ -922,6 +977,7 @@ mod tests {
             tracker: &f.tracker,
             weights: &f.weights,
             profile: NumericalProfile::OracleF32,
+            control: &|| {},
         }
         .logits_at(&tokens, 2, &|| false)
         .unwrap();
@@ -930,6 +986,7 @@ mod tests {
             tracker: &f.tracker,
             weights: &f.weights,
             profile: NumericalProfile::LlamaCpu,
+            control: &|| {},
         }
         .logits_at(&tokens, 2, &|| false)
         .unwrap();
@@ -954,6 +1011,7 @@ mod tests {
             tracker: &f.tracker,
             weights: &f.weights,
             profile: NumericalProfile::OracleF32,
+            control: &|| {},
         };
         let err = fwd.logits_at(&[999_999], 0, &|| false).unwrap_err();
         assert_eq!(err.code(), ErrorCode::InvalidRequest);
@@ -967,6 +1025,7 @@ mod tests {
             tracker: &f.tracker,
             weights: &f.weights,
             profile: NumericalProfile::OracleF32,
+            control: &|| {},
         };
         assert!(fwd.logits_at(&[1, 2], 5, &|| false).is_err());
         assert!(fwd.logits_at(&[], 0, &|| false).is_err());

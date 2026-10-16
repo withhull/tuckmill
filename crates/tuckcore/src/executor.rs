@@ -21,12 +21,12 @@ use tuckmill_manifest::records::EngineIdentity;
 use tuckmill_manifest::{BACKEND_ABI_VERSION, WORKER_PROTOCOL_VERSION};
 
 use crate::completion::CompletionTracker;
-use crate::forward::{self, Forward, KvState, ModelWeights, NumericalProfile};
+use crate::forward::{self, Forward, KvPrecision, KvState, ModelWeights, NumericalProfile};
 use crate::loader::{BlockLoader, BlockPolicy};
 use crate::model;
 use crate::sampling::{self, Rng, SamplingConfig};
 use crate::tensor;
-use crate::tokenizer::Tokenizer;
+use crate::tokenizer::{Tokenizer, Utf8StreamDecoder};
 
 /// Defaults; overridable per run through the versioned Load options.
 pub const DEFAULT_CACHE_BYTES: u64 = 512 * 1024 * 1024;
@@ -40,6 +40,14 @@ struct TuckCoreOptions {
     /// "oracle-f32" (default) or "llama-cpu" (mirrors pinned llama.cpp CPU
     /// kernels; used for reference comparisons).
     numerical_profile: Option<String>,
+    /// KV cache precision: "f32" (default) or "f16". Stored entries are
+    /// f16-representable f32 values when "f16"; the actual setting is
+    /// reported in stats so comparisons never trust the request alone.
+    kv_precision: Option<String>,
+    /// Verify the artifact's canonical content digest before executing
+    /// (default true; a bounded single streaming pass). Disabling is an
+    /// explicit, recorded choice.
+    verify_content_hash: Option<bool>,
 }
 
 struct Loaded {
@@ -49,6 +57,7 @@ struct Loaded {
     tokenizer: Tokenizer,
     context_total: u64,
     profile: NumericalProfile,
+    kv_precision: KvPrecision,
 }
 
 /// The experimental custom native executor.
@@ -57,6 +66,10 @@ pub struct TuckCore {
     /// Optional artificial per-token pacing (tests only; real forward work is
     /// its own pacing).
     pub per_token_delay: Duration,
+    /// Shared cache-trim epoch (governor -> engine). Incremented via Control
+    /// frames; applied by the forward loops at safe checkpoints.
+    trim_epoch: Arc<std::sync::atomic::AtomicU64>,
+    applied_trim_epoch: Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl Default for TuckCore {
@@ -70,11 +83,31 @@ impl TuckCore {
         Self {
             loaded: None,
             per_token_delay: Duration::ZERO,
+            trim_epoch: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            applied_trim_epoch: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         }
     }
 
     pub fn is_loaded(&self) -> bool {
         self.loaded.is_some()
+    }
+
+    /// Applies a pending cache trim if the governor asked for one; returns
+    /// the number of evicted blocks (0 when nothing was pending). Pinned,
+    /// in-flight blocks are never evicted.
+    fn apply_pending_trim(&self) -> usize {
+        let requested = self.trim_epoch.load(Ordering::Relaxed);
+        let applied = self.applied_trim_epoch.load(Ordering::Relaxed);
+        if requested == applied {
+            return 0;
+        }
+        let Some(loaded) = self.loaded.as_ref() else {
+            self.applied_trim_epoch.store(requested, Ordering::Relaxed);
+            return 0;
+        };
+        let evicted = loaded.loader.evict_all();
+        self.applied_trim_epoch.store(requested, Ordering::Relaxed);
+        evicted
     }
 
     /// Engine identity (inherent form so the supervisor can query the
@@ -155,6 +188,17 @@ impl InferenceBackend for TuckCore {
                 ))
             }
         };
+        let verify_content_hash = opts.verify_content_hash.unwrap_or(true);
+        let kv_precision = match opts.kv_precision.as_deref() {
+            None | Some("f32") => KvPrecision::F32,
+            Some("f16") => KvPrecision::F16,
+            Some(other) => {
+                return Err(TuckmillError::new(
+                    ErrorCode::InvalidRequest,
+                    format!("unknown kv_precision {other:?}; use \"f32\" or \"f16\""),
+                ))
+            }
+        };
 
         // ---- identity verification before anything executes ----
         let path = std::path::Path::new(&artifact.path);
@@ -190,6 +234,32 @@ impl InferenceBackend for TuckCore {
                 ));
             }
         }
+        // Full-payload identity: one bounded streaming pass over the file,
+        // compared against the store's recorded canonical digest. Drifted
+        // bytes must never execute; disabling is explicit and recorded.
+        let content_verified = if verify_content_hash {
+            match &artifact.content_hash {
+                Some(expected) => {
+                    let mut file = std::fs::File::open(path).map_err(TuckmillError::from)?;
+                    let mut reader = std::io::BufReader::with_capacity(1 << 20, &mut file);
+                    let (actual, _) = tuckmill_manifest::digest::digest_reader(
+                        &mut reader,
+                        tuckmill_manifest::digest::DEFAULT_CHUNK_BYTES,
+                    )
+                    .map_err(TuckmillError::from)?;
+                    if &actual != expected {
+                        return Err(TuckmillError::new(
+                            ErrorCode::IntegrityFailure,
+                            "artifact content digest does not match the recorded identity; refusing to execute drifted weights",
+                        ));
+                    }
+                    true
+                }
+                None => false,
+            }
+        } else {
+            false
+        };
 
         // ---- configuration and type checks ----
         let registry = AdapterRegistry::builtin()?;
@@ -230,15 +300,24 @@ impl InferenceBackend for TuckCore {
         let payload: u64 = insp.tensors.iter().map(|t| t.byte_size).sum();
 
         let mut note = format!(
-            "tuckcore (experimental, uncertified): dense Qwen3, {} layers, vocab {}, byte-level BPE tokenizer, scalar kernels [{}]; real weights from {} ({} payload), weight cache {}, block {}",
+            "tuckcore (experimental, uncertified): dense Qwen3, {} layers, vocab {}, byte-level BPE tokenizer, scalar kernels [{}], kv {}; real weights from {} ({} payload), weight cache {}, block {}",
             cfg.layers,
             cfg.vocab,
             profile.as_str(),
+            kv_precision.as_str(),
             artifact.path,
             tuckmill_manifest::units::Bytes(payload),
             tuckmill_manifest::units::Bytes(policy.cache_bytes),
             tuckmill_manifest::units::Bytes(policy.block_bytes)
         );
+        note.push_str(&format!(
+            "; payload content hash {}",
+            if content_verified {
+                "verified"
+            } else {
+                "not verified (no digest recorded or verification disabled by option)"
+            }
+        ));
         if let Some(extra) = tokenizer.pretokenizer_note() {
             note.push_str("; ");
             note.push_str(&extra);
@@ -250,6 +329,7 @@ impl InferenceBackend for TuckCore {
             tokenizer,
             context_total: plan.context.total_context,
             profile,
+            kv_precision,
         });
         Ok(note)
     }
@@ -285,12 +365,27 @@ impl InferenceBackend for TuckCore {
             let cancel = ctl.cancel.clone();
             move || cancel.load(Ordering::Relaxed)
         };
-        let mut kv = KvState::new(&loaded.weights.cfg, loaded.context_total)?;
+        // Control closure for the forward loops: services external input
+        // (poll) and applies governor-ordered cache trims at safe points.
+        // `poll` is copied out so the closure never borrows `ctl` mutably.
+        let poll_hook = ctl.poll;
+        let control = || {
+            if let Some(poll) = poll_hook {
+                poll();
+            }
+            let _ = self.apply_pending_trim();
+        };
+        let mut kv = KvState::new(
+            &loaded.weights.cfg,
+            loaded.context_total,
+            loaded.kv_precision,
+        )?;
         let fwd = Forward {
             loader: &loaded.loader,
             tracker: &loaded.tracker,
             weights: &loaded.weights,
             profile: loaded.profile,
+            control: &control,
         };
 
         (ctl.on_state)(RunState::Warming);
@@ -323,6 +418,9 @@ impl InferenceBackend for TuckCore {
         let sampling_cfg = SamplingConfig::default(); // greedy in Stage 0
         let mut committed: u64 = 0;
         let mut generated = String::new();
+        // Incremental UTF-8 assembly: multibyte characters split across
+        // tokens are held until complete, never replacement-mangled mid-char.
+        let mut decoder = Utf8StreamDecoder::new();
         for i in 0..req.max_output_tokens {
             if ctl.cancel.load(Ordering::Relaxed) {
                 return Ok(GenOutcome {
@@ -339,8 +437,11 @@ impl InferenceBackend for TuckCore {
                 ));
             };
             let text = match loaded.tokenizer.token_text(token) {
-                Some(_) => loaded.tokenizer.decode_token(token),
-                None => format!("<tok {token}>"),
+                Some(_) => decoder.push(&loaded.tokenizer.token_bytes(token)),
+                None => {
+                    let placeholder = format!("<tok {token}>");
+                    decoder.push(placeholder.as_bytes())
+                }
             };
             generated.push_str(&text);
             committed += 1;
@@ -391,27 +492,42 @@ impl InferenceBackend for TuckCore {
         &mut self,
         tokens: &[u32],
         positions: &[u64],
+        cancelled: &dyn Fn() -> bool,
         sink: &mut dyn FnMut(u64, &[f32]) -> bool,
     ) -> Result<u64> {
         let loaded = self.loaded.as_ref().ok_or_else(|| {
             TuckmillError::new(ErrorCode::WorkerFailed, "tuckcore has no loaded artifact")
         })?;
+        let control = || {
+            let _ = self.apply_pending_trim();
+        };
         let fwd = Forward {
             loader: &loaded.loader,
             tracker: &loaded.tracker,
             weights: &loaded.weights,
             profile: loaded.profile,
+            control: &control,
         };
         let mut scored = 0u64;
         for position in positions {
+            if cancelled() {
+                return Err(TuckmillError::new(
+                    ErrorCode::Cancelled,
+                    "scoring cancelled at a position boundary",
+                ));
+            }
             let pos = *position as usize;
-            let logits = fwd.logits_at(tokens, pos, &|| false)?;
+            let logits = fwd.logits_at(tokens, pos, cancelled)?;
             scored += 1;
             if !sink(*position, &logits) {
                 break;
             }
         }
         Ok(scored)
+    }
+
+    fn trim_epoch(&self) -> Arc<std::sync::atomic::AtomicU64> {
+        self.trim_epoch.clone()
     }
 
     fn stats(&self) -> BackendStats {
@@ -426,6 +542,8 @@ impl InferenceBackend for TuckCore {
                     evictions: s.evictions,
                     in_flight_leases: loaded.tracker.in_flight() as u64,
                     footprint_bytes: None,
+                    kv_precision: Some(loaded.kv_precision.as_str().to_string()),
+                    threads: Some(1), // scalar executor is single-threaded
                 }
             }
             None => BackendStats::default(),
@@ -446,6 +564,7 @@ fn pause_loop(ctl: &mut GenControl<'_>, mut remaining: Duration) -> Result<()> {
     let slice = Duration::from_millis(2);
     let mut paused_reported = false;
     loop {
+        ctl.poll();
         if ctl.cancel.load(Ordering::Relaxed) {
             return Ok(());
         }
@@ -498,6 +617,7 @@ mod tests {
                 .unwrap()
                 .map(|h| h.as_str().to_string()),
             arch_id: Some("qwen3".into()),
+            content_hash: None,
         };
         let mut plan = Plan::new_skeleton(
             Id::new("a".repeat(64)).unwrap(),
@@ -523,12 +643,7 @@ mod tests {
             true
         };
         let mut on_state = |_s: RunState| {};
-        let mut ctl = GenControl {
-            cancel,
-            paused,
-            on_token: &mut on_token,
-            on_state: &mut on_state,
-        };
+        let mut ctl = GenControl::new(cancel.clone(), paused.clone(), &mut on_token, &mut on_state);
         let req = GenerateRequest {
             request_id: "t1".into(),
             prompt_tokens: prompt,
@@ -596,12 +711,8 @@ mod tests {
             let paused = Arc::new(AtomicBool::new(false));
             let mut on_token = |_i: u64, _t: &str| true;
             let mut on_state = |_s: RunState| {};
-            let mut ctl = GenControl {
-                cancel,
-                paused,
-                on_token: &mut on_token,
-                on_state: &mut on_state,
-            };
+            let mut ctl =
+                GenControl::new(cancel.clone(), paused.clone(), &mut on_token, &mut on_state);
             let req = GenerateRequest {
                 request_id: "t2".into(),
                 prompt_tokens: vec![1; 200],
@@ -631,12 +742,7 @@ mod tests {
             true
         };
         let mut on_state = |_s: RunState| {};
-        let mut ctl = GenControl {
-            cancel,
-            paused,
-            on_token: &mut on_token,
-            on_state: &mut on_state,
-        };
+        let mut ctl = GenControl::new(cancel.clone(), paused.clone(), &mut on_token, &mut on_state);
         let req = GenerateRequest {
             request_id: "t3".into(),
             prompt_tokens: vec![4, 5],
@@ -658,7 +764,7 @@ mod tests {
         let tokens = [2u32, 4, 6, 8];
         let mut seen = Vec::new();
         let scored = engine
-            .score(&tokens, &[1, 3], &mut |pos, logits| {
+            .score(&tokens, &[1, 3], &|| false, &mut |pos, logits| {
                 seen.push((pos, logits.len(), logits[0]));
                 true
             })
@@ -669,14 +775,14 @@ mod tests {
         // Logits at the same position are deterministic across runs.
         let mut a = Vec::new();
         engine
-            .score(&tokens, &[3], &mut |_, l| {
+            .score(&tokens, &[3], &|| false, &mut |_, l| {
                 a.extend_from_slice(l);
                 true
             })
             .unwrap();
         let mut b = Vec::new();
         engine
-            .score(&tokens, &[3], &mut |_, l| {
+            .score(&tokens, &[3], &|| false, &mut |_, l| {
                 b.extend_from_slice(l);
                 true
             })
@@ -706,14 +812,14 @@ mod tests {
             .unwrap();
         let mut ra = Vec::new();
         resident
-            .score(&tokens, &[4], &mut |_, l| {
+            .score(&tokens, &[4], &|| false, &mut |_, l| {
                 ra.extend_from_slice(l);
                 true
             })
             .unwrap();
         let mut sb = Vec::new();
         streamed
-            .score(&tokens, &[4], &mut |_, l| {
+            .score(&tokens, &[4], &|| false, &mut |_, l| {
                 sb.extend_from_slice(l);
                 true
             })
@@ -722,6 +828,55 @@ mod tests {
         let stats = streamed.stats();
         assert!(stats.evictions > 0, "forced streaming exercised: {stats:?}");
         assert_eq!(stats.in_flight_leases, 0, "leases drain after scoring");
+    }
+
+    #[test]
+    fn governor_trim_epoch_evicts_caches_during_generation() {
+        let (_dir, artifact, plan) = fixture();
+        let mut engine = TuckCore::new();
+        engine
+            .load(
+                &plan,
+                &artifact,
+                Some(&serde_json::json!({"weight_cache_bytes": 65536, "block_bytes": 65536})),
+            )
+            .unwrap();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let paused = Arc::new(AtomicBool::new(false));
+        let trim = engine.trim_epoch();
+        // Bump the epoch from "the governor" mid-run via the token callback.
+        let trim2 = trim.clone();
+        let mut bumped = false;
+        let mut on_token = |_i: u64, _t: &str| {
+            if !bumped {
+                bumped = true;
+                trim2.fetch_add(1, Ordering::Relaxed);
+            }
+            true
+        };
+        let mut on_state = |_s: RunState| {};
+        let mut ctl = GenControl::new(cancel, paused, &mut on_token, &mut on_state);
+        ctl.trim_epoch = trim.clone();
+        let req = GenerateRequest {
+            request_id: "trim".into(),
+            prompt_tokens: vec![1, 2],
+            max_output_tokens: 8,
+            stop: vec![],
+            seed: 0,
+        };
+        let before = engine.stats().evictions;
+        let outcome = engine.generate(&req, &mut ctl).unwrap();
+        assert_eq!(outcome.committed, 8);
+        let after = engine.stats().evictions;
+        assert!(
+            after > before,
+            "trim request must evict expendable caches at a safe point (before {before}, after {after})"
+        );
+        assert_eq!(
+            engine.stats().in_flight_leases,
+            0,
+            "trim never touches in-flight buffers"
+        );
     }
 
     #[test]

@@ -9,6 +9,7 @@ description = "Tuckmill reference backend: pinned llama.cpp via a checked C shim
 [dependencies]
 tuckmill-manifest.workspace = true
 tuckmill-backend.workspace = true
+serde.workspace = true
 serde_json.workspace = true
 libc.workspace = true
 

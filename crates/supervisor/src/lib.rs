@@ -15,6 +15,8 @@ pub mod pressure;
 pub mod proto;
 pub mod queue;
 pub mod runtime;
+pub mod scoring;
+pub mod tokenization;
 pub mod verify;
 pub mod worker;
 pub mod worker_host;

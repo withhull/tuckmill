@@ -100,6 +100,8 @@ pub fn dispatch(cmd: &Cmd, json: bool, data_dir: Option<&Path>) -> Result<ExitCo
             reference,
             tolerance,
             tuckcore_profile,
+            kv_precision,
+            held_out,
         } => verify(
             model,
             memory_budget.as_deref(),
@@ -109,6 +111,8 @@ pub fn dispatch(cmd: &Cmd, json: bool, data_dir: Option<&Path>) -> Result<ExitCo
             *reference,
             *tolerance,
             tuckcore_profile,
+            kv_precision,
+            *held_out,
             json,
             data_dir,
         ),
@@ -781,14 +785,13 @@ fn run(
     let prompt_tokens = if synthetic {
         tuckmill_supervisor::engine::synthetic_prompt_tokens(&prompt, 4096)
     } else {
-        // Real tokenization from the artifact's own tokenizer tables.
-        let tokenizer = artifact_tokenizer(&runtime, &artifact)?;
-        if let Some(note) = tokenizer.pretokenizer_note() {
-            if !quiet {
-                eprintln!("note: {note}");
-            }
+        // Reference-first tokenization (llama.cpp when configured; exact
+        // gpt2-style fallback otherwise; refusal rather than approximation).
+        let encoder = artifact_encoder(&runtime, &artifact)?;
+        if !quiet {
+            eprintln!("note: {}", encoder.note());
         }
-        tokenizer.encode(&prompt, false)?
+        encoder.encode(&prompt, false)?
     };
 
     if !quiet {
@@ -1087,14 +1090,15 @@ fn bench(
     Ok(ExitCode::SUCCESS)
 }
 
-/// Load the artifact's own tokenizer (bounded header read, no weights).
-fn artifact_tokenizer(
+/// Open the reference-first artifact encoder (bounded header read; the
+/// llama.cpp vocab-only load is cheap and used in preference whenever the
+/// pinned library is configured).
+fn artifact_encoder(
     runtime: &Arc<Runtime>,
     artifact: &tuckmill_manifest::records::ModelArtifact,
-) -> Result<tuckmill_tuckcore::tokenizer::Tokenizer> {
+) -> Result<tuckmill_supervisor::tokenization::ArtifactEncoder> {
     let path = runtime.layout.artifact_payload_path(&artifact.artifact_id);
-    let insp = gguf::inspect(&path, &gguf::Limits::default())?;
-    tuckmill_tuckcore::tokenizer::Tokenizer::from_gguf(&insp)
+    tuckmill_supervisor::tokenization::open_encoder(&path, None)
 }
 
 // ---------------- verify ----------------
@@ -1109,6 +1113,8 @@ fn verify(
     reference: bool,
     tolerance: f64,
     tuckcore_profile: &str,
+    kv_precision: &str,
+    held_out: bool,
     json: bool,
     data_dir: Option<&Path>,
 ) -> Result<ExitCode> {
@@ -1140,6 +1146,8 @@ fn verify(
                 None
             },
             tuckcore_profile: profile,
+            kv_precision: kv_precision.to_string(),
+            held_out,
             ..Default::default()
         };
         runtime.run_reference_comparison(&plan, &artifact_ref, &options)?
@@ -1151,7 +1159,7 @@ fn verify(
         };
         runtime.run_equivalence(&plan, &artifact_ref, &options)?
     };
-    let passed = report.passed;
+    let passed = report.passed.unwrap_or(false);
     if json {
         println!(
             "{}",

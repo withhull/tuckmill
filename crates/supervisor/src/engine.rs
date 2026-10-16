@@ -254,6 +254,7 @@ impl tuckmill_backend::InferenceBackend for ReferenceTestEngine {
         &mut self,
         _tokens: &[u32],
         _positions: &[u64],
+        _cancelled: &dyn Fn() -> bool,
         _sink: &mut dyn FnMut(u64, &[f32]) -> bool,
     ) -> Result<u64> {
         Err(TuckmillError::new(
@@ -277,6 +278,7 @@ fn pause_loop(ctl: &mut GenControl<'_>, mut remaining: Duration) -> Result<()> {
     let slice = Duration::from_millis(2);
     let mut paused_reported = false;
     while remaining > Duration::ZERO {
+        ctl.poll();
         if ctl.cancel.load(Ordering::Relaxed) {
             return Ok(());
         }
@@ -342,12 +344,7 @@ mod tests {
             true
         };
         let mut on_state = |s: RunState| states.push(s);
-        let mut ctl = GenControl {
-            cancel,
-            paused,
-            on_token: &mut on_token,
-            on_state: &mut on_state,
-        };
+        let mut ctl = GenControl::new(cancel.clone(), paused.clone(), &mut on_token, &mut on_state);
         let outcome = engine.generate(req, &mut ctl).unwrap();
         (outcome, text, states)
     }
@@ -382,12 +379,7 @@ mod tests {
         let paused = Arc::new(AtomicBool::new(false));
         let mut on_token = |_i: u64, _t: &str| true;
         let mut on_state = |_s: RunState| {};
-        let mut ctl = GenControl {
-            cancel,
-            paused,
-            on_token: &mut on_token,
-            on_state: &mut on_state,
-        };
+        let mut ctl = GenControl::new(cancel.clone(), paused.clone(), &mut on_token, &mut on_state);
         let err = engine.generate(&request(1000), &mut ctl).unwrap_err();
         assert_eq!(err.code(), ErrorCode::ContextExceedsBudget);
     }
@@ -424,12 +416,7 @@ mod tests {
             true
         };
         let mut on_state = |_s: RunState| {};
-        let mut ctl = GenControl {
-            cancel,
-            paused,
-            on_token: &mut on_token,
-            on_state: &mut on_state,
-        };
+        let mut ctl = GenControl::new(cancel.clone(), paused.clone(), &mut on_token, &mut on_state);
         let outcome = engine.generate(&request(100), &mut ctl).unwrap();
         assert_eq!(outcome.finish_reason, FinishReason::Cancelled);
         assert!(outcome.committed < 100);
@@ -451,12 +438,7 @@ mod tests {
             std::thread::sleep(Duration::from_millis(60));
             paused2.store(false, Ordering::Relaxed);
         });
-        let mut ctl = GenControl {
-            cancel,
-            paused,
-            on_token: &mut on_token,
-            on_state: &mut on_state,
-        };
+        let mut ctl = GenControl::new(cancel.clone(), paused.clone(), &mut on_token, &mut on_state);
         let outcome = engine.generate(&request(4), &mut ctl).unwrap();
         assert_eq!(outcome.committed, 4);
         assert!(
@@ -500,6 +482,7 @@ mod tests {
             tensor_index_hash: "0".repeat(64),
             tokenizer_hash: None,
             arch_id: None,
+            content_hash: None,
         };
         let note = tuckmill_backend::InferenceBackend::load(
             &mut engine,
@@ -509,6 +492,8 @@ mod tests {
         )
         .expect("synthetic load ignores the artifact");
         assert!(note.contains("synthetic"));
-        assert!(engine.score(&[1, 2], &[1], &mut |_, _| true).is_err());
+        assert!(engine
+            .score(&[1, 2], &[1], &|| false, &mut |_, _| true)
+            .is_err());
     }
 }

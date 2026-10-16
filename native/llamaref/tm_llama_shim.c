@@ -26,7 +26,7 @@
 #include <string.h>
 #include <stdlib.h>
 
-#define TM_SHIM_VERSION 1
+#define TM_SHIM_VERSION 3
 
 typedef struct tm_llama {
     struct llama_model   *model;
@@ -35,8 +35,17 @@ typedef struct tm_llama {
     struct llama_sampler *sampler;
     uint32_t n_ctx;
     int32_t  pos; /* next decode position in the (single) sequence */
+    int      kv_f16; /* KV cache type actually configured */
+    int      n_threads;
     int      backend_initialized;
 } tm_llama;
+
+static void tm_log_filter(enum ggml_log_level level, const char * text, void * user_data) {
+    (void) user_data;
+    if (level >= GGML_LOG_LEVEL_WARN) {
+        fputs(text, stderr);
+    }
+}
 
 static void tm_set_err(char *err, int cap, const char *msg) {
     if (err == NULL || cap <= 0) {
@@ -53,15 +62,34 @@ const char *tm_llama_build_info(void) {
     return "llama.cpp pinned revision (see scripts/fetch-llama.sh)";
 }
 
-tm_llama *tm_load(const char *path, int n_ctx, int n_threads, char *err, int err_cap) {
+tm_llama *tm_load(const char *path, int n_ctx, int n_threads, int kv_f16,
+                  int vocab_only, char *err, int err_cap) {
     if (path == NULL) {
         tm_set_err(err, err_cap, "null model path");
         return NULL;
+    }
+    /* Route llama.cpp logging through a filter that keeps WARN/ERROR and
+     * drops INFO/DEBUG noise (Metal registration banners, loader chatter).
+     * Real problems still reach stderr; product output stays clean. */
+    static int log_filter_installed = 0;
+    if (!log_filter_installed) {
+        llama_log_set(tm_log_filter, NULL);
+        log_filter_installed = 1;
     }
     llama_backend_init();
 
     struct llama_model_params mparams = llama_model_default_params();
     mparams.n_gpu_layers = 0; /* CPU reference path (see header comment) */
+    mparams.vocab_only   = vocab_only != 0; /* tokenizer reference loads vocab only */
+    /* Pin to the CPU device: this prevents GPU backend initialization (Metal
+     * shader compilation, device probing) for a CPU reference path, keeping
+     * vocabulary-only loads and full loads quiet and fast. GPU offload is a
+     * separately measured milestone. */
+    ggml_backend_dev_t cpu_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+    ggml_backend_dev_t cpu_devs[2] = { cpu_dev, NULL };
+    if (cpu_dev != NULL) {
+        mparams.devices = cpu_devs;
+    }
 
     struct llama_model *model = llama_model_load_from_file(path, mparams);
     if (model == NULL) {
@@ -70,6 +98,26 @@ tm_llama *tm_load(const char *path, int n_ctx, int n_threads, char *err, int err
     }
 
     const struct llama_vocab *vocab = llama_model_get_vocab(model);
+
+    if (vocab_only) {
+        tm_llama *h = (tm_llama *) calloc(1, sizeof(tm_llama));
+        if (h == NULL) {
+            llama_model_free(model);
+            tm_set_err(err, err_cap, "out of memory");
+            return NULL;
+        }
+        h->model = model;
+        h->ctx = NULL;
+        h->vocab = vocab;
+        h->sampler = NULL;
+        h->n_ctx = 0;
+        h->pos = 0;
+        h->kv_f16 = 0;
+        h->n_threads = 0;
+        h->backend_initialized = 1;
+        return h;
+    }
+
     const uint32_t n_ctx_train = llama_model_n_ctx_train(model);
 
     struct llama_context_params cparams = llama_context_default_params();
@@ -77,6 +125,10 @@ tm_llama *tm_load(const char *path, int n_ctx, int n_threads, char *err, int err
                                : (n_ctx_train > 0 ? n_ctx_train : 512u);
     cparams.n_threads = (n_threads > 0) ? n_threads : 4;
     cparams.n_threads_batch = cparams.n_threads;
+    /* Explicit KV cache type: the diagnostic comparison must know and match
+     * cache precision on both sides. */
+    cparams.type_k = kv_f16 ? GGML_TYPE_F16 : GGML_TYPE_F32;
+    cparams.type_v = kv_f16 ? GGML_TYPE_F16 : GGML_TYPE_F32;
 
     struct llama_context *ctx = llama_init_from_model(model, cparams);
     if (ctx == NULL) {
@@ -103,8 +155,19 @@ tm_llama *tm_load(const char *path, int n_ctx, int n_threads, char *err, int err
     h->sampler = sampler;
     h->n_ctx = llama_n_ctx(ctx);
     h->pos = 0;
+    h->kv_f16 = kv_f16 ? 1 : 0;
+    h->n_threads = cparams.n_threads;
     h->backend_initialized = 1;
     return h;
+}
+
+/* KV cache element type in use: 1 = f16, 0 = f32. */
+int32_t tm_kv_type(const tm_llama *h) {
+    return h ? h->kv_f16 : -1;
+}
+
+int32_t tm_n_threads(const tm_llama *h) {
+    return h ? h->n_threads : -1;
 }
 
 void tm_free(tm_llama *h) {
@@ -154,7 +217,7 @@ int32_t tm_token_to_piece(const tm_llama *h, int32_t id, char *buf, int32_t cap)
 
 /* Append tokens at the current position. Returns 0 on success. */
 int32_t tm_decode(tm_llama *h, const int32_t *ids, int32_t n) {
-    if (h == NULL || ids == NULL || n <= 0) {
+    if (h == NULL || h->ctx == NULL || ids == NULL || n <= 0) {
         return -1;
     }
     if ((uint32_t) (h->pos + n) > h->n_ctx) {
@@ -180,7 +243,7 @@ int32_t tm_decode(tm_llama *h, const int32_t *ids, int32_t n) {
 
 /* Forget all KV state; the next decode starts at position 0. */
 int32_t tm_reset(tm_llama *h) {
-    if (h == NULL) {
+    if (h == NULL || h->ctx == NULL) {
         return -1;
     }
     llama_memory_clear(llama_get_memory(h->ctx), true);
@@ -191,7 +254,7 @@ int32_t tm_reset(tm_llama *h) {
 
 /* Copy the logits of the last decoded token into out; returns vocab size. */
 int32_t tm_logits(tm_llama *h, float *out, int32_t cap) {
-    if (h == NULL || out == NULL) {
+    if (h == NULL || h->ctx == NULL || out == NULL) {
         return -1;
     }
     const int32_t n = llama_vocab_n_tokens(h->vocab);
@@ -208,7 +271,7 @@ int32_t tm_logits(tm_llama *h, float *out, int32_t cap) {
 
 /* Greedy sample from the last decoded token's logits. */
 int32_t tm_sample_greedy(tm_llama *h, int32_t *out_token) {
-    if (h == NULL || out_token == NULL) {
+    if (h == NULL || h->ctx == NULL || out_token == NULL) {
         return -1;
     }
     const llama_token id = llama_sampler_sample(h->sampler, h->ctx, -1);

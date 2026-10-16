@@ -22,7 +22,12 @@ quality.
 > logits under registered per-dtype tolerances, and the scalar oracle's gap
 > to llama.cpp CPU is measured (that gap, not vibes, names the kernel work).
 > Nothing is certified; no Metal kernels exist (K01–K09 specified); no
-> performance comparative claim is made. See
+> performance comparative claim is made. Stage A verification is hardened:
+> malformed scoring fails closed, verification records are immutable with
+> held-out qualification, the governor drives real backend commands
+> (protocol v4), tokenization is reference-first (llama.cpp when configured;
+> non-GPT-2 pre-tokenizers are refused, never approximated), and executors
+> verify the artifact's full content digest before running. See
 > [docs/certification-matrix.md](docs/certification-matrix.md) and
 > [docs/claims.md](docs/claims.md).
 
@@ -33,6 +38,7 @@ scripts/build.sh                # cargo build + native ABI stub check
 scripts/test.sh                 # fmt + clippy -D warnings + full test suite
 scripts/demo.sh                 # end-to-end on a generated fixture
 scripts/fetch-llama.sh          # pinned llama.cpp reference build + tm shim (into .deps/)
+                                # powers --engine llama, verify --reference, and reference-first tokenization
 
 tuckmill doctor                                  # device profile, honest labels
 tuckmill inspect model.gguf                      # validate without loading weights
@@ -150,7 +156,8 @@ scripts/            build.sh, test.sh, demo.sh
 
 ## Verification and benchmarks
 
-`scripts/test.sh` runs formatting, `clippy -D warnings`, and 236 tests,
+`scripts/test.sh` runs formatting, `clippy -D warnings`, and the full test
+suite (288 tests),
 including adversarial GGUF/Safetensors fixtures, planner math, governor
 semantics, import/pack fault injection, worker-protocol framing, HTTP
 auth/SSE, CLI end-to-end runs (isolated worker, crash injection, SIGINT

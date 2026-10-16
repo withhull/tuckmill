@@ -1,4 +1,4 @@
-# Worker control protocol (v2)
+# Worker control protocol (v4)
 
 Wire contract between the Tuckmill supervisor and an execution worker. The
 transport is a private Unix domain socket under the store's `tmp/` directory.
@@ -15,9 +15,17 @@ payload := UTF-8 JSON, one message object
 
 - `length` must be `1..=1_048_576` bytes (1 MiB). Frames outside the range
   fail as `WORKER_FAILED`; they are never buffered or truncated.
-- v2 (ADR-005) adds: `ArtifactRef` + backend options on `Load`; the
-  `Score`/`ScoreChunk`/`ScoreDone` teacher-forced evaluation messages; backend
-  statistics on `StatsAck`. v1 plans are `PLAN_STALE`.
+- v2 (ADR-005): `ArtifactRef` + backend options on `Load`;
+  `Score`/`ScoreChunk`/`ScoreDone` teacher-forced evaluation; backend
+  statistics on `StatsAck`.
+- v3: `ScoreChunk` carries an `offset`; one position's logits stream in
+  multiple frames sized for the 1 MiB cap (150k+ vocabularies).
+- v4: `Control`/`ControlAck` frames give the governor a real command
+  contract — `trim-caches` (applied by engines at safe checkpoints; in-flight
+  buffers are never released) and `set-prefetch=on/off` (recorded; no
+  speculative prefetch exists in this build). Workers emit heartbeats from a
+  helper thread during long single-step compute, and supervisors skip
+  heartbeats when awaiting meaningful frames. Older plans are `PLAN_STALE`.
 - Clean EOF before the first byte of a frame closes the session. EOF mid-frame
   is `WORKER_FAILED`.
 - All fields are validated before use; unknown message tags are protocol
@@ -49,6 +57,8 @@ Every message is a JSON object with `"t"` as the tag:
 | `Score` | C→W | `request_id`, `tokens` (exact ids), `positions` | Bounded: ≤16384 tokens, ≤64 positions, positions within the sequence. |
 | `ScoreChunk` | W→C | `position`, `logits` (vocabulary order, f32) | Teacher-forced logits for one position. |
 | `ScoreDone` | W→C | `scored` | Terminal for the scoring request. |
+| `Control` | C→W | `action` | Governor/administrative command (`trim-caches`, `set-prefetch=on/off`). Applied locally; engines act at safe checkpoints. |
+| `ControlAck` | W→C | `action`, `result` | Honest result string ("queued", "recorded", "unsupported ..."). |
 | `Stats` | C→W | — | Request for `StatsAck`. |
 | `StatsAck` | W→C | `footprint_bytes`, `uptime_ms`, optional backend stats | Backend stats: logical reads, cache hits/misses, evictions, in-flight leases. Measured or 0-with-no-claim; never guessed. |
 | `Shutdown` | C→W | — | Worker replies `Bye` and exits. |

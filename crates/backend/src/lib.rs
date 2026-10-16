@@ -93,6 +93,11 @@ pub struct ArtifactRef {
     /// Resolved architecture, when known; used for capability gating.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub arch_id: Option<String>,
+    /// Canonical chunked content digest of the payload, when the store
+    /// recorded one. Engines may verify it before executing (bounded
+    /// full-file verification; see backend load options).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content_hash: Option<String>,
 }
 
 /// Scheduling states surfaced to users (PRD §7.1).
@@ -153,10 +158,45 @@ pub struct GenControl<'a> {
     /// Safe-boundary pause; cleared by the supervisor after the stability
     /// window. A backend must pause after the current committed token.
     pub paused: Arc<AtomicBool>,
+    /// Cache-trim epoch: the governor increments this to request that
+    /// expendable caches be released. Engines that own caches check it at
+    /// safe points (never releasing in-flight buffers) and apply the trim.
+    pub trim_epoch: Arc<std::sync::atomic::AtomicU64>,
+    /// Chance to service external input (control frames, heartbeats) while
+    /// computing; backends call it during long single-step work so
+    /// cancellation and liveness do not depend on the next token callback.
+    pub poll: Option<&'a dyn Fn()>,
     /// Called for each committed token; returning false requests a stop.
     pub on_token: &'a mut dyn FnMut(u64, &str) -> bool,
     /// State transitions worth showing to the user.
     pub on_state: &'a mut dyn FnMut(RunState),
+}
+
+impl<'a> GenControl<'a> {
+    /// Standard construction; `trim_epoch` starts fresh and can be replaced
+    /// with a shared handle where a governor needs to reach it.
+    pub fn new(
+        cancel: Arc<AtomicBool>,
+        paused: Arc<AtomicBool>,
+        on_token: &'a mut dyn FnMut(u64, &str) -> bool,
+        on_state: &'a mut dyn FnMut(RunState),
+    ) -> Self {
+        Self {
+            cancel,
+            paused,
+            trim_epoch: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            poll: None,
+            on_token,
+            on_state,
+        }
+    }
+
+    /// Service external input if a poll hook is installed.
+    pub fn poll(&self) {
+        if let Some(poll) = self.poll {
+            poll();
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -181,6 +221,14 @@ pub struct BackendStats {
     /// Process footprint attributed to the backend, when measurable.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub footprint_bytes: Option<u64>,
+    /// Actual KV cache precision in use ("f16"/"f32"), reported by the
+    /// backend — comparisons must rely on the backend's report, not on the
+    /// supervisor's request.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kv_precision: Option<String>,
+    /// Thread count in use for compute, when the backend is threaded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub threads: Option<u32>,
 }
 
 /// The versioned backend contract.
@@ -216,14 +264,28 @@ pub trait InferenceBackend: Send {
     /// `(position, logits)`; returning false stops early. Returns the number
     /// of scored positions. Implementations must bound the vocabulary-logit
     /// matrix per step (no full long-context matrix in RAM).
+    ///
+    /// `cancelled` must be consulted between positions (and, where possible,
+    /// inside long per-position compute) so a stalled or cancelled scoring
+    /// request can always terminate; implementations return `CANCELLED`
+    /// rather than a partial ScoreDone when it fires.
     fn score(
         &mut self,
         tokens: &[u32],
         positions: &[u64],
+        cancelled: &dyn Fn() -> bool,
         sink: &mut dyn FnMut(u64, &[f32]) -> bool,
     ) -> Result<u64>;
 
     fn stats(&self) -> BackendStats;
+
+    /// Shared cache-trim epoch handle. The governor increments it; engines
+    /// that own expendable caches observe the change at safe checkpoints and
+    /// release what can be released (never in-flight buffers). Engines
+    /// without managed caches return a fresh handle and ignore it.
+    fn trim_epoch(&self) -> Arc<std::sync::atomic::AtomicU64> {
+        Arc::new(std::sync::atomic::AtomicU64::new(0))
+    }
 
     /// Release buffers after completion fences. Idempotent.
     fn shutdown(&mut self);
@@ -247,6 +309,7 @@ impl ArtifactRef {
                 .as_ref()
                 .map(|h| h.as_str().to_string()),
             arch_id: artifact.arch_id.clone(),
+            content_hash: Some(artifact.content_hash.as_str().to_string()),
         }
     }
 }

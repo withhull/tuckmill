@@ -5,11 +5,13 @@
 //! `WORKER_FAILED` with the last acknowledged output position retained, and
 //! never fabricated continuation state (PRD §7.4).
 
+use std::collections::VecDeque;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use tuckmill_backend::{ArtifactRef, BackendStats, EngineKind};
@@ -22,6 +24,9 @@ use crate::proto::{hello, validate_handshake, WorkerFrame};
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const FRAME_TIMEOUT: Duration = Duration::from_secs(30);
 const CANCEL_GRACE: Duration = Duration::from_secs(3);
+/// Absolute wall-clock budget for one scoring request: heartbeats prove the
+/// worker is alive, but must never let a stalled request run forever.
+pub const DEFAULT_SCORE_DEADLINE: Duration = Duration::from_secs(900);
 
 pub struct IsolatedWorker {
     child: Child,
@@ -31,6 +36,9 @@ pub struct IsolatedWorker {
     pub engine: String,
     pub certified: bool,
     last_frame: Instant,
+    /// Governor commands queued by other threads; the generate/score loops
+    /// flush them to the worker as Control frames at read checkpoints.
+    pending_controls: Arc<Mutex<VecDeque<String>>>,
 }
 
 impl IsolatedWorker {
@@ -92,6 +100,7 @@ impl IsolatedWorker {
             engine: String::new(),
             certified: false,
             last_frame: Instant::now(),
+            pending_controls: Arc::new(Mutex::new(VecDeque::new())),
         };
         worker.handshake()?;
         Ok(worker)
@@ -99,7 +108,7 @@ impl IsolatedWorker {
 
     fn handshake(&mut self) -> Result<()> {
         hello(&crate::engine::build_id()).write_to(&mut self.stream)?;
-        match self.read_frame_timed(FRAME_TIMEOUT)? {
+        match self.read_frame_skipping_heartbeats(FRAME_TIMEOUT)? {
             Some(WorkerFrame::HelloAck {
                 protocol,
                 abi,
@@ -136,7 +145,7 @@ impl IsolatedWorker {
             options: options.cloned(),
         }
         .write_to(&mut self.stream)?;
-        match self.read_frame_timed(FRAME_TIMEOUT)? {
+        match self.read_frame_skipping_heartbeats(FRAME_TIMEOUT)? {
             Some(WorkerFrame::Loaded { note, .. }) => Ok(note),
             Some(WorkerFrame::Error {
                 code,
@@ -181,6 +190,7 @@ impl IsolatedWorker {
         let mut cancel_sent_at: Option<Instant> = None;
         let mut paused_reported = false;
         loop {
+            self.flush_controls()?;
             if cancel.load(Ordering::Relaxed) && cancel_sent_at.is_none() {
                 let _ = WorkerFrame::Cancel {
                     request_id: request_id.clone(),
@@ -295,7 +305,7 @@ impl IsolatedWorker {
     /// Query worker statistics.
     pub fn stats(&mut self) -> Result<(u64, u64, Option<BackendStats>)> {
         WorkerFrame::Stats.write_to(&mut self.stream)?;
-        match self.read_frame_timed(FRAME_TIMEOUT)? {
+        match self.read_frame_skipping_heartbeats(FRAME_TIMEOUT)? {
             Some(WorkerFrame::StatsAck {
                 footprint_bytes,
                 uptime_ms,
@@ -315,11 +325,18 @@ impl IsolatedWorker {
     /// Teacher-forced scoring: requests bounded logits for the listed
     /// positions and returns them in request order. Bounded by the protocol
     /// (<= 64 positions, <= 16384 tokens per request) and by the caller.
+    /// Teacher-forced scoring: requests bounded logits for the listed
+    /// positions and returns them in request order. Bounded by the protocol
+    /// (<= 64 positions, <= 16384 tokens per request), by the accumulation
+    /// caps in `scoring`, and by `deadline` — heartbeats keep liveness
+    /// evidence flowing but never extend the absolute budget; expiry cancels
+    /// at a position boundary.
     pub fn score(
         &mut self,
         request_id: &str,
         tokens: &[u32],
         positions: &[u64],
+        deadline: Duration,
     ) -> Result<Vec<(u64, Vec<f32>)>> {
         WorkerFrame::Score {
             request_id: request_id.to_string(),
@@ -327,53 +344,58 @@ impl IsolatedWorker {
             positions: positions.to_vec(),
         }
         .write_to(&mut self.stream)?;
-        let mut out: Vec<(u64, Vec<f32>)> = Vec::with_capacity(positions.len());
+        let mut acc = crate::scoring::ScoreAccumulator::new();
+        let deadline = Instant::now() + deadline;
+        let mut cancel_sent = false;
         loop {
-            match self.read_frame_timed(FRAME_TIMEOUT)? {
+            self.flush_controls()?;
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                if !cancel_sent {
+                    let _ = WorkerFrame::Cancel {
+                        request_id: request_id.to_string(),
+                    }
+                    .write_to(&mut self.stream);
+                    cancel_sent = true;
+                }
+                // Grace: accept a clean acknowledgement, never a partial row.
+                match self.read_frame_timed(CANCEL_GRACE)? {
+                    Some(WorkerFrame::Error { code, .. }) if code == "CANCELLED" => {
+                        return Err(TuckmillError::new(
+                            ErrorCode::WorkerFailed,
+                            "scoring exceeded its deadline and was cancelled at a position boundary",
+                        ));
+                    }
+                    Some(WorkerFrame::Error {
+                        code,
+                        message,
+                        action,
+                    }) => {
+                        return Err(map_worker_error(&code, &message, &action));
+                    }
+                    Some(_) => {}
+                    None => {
+                        let _ = self.child.kill();
+                        return Err(TuckmillError::new(
+                            ErrorCode::WorkerFailed,
+                            "scoring exceeded its deadline; the worker did not acknowledge cancellation and was terminated",
+                        ));
+                    }
+                }
+                continue;
+            }
+            match self.read_frame_timed(remaining.min(FRAME_TIMEOUT))? {
                 Some(WorkerFrame::ScoreChunk {
                     position,
                     offset,
                     logits,
-                }) => match out.last_mut() {
-                    Some((last_position, buffer)) if *last_position == position => {
-                        if offset as usize != buffer.len() {
-                            return Err(TuckmillError::new(
-                                    ErrorCode::WorkerFailed,
-                                    format!(
-                                        "score chunk gap for position {position}: offset {offset} after {} values",
-                                        buffer.len()
-                                    ),
-                                ));
-                        }
-                        buffer.extend_from_slice(&logits);
-                    }
-                    _ => {
-                        if offset != 0 {
-                            return Err(TuckmillError::new(
-                                    ErrorCode::WorkerFailed,
-                                    format!(
-                                        "score chunks for position {position} started at offset {offset}"
-                                    ),
-                                ));
-                        }
-                        out.push((position, logits));
-                    }
-                },
+                }) => {
+                    acc.push_chunk(position, offset, &logits)?;
+                }
                 Some(WorkerFrame::Heartbeat { .. }) => {}
+                Some(WorkerFrame::ControlAck { .. }) => {}
                 Some(WorkerFrame::ScoreDone { scored }) => {
-                    let matches_request = out.len() == scored as usize
-                        && out.iter().map(|(p, _)| *p).eq(positions.iter().copied());
-                    if !matches_request {
-                        return Err(TuckmillError::new(
-                            ErrorCode::WorkerFailed,
-                            format!(
-                                "worker scored {scored} positions but streamed {} (expected {:?})",
-                                out.len(),
-                                positions
-                            ),
-                        ));
-                    }
-                    return Ok(out);
+                    return acc.finish(scored, positions);
                 }
                 Some(WorkerFrame::Error {
                     code,
@@ -402,6 +424,46 @@ impl IsolatedWorker {
 
     pub fn pid(&self) -> u32 {
         self.child.id()
+    }
+
+    /// Handle for other threads (governor) to enqueue backend commands; the
+    /// running loop flushes them within one read slice.
+    pub fn controls(&self) -> Arc<Mutex<VecDeque<String>>> {
+        self.pending_controls.clone()
+    }
+
+    /// Flush queued Control frames; called from the generate/score read loops
+    /// so mid-run commands reach the worker without contending for its lock.
+    fn flush_controls(&mut self) -> Result<()> {
+        let actions: Vec<String> = {
+            let mut queue = self.pending_controls.lock().map_err(|_| {
+                TuckmillError::new(ErrorCode::WorkerFailed, "control queue poisoned")
+            })?;
+            queue.drain(..).collect()
+        };
+        for action in actions {
+            WorkerFrame::Control { action }.write_to(&mut self.stream)?;
+        }
+        Ok(())
+    }
+
+    /// Read the next meaningful frame, skipping heartbeats (they are
+    /// liveness evidence, never protocol payload).
+    fn read_frame_skipping_heartbeats(&mut self, timeout: Duration) -> Result<Option<WorkerFrame>> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err(TuckmillError::new(
+                    ErrorCode::WorkerFailed,
+                    "worker produced no meaningful frame within the timeout",
+                ));
+            }
+            match self.read_frame_timed(remaining)? {
+                Some(WorkerFrame::Heartbeat { .. }) => continue,
+                other => return Ok(other),
+            }
+        }
     }
 
     fn read_frame_timed(&mut self, timeout: Duration) -> Result<Option<WorkerFrame>> {
@@ -529,6 +591,7 @@ mod tests {
             tensor_index_hash: "0".repeat(64),
             tokenizer_hash: None,
             arch_id: Some("qwen3".into()),
+            content_hash: None,
         };
         let note = worker.load(&plan, &artifact, None).unwrap();
         assert!(note.contains("synthetic"));

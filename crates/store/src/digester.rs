@@ -72,19 +72,20 @@ impl DigestJournal {
         Ok(())
     }
 
-    /// Final digest from the journal; None while incomplete knowledge.
-    ///
-    /// The canonical form includes the chunking profile so that identity is
-    /// reproducible from the journal alone; two files digested under
-    /// different chunk profiles are distinct identities by construction.
+    /// Final digest from the journal. Delegates to the shared canonical
+    /// implementation (`tuckmill_manifest::digest`) so store imports and
+    /// executor payload verification agree by construction.
     pub fn final_digest(&self) -> Id {
-        let mut hasher = Sha256::new();
-        hasher.update(b"tm-chunks-v1\n");
-        hasher.update(format!("chunk:{}\n", self.chunk_bytes).as_bytes());
-        for c in &self.chunks {
-            hasher.update(format!("{}:{}\n", c.len, c.sha256).as_bytes());
-        }
-        Id::new(hex(&hasher.finalize())).expect("sha256 is valid hex")
+        let rows: Vec<(u64, String)> = self
+            .chunks
+            .iter()
+            .map(|c| (c.len, c.sha256.clone()))
+            .collect();
+        Id::new(tuckmill_manifest::digest::final_digest(
+            self.chunk_bytes,
+            &rows,
+        ))
+        .expect("sha256 is valid hex")
     }
 
     /// Sum of recorded chunk lengths.

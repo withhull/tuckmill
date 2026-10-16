@@ -6,7 +6,7 @@
 //! happens inside the worker (isolated process by default).
 
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::mpsc::{sync_channel, Receiver, SyncSender};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -27,6 +27,10 @@ use tuckmill_store::aliases;
 use tuckmill_store::layout::StoreLayout;
 
 use crate::admission::{LedgerStats, LiveLedger};
+
+/// Governor command queue shared with the live worker (queued by monitor
+/// threads, flushed by the generate/score loops).
+pub type ControlQueue = Arc<Mutex<Option<Arc<Mutex<std::collections::VecDeque<String>>>>>>;
 use crate::engine::{FinishReason, GenOutcome, ReferenceTestEngine, RunState};
 use crate::governor::{GovState, Governor, GovernorAction, GovernorConfig, GovernorSignal};
 use crate::log::Logger;
@@ -116,6 +120,8 @@ struct ActiveRequest {
     pause: Arc<AtomicBool>,
     committed: Arc<AtomicU64>,
     state: Arc<Mutex<String>>,
+    /// Governor command queue of the live worker, registered after spawn.
+    controls: ControlQueue,
 }
 
 /// Handle to a started run.
@@ -186,13 +192,16 @@ pub struct Runtime {
     monitor_thread: Mutex<Option<std::thread::JoinHandle<()>>>,
     monitor_stop: Arc<AtomicBool>,
     allow_test_engine: bool,
+    /// Worker PID for lock-free monitoring (0 = no worker).
+    worker_pid: AtomicU32,
+    /// Consecutive footprint-overrun samples (enforcement escalates at 3).
+    overrun_streak: AtomicU64,
 }
 
 struct WorkerSlot {
     worker: IsolatedWorker,
     plan_id: Id,
     kind: EngineKind,
-    pid: u32,
 }
 
 impl Runtime {
@@ -261,6 +270,8 @@ impl Runtime {
             monitor_thread: Mutex::new(None),
             monitor_stop: Arc::new(AtomicBool::new(false)),
             allow_test_engine: options.allow_test_engine,
+            worker_pid: AtomicU32::new(0),
+            overrun_streak: AtomicU64::new(0),
         });
 
         if options.monitor {
@@ -465,21 +476,23 @@ impl Runtime {
         self.engine_kind.backend_id()
     }
 
-    /// PID of the live worker, when one is running.
+    /// PID of the live worker, when one is running. Lock-free so the
+    /// governor monitor never waits on in-flight generation.
     pub fn worker_pid(&self) -> Option<u32> {
-        self.worker
-            .lock()
-            .ok()
-            .and_then(|slot| slot.as_ref().map(|s| s.pid))
+        let pid = self.worker_pid.load(Ordering::Relaxed);
+        (pid != 0).then_some(pid)
     }
 
     /// Cancel the currently active run, if any. Returns whether one was found.
     pub fn cancel_active(&self) -> bool {
-        let active = self.active.lock().expect("active lock");
-        match active.as_ref() {
-            Some(a) => {
-                a.cancel.store(true, Ordering::Relaxed);
-                a.pause.store(false, Ordering::Relaxed);
+        let flags = {
+            let active = self.active.lock().expect("active lock");
+            active.as_ref().map(|a| (a.cancel.clone(), a.pause.clone()))
+        };
+        match flags {
+            Some((cancel, pause)) => {
+                cancel.store(true, Ordering::Relaxed);
+                pause.store(false, Ordering::Relaxed);
                 true
             }
             None => false,
@@ -571,6 +584,7 @@ impl Runtime {
         let pause = Arc::new(AtomicBool::new(false));
         let committed = Arc::new(AtomicU64::new(0));
         let state = Arc::new(Mutex::new("admitted".to_string()));
+        let controls: ControlQueue = Arc::new(Mutex::new(None));
 
         // Session record (committed state only; no speculative state).
         let session = SessionRecord {
@@ -600,6 +614,7 @@ impl Runtime {
                         pause: pause.clone(),
                         committed: committed.clone(),
                         state: state.clone(),
+                        controls: controls.clone(),
                     });
                     break;
                 }
@@ -628,6 +643,7 @@ impl Runtime {
         let request_id_evt = request_id.clone();
         let session_id_evt = session_id.clone();
         let artifact_evt = artifact;
+        let controls_evt = controls.clone();
         let thread_name = format!("tuckmill-run-{request_id}");
         std::thread::Builder::new()
             .name(thread_name)
@@ -637,6 +653,7 @@ impl Runtime {
                     &artifact_evt,
                     &request_id_evt,
                     &session_id_evt,
+                    &controls_evt,
                     prompt_tokens,
                     max_output_tokens,
                     stop,
@@ -688,6 +705,7 @@ impl Runtime {
         artifact: &ArtifactRef,
         request_id: &str,
         session_id: &Id,
+        controls: &ControlQueue,
         prompt_tokens: Vec<u32>,
         max_output_tokens: u64,
         stop: Vec<String>,
@@ -744,12 +762,16 @@ impl Runtime {
                             .into_iter()
                             .collect(),
                     );
+                    self.worker_pid.store(worker.pid(), Ordering::Relaxed);
                     *slot = Some(WorkerSlot {
-                        pid: worker.pid(),
                         plan_id: plan.plan_id.clone(),
                         kind: self.engine_kind,
                         worker,
                     });
+                    if let Ok(mut slot_controls) = controls.lock() {
+                        *slot_controls =
+                            Some(slot.as_ref().expect("slot set above").worker.controls());
+                    }
                 }
                 let WorkerSlot { worker, .. } = slot.as_mut().expect("worker slot");
                 let mut token_tx = |index: u64, text: &str| -> bool {
@@ -807,12 +829,12 @@ impl Runtime {
                 let mut on_state = |s: RunState| {
                     set_state(s.as_str());
                 };
-                let mut ctl = crate::engine::GenControl {
-                    cancel: cancel.clone(),
-                    paused: pause.clone(),
-                    on_token: &mut token_tx,
-                    on_state: &mut on_state,
-                };
+                let mut ctl = crate::engine::GenControl::new(
+                    cancel.clone(),
+                    pause.clone(),
+                    &mut token_tx,
+                    &mut on_state,
+                );
                 let outcome = engine.generate(&req, &mut ctl)?;
                 self.finish_run(
                     request_id, session_id, plan, prompt_len, &outcome, started, tx,
@@ -928,35 +950,60 @@ impl Runtime {
                 }
             }
 
-            let active = self.active.lock().expect("active lock");
-            if let Some(a) = active.as_ref() {
+            // Short guard: clone the handles we need, then act without the
+            // active lock so cancellation and status never queue behind the
+            // monitor (Stage A review: no nested active->worker locking).
+            let snapshot = {
+                let active = self.active.lock().expect("active lock");
+                active.as_ref().map(|a| {
+                    (
+                        a.cancel.clone(),
+                        a.pause.clone(),
+                        a.committed.clone(),
+                        a.state.clone(),
+                        a.controls.clone(),
+                    )
+                })
+            };
+            if let Some((cancel, pause, committed, state, controls)) = snapshot {
+                let push_control = |action: &str| {
+                    if let Ok(guard) = controls.lock() {
+                        if let Some(queue) = guard.as_ref() {
+                            if let Ok(mut queue) = queue.lock() {
+                                queue.push_back(action.to_string());
+                            }
+                        }
+                    }
+                };
                 for action in actions {
                     match action {
                         GovernorAction::PauseComputeAndIo => {
-                            a.pause.store(true, Ordering::Relaxed);
-                            *a.state.lock().expect("state lock") = "paused".into();
+                            pause.store(true, Ordering::Relaxed);
+                            *state.lock().expect("state lock") = "paused".into();
                         }
                         GovernorAction::ResumeReads => {
-                            a.pause.store(false, Ordering::Relaxed);
-                            *a.state.lock().expect("state lock") = "generating".into();
+                            pause.store(false, Ordering::Relaxed);
+                            *state.lock().expect("state lock") = "generating".into();
                         }
-                        GovernorAction::ReduceSubmissionAndSpeculation
-                        | GovernorAction::TrimCaches
-                        | GovernorAction::StopPrefetchGrowth => {
-                            *a.state.lock().expect("state lock") = "throttling".into();
+                        GovernorAction::TrimCaches => {
+                            push_control("trim-caches");
+                            *state.lock().expect("state lock") = "throttling".into();
+                        }
+                        GovernorAction::StopPrefetchGrowth
+                        | GovernorAction::ReduceSubmissionAndSpeculation => {
+                            push_control("set-prefetch=off");
+                            *state.lock().expect("state lock") = "throttling".into();
                         }
                         GovernorAction::DrainThenRelease | GovernorAction::FailRequest => {
-                            a.cancel.store(true, Ordering::Relaxed);
-                            a.pause.store(false, Ordering::Relaxed);
+                            cancel.store(true, Ordering::Relaxed);
+                            pause.store(false, Ordering::Relaxed);
                         }
                     }
                 }
                 // Footprint sampling: measured, never conflated with
-                // reservations.
-                if let Ok(Some(pid)) = {
-                    let slot = self.worker.lock().expect("worker lock");
-                    Ok::<Option<u32>, ()>(slot.as_ref().map(|w| w.pid))
-                } {
+                // reservations. Enforcement: a sustained overrun trims and
+                // then pauses rather than only logging.
+                if let Some(pid) = self.worker_pid() {
                     if let Some(fp) = self.signals.footprint_of(pid as i32) {
                         let ledger = self.ledger.lock().expect("ledger lock").clone();
                         if ledger.observe_footprint(fp) {
@@ -966,12 +1013,26 @@ impl Runtime {
                                     ("measured".to_string(), serde_json::json!(fp)),
                                     (
                                         "committed".to_string(),
-                                        serde_json::json!(a.committed.load(Ordering::Relaxed)),
+                                        serde_json::json!(committed.load(Ordering::Relaxed)),
                                     ),
                                 ]
                                 .into_iter()
                                 .collect(),
                             );
+                            push_control("trim-caches");
+                            *state.lock().expect("state lock") = "throttling".into();
+                            let streak = self.overrun_streak.fetch_add(1, Ordering::Relaxed) + 1;
+                            if streak >= 3 {
+                                pause.store(true, Ordering::Relaxed);
+                                self.logger.warn(
+                                    "FOOTPRINT_OVERRUN_ENFORCED",
+                                    [("streak".to_string(), serde_json::json!(streak))]
+                                        .into_iter()
+                                        .collect(),
+                                );
+                            }
+                        } else {
+                            self.overrun_streak.store(0, Ordering::Relaxed);
                         }
                     }
                 }
@@ -989,6 +1050,7 @@ impl Runtime {
         if let Some(slot) = self.worker.lock().expect("worker lock").take() {
             drop(slot);
         }
+        self.worker_pid.store(0, Ordering::Relaxed);
     }
 }
 
@@ -1233,6 +1295,67 @@ mod tests {
             "governor must resume after the stability window"
         );
         assert_eq!(runtime.governor_state(), GovState::Normal);
+        runtime.shutdown();
+    }
+
+    #[test]
+    fn control_paths_never_wait_on_the_worker_lock() {
+        // Stage A review regression: the governor monitor, status(), and
+        // cancellation must all make progress while a generation holds the
+        // worker lock for its whole duration.
+        let (_dir, runtime, _signals) = test_runtime(EngineMode::InProcess);
+        let runtime2 = runtime.clone();
+        let held = std::thread::spawn(move || {
+            let _guard = runtime2.worker.lock().expect("hold worker lock");
+            std::thread::sleep(Duration::from_millis(600));
+        });
+        std::thread::sleep(Duration::from_millis(50));
+        let t0 = std::time::Instant::now();
+        let _ = runtime.cancel_active();
+        let _ = runtime.status();
+        let _ = runtime.worker_pid();
+        assert!(
+            t0.elapsed() < Duration::from_millis(150),
+            "control paths must not block on the worker lock (took {:?})",
+            t0.elapsed()
+        );
+        held.join().expect("holder thread");
+        runtime.shutdown();
+    }
+
+    #[test]
+    fn governor_throttling_reaches_the_active_run_state() {
+        let (_dir, runtime, signals) = test_runtime(EngineMode::InProcess);
+        let (artifact, adapter) = runtime.resolve_artifact("local").unwrap();
+        let plan = runtime
+            .plan_for(
+                &artifact,
+                &adapter,
+                Bytes::parse("2GiB").unwrap(),
+                2048,
+                300,
+            )
+            .unwrap();
+        let ticket = runtime.submit().unwrap();
+        let artifact_ref = artifact_ref_for(&runtime);
+        let run = runtime
+            .start_run(&ticket, plan, artifact_ref, vec![1, 2, 3], 300, vec![], 0)
+            .unwrap();
+        signals.set_pressure(crate::pressure::PressureLevel::Warning);
+        let mut saw_throttling = false;
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while std::time::Instant::now() < deadline {
+            if runtime.status().active_state.as_deref() == Some("throttling") {
+                saw_throttling = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(
+            saw_throttling,
+            "warning pressure must throttle the active run"
+        );
+        let _ = run;
         runtime.shutdown();
     }
 

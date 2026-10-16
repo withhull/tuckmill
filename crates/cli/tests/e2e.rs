@@ -380,6 +380,41 @@ fn corrupt_artifact_is_rejected_before_publish() {
 }
 
 #[test]
+fn corrupted_store_payload_is_refused_before_execution() {
+    let env = TestEnv::new();
+    let fixture = env.fixture.display().to_string();
+    let out = env.run_ok(&["import", &fixture, "--alias", "m", "--json"]);
+    let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+    let id = v["artifact"]["artifact_id"].as_str().unwrap().to_string();
+    let payload = env
+        .data_dir
+        .join("artifacts")
+        .join(&id[..16])
+        .join("model.bin");
+    // Flip one byte deep inside the weight payload (past header + index).
+    let mut bytes = std::fs::read(&payload).unwrap();
+    let last = bytes.len() - 1;
+    bytes[last] ^= 0xff;
+    std::fs::write(&payload, &bytes).unwrap();
+
+    let (code, _, stderr) = env.run(&[
+        "run",
+        "m",
+        "--prompt",
+        "x",
+        "--engine",
+        "tuckcore",
+        "--max-output",
+        "2",
+    ]);
+    assert_eq!(code, 1, "drifted payload must not execute");
+    assert!(
+        stderr.contains("INTEGRITY_FAILURE") && stderr.contains("content digest"),
+        "expected content-digest refusal: {stderr}"
+    );
+}
+
+#[test]
 fn adversarial_metadata_is_bounded() {
     // A GGUF with an absurd tensor count must be rejected without allocation.
     let env = TestEnv::new();
@@ -561,16 +596,28 @@ fn verify_proves_streaming_equivalence_bit_exact() {
         .unwrap();
     assert!(reads > 0, "streaming must read weights from storage");
     assert_eq!(v["resident"]["stats"]["in_flight_leases"], 0);
-    assert!(v["caveats"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .any(|c| c.as_str().unwrap().contains("llama.cpp")));
+    assert_eq!(v["schema_version"], 2);
+    assert_eq!(v["config"]["qualification"], "calibration");
+    assert_eq!(v["config"]["policy_version"], "calibration-2026-10-16.1");
+    assert!(v["config_id"].as_str().unwrap().len() == 64);
+    assert_ne!(
+        v["config_id"], v["run_id"],
+        "config and run identities are distinct"
+    );
 
     // The record is persisted under records/verify/.
     let verify_dir = env.data_dir.join("records/verify");
     let entries: Vec<_> = std::fs::read_dir(&verify_dir).unwrap().flatten().collect();
     assert_eq!(entries.len(), 1);
+
+    // Immutable evidence: a rerun keeps the same configuration identity but
+    // a distinct execution identity, and never overwrites the first record.
+    let out2 = env.run_ok(&["verify", "m", "--json"]);
+    let v2: serde_json::Value = serde_json::from_str(&out2).unwrap();
+    assert_eq!(v2["config_id"], v["config_id"], "same experiment config");
+    assert_ne!(v2["run_id"], v["run_id"], "distinct execution id");
+    let entries: Vec<_> = std::fs::read_dir(&verify_dir).unwrap().flatten().collect();
+    assert_eq!(entries.len(), 2, "every execution is preserved");
 }
 
 #[test]

@@ -613,14 +613,17 @@ fn handle_chat_completions(runtime: Arc<Runtime>, mut stream: TcpStream, body: &
     let prompt_tokens = if synthetic {
         prompt_to_tokens(&request.messages)
     } else {
-        let tokenizer = match artifact_tokenizer(runtime.as_ref(), &artifact) {
+        let encoder = match crate::tokenization::open_encoder(
+            &runtime.layout.artifact_payload_path(&artifact.artifact_id),
+            None,
+        ) {
             Ok(t) => t,
             Err(e) => {
                 respond_error(&mut stream, &e);
                 return;
             }
         };
-        match tokenizer.encode(&messages_text(&request.messages), false) {
+        match encoder.encode(&messages_text(&request.messages), false) {
             Ok(ids) => ids,
             Err(e) => {
                 respond_error(&mut stream, &e);
@@ -699,17 +702,6 @@ fn messages_text(messages: &[ChatMessage]) -> String {
         .join("\n")
 }
 
-/// Load a stored artifact's own tokenizer (bounded header read).
-fn artifact_tokenizer(
-    runtime: &Runtime,
-    artifact: &tuckmill_manifest::records::ModelArtifact,
-) -> Result<tuckmill_tuckcore::tokenizer::Tokenizer, TuckmillError> {
-    let path = runtime.layout.artifact_payload_path(&artifact.artifact_id);
-    let insp =
-        tuckmill_manifest::gguf::inspect(&path, &tuckmill_manifest::gguf::Limits::default())?;
-    tuckmill_tuckcore::tokenizer::Tokenizer::from_gguf(&insp)
-}
-
 fn tuckmill_extension(
     runtime: &Runtime,
     plan: &tuckmill_manifest::plan::ExecutionPlan,
@@ -730,7 +722,7 @@ fn tuckmill_extension(
         "tokenizer": if tuckmill_backend::is_synthetic_engine(&identity.engine) {
             "none (synthetic engine)"
         } else {
-            "gguf byte-level BPE"
+            "reference-first (llama.cpp pinned; gpt2-style BPE fallback)"
         },
     })
 }

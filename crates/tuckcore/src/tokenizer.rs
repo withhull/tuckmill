@@ -185,14 +185,20 @@ impl Tokenizer {
         self.token_type(id) == Some(TOKEN_TYPE_CONTROL)
     }
 
-    /// Disclosed limitation when the artifact declares a non-GPT-2
-    /// pre-tokenizer: encoding uses GPT-2 splits until llama.cpp goldens land.
+    /// True when this tokenizer's own encoding is exact for the artifact's
+    /// declared pre-tokenizer (GPT-2-style splits only).
+    pub fn encode_is_exact(&self) -> bool {
+        matches!(self.pretokenizer.as_str(), "gpt2" | "gpt-2")
+    }
+
+    /// Disclosed limitation when encoding would not be exact: callers must
+    /// use the llama.cpp reference tokenizer (TUCKMILL_LLAMA_LIB) instead.
     pub fn pretokenizer_note(&self) -> Option<String> {
-        if self.pretokenizer == "gpt2" {
+        if self.encode_is_exact() {
             None
         } else {
             Some(format!(
-                "artifact declares pre-tokenizer {:?}; this build applies GPT-2 splits (equivalence with llama.cpp goldens pending)",
+                "artifact declares pre-tokenizer {:?}; exact encoding requires the llama.cpp reference tokenizer (TUCKMILL_LLAMA_LIB), which this build will use in preference",
                 self.pretokenizer
             ))
         }
@@ -203,6 +209,18 @@ impl Tokenizer {
     /// and the byte-coverage requirement is checked up front rather than
     /// silently substituting unknowns.
     pub fn encode(&self, text: &str, add_bos: bool) -> Result<Vec<u32>> {
+        if !self.encode_is_exact() {
+            return Err(TuckmillError::new(
+                ErrorCode::UnsupportedArchitecture,
+                format!(
+                    "artifact declares pre-tokenizer {:?}; tuckmill's built-in tokenizer only reproduces GPT-2-style splits exactly and will not approximate this one (token IDs must match the model's intended tokenizer)",
+                    self.pretokenizer
+                ),
+            )
+            .with_action(
+                "Set TUCKMILL_LLAMA_LIB (scripts/fetch-llama.sh) so encoding uses the pinned llama.cpp reference tokenizer.",
+            ));
+        }
         if !self.byte_coverage {
             return Err(TuckmillError::new(
                 ErrorCode::UnsupportedArchitecture,
@@ -300,6 +318,27 @@ impl Tokenizer {
         self.decode(&[id])
     }
 
+    /// Exact bytes for one token id (control tokens yield empty bytes); feed
+    /// to [`Utf8StreamDecoder`] for streaming text assembly.
+    pub fn token_bytes(&self, id: u32) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        let Some(token) = self.tokens.get(id as usize) else {
+            return bytes;
+        };
+        if self.is_control(id) {
+            return bytes;
+        }
+        for c in token.chars() {
+            if let Some(b) = self.char_to_byte.get(&c) {
+                bytes.push(*b);
+            } else {
+                let mut buf = [0u8; 4];
+                bytes.extend_from_slice(c.encode_utf8(&mut buf).as_bytes());
+            }
+        }
+        bytes
+    }
+
     /// Raw stored string for a token id (diagnostics, "unused" checks).
     pub fn token_text(&self, id: u32) -> Option<&str> {
         self.tokens.get(id as usize).map(|s| s.as_str())
@@ -313,6 +352,9 @@ fn meta_u32(inspection: &GgufInspection, key: &str) -> Option<u32> {
         None => None,
     }
 }
+
+/// Stateful incremental UTF-8 decoder (shared implementation).
+pub use tuckmill_manifest::utf8::Utf8StreamDecoder;
 
 /// GPT-2 pre-tokenization. Implemented manually (no regex dependency) to the
 /// canonical pattern:
@@ -486,6 +528,17 @@ mod tests {
         let text_id = t.encode("x", false).unwrap()[0];
         let decoded = t.decode(&[t.special.bos.unwrap(), text_id, t.special.eos.unwrap()]);
         assert_eq!(decoded, "x");
+    }
+
+    #[test]
+    fn token_bytes_match_decode_for_byte_tokens() {
+        let t = fixture_tokenizer();
+        let ids = t.encode("héllo", false).unwrap();
+        let mut bytes = Vec::new();
+        for id in &ids {
+            bytes.extend_from_slice(&t.token_bytes(*id));
+        }
+        assert_eq!(String::from_utf8(bytes).unwrap(), "héllo");
     }
 
     #[test]

@@ -98,6 +98,16 @@ pub enum WorkerFrame {
     Cancel {
         request_id: String,
     },
+    /// Governor/administrative command to the backend (e.g. "trim-caches",
+    /// "set-prefetch=off"). Acknowledged with `ControlAck`; engines apply
+    /// supported actions at their next safe check.
+    Control {
+        action: String,
+    },
+    ControlAck {
+        action: String,
+        result: String,
+    },
     Stats,
     StatsAck {
         footprint_bytes: u64,
@@ -234,6 +244,7 @@ mod tests {
             tensor_index_hash: "b".repeat(64),
             tokenizer_hash: Some("c".repeat(64)),
             arch_id: Some("qwen3".into()),
+            content_hash: None,
         }
     }
 
@@ -288,7 +299,16 @@ mod tests {
                     evictions: 1,
                     in_flight_leases: 0,
                     footprint_bytes: Some(999),
+                    kv_precision: Some("f16".into()),
+                    threads: Some(4),
                 }),
+            },
+            WorkerFrame::Control {
+                action: "trim-caches".into(),
+            },
+            WorkerFrame::ControlAck {
+                action: "trim-caches".into(),
+                result: "queued".into(),
             },
             WorkerFrame::Shutdown,
             WorkerFrame::Bye,

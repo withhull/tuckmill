@@ -70,6 +70,12 @@ Real-model Stage A smoke (same machine, release, Qwen3-0.6B Q8_0, 16 in /
 | TuckCore (scalar oracle, llama-cpu profile) | 18.4 s | 0.3 tok/s | 1.1 GiB |
 | llama.cpp b11695 (CPU via tm shim) | 1.2 s | 6.5 tok/s | 964 MiB |
 
+The ~13.9 GiB of logical weight reads reported for the 604 MiB model is the
+expected consequence of a 32 MiB cache during streaming: prefill plus
+generation processed ~24 forward passes at one full weight sweep each. It is
+logical read traffic, not physical SSD traffic (page cache serves most of it);
+raising the cache allowance reduces sweeps at the cost of resident memory.
+
 These exercise the harness and measure the kernel gap that K01–K03 must close;
 they are single-run smoke numbers, not controlled comparisons (no ABBA, no
 warm/cold controls, no foreground matching). Fixture numbers say nothing about

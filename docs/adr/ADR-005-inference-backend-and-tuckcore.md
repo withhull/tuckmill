@@ -28,6 +28,38 @@ divergence on near-ties is recorded, never required. The scalar oracle sits
 ~20x behind llama.cpp CPU on the real 0.6B — measured, per ADR-006, before
 any kernel work.
 
+**Update 3 (verification hardening, 2026-10-16):** an external review of
+commit `064836a` found (and local inspection confirmed) gaps that this update
+closes. (1) Verification fails closed: exact requested positions, exact
+vocabulary row length, finite values, contiguous bounded chunk accumulation —
+a skipped or truncated row can never produce a PASS (regression tests at the
+accumulator and validator layers). (2) Evidence is immutable: a configuration
+ID (full resolved settings: profiles, KV precision, tolerances, identities,
+workload) is separate from a unique execution ID; interrupted executions are
+persisted with `status: "interrupted"` and no verdict; files are never
+overwritten. (3) KV cache precision is explicit and matched on both sides
+(shim sets `type_k/type_v`; TuckCore stores f16-representable values when
+asked). (4) Tolerances are a versioned per-dtype policy; unmeasured dtypes
+are refused by default, explicit overrides label the run `exploratory`, and
+`--held-out` qualifies on frozen disjoint inputs (Qwen3-0.6B: Q8_0 max
+2.68e-1 and F16 max 1.13e-2, both PASS, top-1 agreement 100%).
+(5) The governor has a real backend contract: protocol v4
+`Control`/`ControlAck` frames, engines apply `trim-caches` at safe
+checkpoints via a shared epoch (tested mid-generation), continuous heartbeat
+threads during long compute, and cancellation is serviced by engine poll
+hooks during single-step work instead of waiting for the next callback. The
+monitor, `status()`, and cancellation are lock-free with respect to the
+in-flight generation lock (regression-tested). (6) Misleading wording fixed:
+`oracle-f32` is a **scalar FP32 reference with no additional activation
+quantization**, never "exact arithmetic"; "exact" is reserved for tested
+statements. (7) Tokenization is reference-first: llama.cpp (vocab-only load,
+CPU-pinned, log-filtered) is the authoritative encoder; the built-in BPE is
+used only where it is exact (gpt2-style, golden-tested) and non-GPT-2
+pre-tokenizers are refused rather than approximated; streaming committed text
+uses an incremental UTF-8 decoder. (8) TuckCore verifies the artifact's full
+canonical content digest before executing (drifted payloads are refused
+before any compute; disabling is an explicit recorded option).
+
 ## Context and review
 
 The v0.2 engineering build finished the orchestration stack with exactly one

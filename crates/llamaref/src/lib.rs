@@ -29,7 +29,7 @@ use tuckmill_manifest::{BACKEND_ABI_VERSION, WORKER_PROTOCOL_VERSION};
 
 /// llama.cpp revision this shim is compiled against (scripts/fetch-llama.sh).
 pub const LLAMA_REVISION: &str = "b11695";
-pub const SHIM_VERSION: c_int = 1;
+pub const SHIM_VERSION: c_int = 3;
 const LIB_FILE_NAME: &str = "libtm_llama.dylib";
 
 #[repr(C)]
@@ -38,8 +38,16 @@ struct TmHandle {
 }
 
 type FnShimVersion = unsafe extern "C" fn() -> c_int;
-type FnLoad =
-    unsafe extern "C" fn(*const c_char, c_int, c_int, *mut c_char, c_int) -> *mut TmHandle;
+type FnLoad = unsafe extern "C" fn(
+    *const c_char,
+    c_int,
+    c_int,
+    c_int,
+    c_int,
+    *mut c_char,
+    c_int,
+) -> *mut TmHandle;
+type FnProbe = unsafe extern "C" fn(*const TmHandle) -> i32;
 type FnFree = unsafe extern "C" fn(*mut TmHandle);
 type FnVocabSize = unsafe extern "C" fn(*const TmHandle) -> i32;
 type FnBosEos = unsafe extern "C" fn(*const TmHandle) -> i32;
@@ -69,6 +77,8 @@ struct Shim {
     token_to_piece: FnTokenToPiece,
     decode: FnDecode,
     reset: FnReset,
+    kv_type: FnProbe,
+    n_threads: FnProbe,
     logits: FnLogits,
     sample_greedy: FnSampleGreedy,
     model_desc: FnModelDesc,
@@ -143,6 +153,8 @@ impl Shim {
             token_to_piece: get!("tm_token_to_piece", FnTokenToPiece),
             decode: get!("tm_decode", FnDecode),
             reset: get!("tm_reset", FnReset),
+            kv_type: get!("tm_kv_type", FnProbe),
+            n_threads: get!("tm_n_threads", FnProbe),
             logits: get!("tm_logits", FnLogits),
             sample_greedy: get!("tm_sample_greedy", FnSampleGreedy),
             model_desc: get!("tm_model_desc", FnModelDesc),
@@ -175,13 +187,10 @@ fn dlerror_string() -> String {
     }
 }
 
-/// Resolve the shim library path: load option `lib_path`, else
+/// Resolve the shim library path: the `lib_path` load option, else
 /// `TUCKMILL_LLAMA_LIB` (file or directory).
-pub fn resolve_lib_path(options: Option<&serde_json::Value>) -> Result<PathBuf> {
-    if let Some(value) = options
-        .and_then(|v| v.get("lib_path"))
-        .and_then(|v| v.as_str())
-    {
+pub fn resolve_lib_path(option: Option<&str>) -> Result<PathBuf> {
+    if let Some(value) = option {
         let path = PathBuf::from(value);
         return if path.is_dir() {
             Ok(path.join(LIB_FILE_NAME))
@@ -208,6 +217,163 @@ pub fn resolve_lib_path(options: Option<&serde_json::Value>) -> Result<PathBuf> 
     ))
 }
 
+/// The llama.cpp reference tokenizer: a vocab-only handle over the same
+/// pinned shim. Used as the authoritative encoder for artifacts whose
+/// pre-tokenizer this build does not reproduce exactly (everything except
+/// GPT-2-style splits), so token IDs always match the selected model's
+/// intended tokenizer rather than an approximation.
+pub struct ReferenceTokenizer {
+    shim: Shim,
+    handle: *mut TmHandle,
+}
+
+// SAFETY: same single-owner discipline as LlamaRef.
+unsafe impl Send for ReferenceTokenizer {}
+
+impl ReferenceTokenizer {
+    /// Open a vocab-only handle for `model_path`. The library resolves from
+    /// the `lib_path` option or `TUCKMILL_LLAMA_LIB`.
+    pub fn open(lib_path: Option<&str>, model_path: &std::path::Path) -> Result<Self> {
+        let lib = resolve_lib_path(lib_path)?;
+        let shim = Shim::open(&lib)?;
+        let c_path = CString::new(model_path.as_os_str().to_string_lossy().as_bytes().to_vec())
+            .map_err(|_| {
+                TuckmillError::new(ErrorCode::InvalidConfiguration, "path contains NUL")
+            })?;
+        let mut err_buf = vec![0u8; 512];
+        // SAFETY: shim version-checked; path and error buffer valid;
+        // vocab_only=1 skips context creation entirely.
+        let handle = unsafe {
+            (shim.load)(
+                c_path.as_ptr(),
+                0,
+                0,
+                0,
+                /*vocab_only=*/ 1,
+                err_buf.as_mut_ptr() as *mut c_char,
+                err_buf.len() as c_int,
+            )
+        };
+        if handle.is_null() {
+            let len = err_buf
+                .iter()
+                .position(|b| *b == 0)
+                .unwrap_or(err_buf.len());
+            let msg = String::from_utf8_lossy(&err_buf[..len]).into_owned();
+            return Err(TuckmillError::new(
+                ErrorCode::InvalidArtifact,
+                format!(
+                    "llama.cpp could not load the tokenizer of {}: {msg}",
+                    model_path.display()
+                ),
+            ));
+        }
+        Ok(Self { shim, handle })
+    }
+
+    pub fn vocab_len(&self) -> Result<usize> {
+        // SAFETY: handle valid.
+        let n = unsafe { (self.shim.vocab_size)(self.handle) };
+        if n <= 0 {
+            return Err(TuckmillError::new(
+                ErrorCode::WorkerFailed,
+                "llama.cpp reported no vocabulary",
+            ));
+        }
+        Ok(n as usize)
+    }
+
+    pub fn eos(&self) -> i32 {
+        // SAFETY: handle valid.
+        unsafe { (self.shim.eos)(self.handle) }
+    }
+
+    pub fn tokenize(&self, text: &str, add_special: bool) -> Result<Vec<u32>> {
+        let c_text = CString::new(text)
+            .map_err(|_| TuckmillError::new(ErrorCode::InvalidRequest, "text contains NUL"))?;
+        let mut out = vec![0i32; 4096];
+        // SAFETY: pointers valid for the calls; capacities match buffers.
+        let n = unsafe {
+            (self.shim.tokenize)(
+                self.handle,
+                c_text.as_ptr(),
+                text.len() as c_int,
+                add_special as c_int,
+                out.as_mut_ptr(),
+                out.len() as i32,
+            )
+        };
+        if n < 0 {
+            out = vec![0i32; (-n) as usize];
+            let n2 = unsafe {
+                (self.shim.tokenize)(
+                    self.handle,
+                    c_text.as_ptr(),
+                    text.len() as c_int,
+                    add_special as c_int,
+                    out.as_mut_ptr(),
+                    out.len() as i32,
+                )
+            };
+            if n2 < 0 {
+                return Err(TuckmillError::new(
+                    ErrorCode::WorkerFailed,
+                    "llama_tokenize failed twice",
+                ));
+            }
+            out.truncate(n2 as usize);
+        } else {
+            out.truncate(n as usize);
+        }
+        Ok(out.into_iter().map(|v| v as u32).collect())
+    }
+
+    /// Exact piece bytes for a token id.
+    pub fn piece_bytes(&self, id: u32) -> Result<Vec<u8>> {
+        let mut buf = vec![0u8; 1024];
+        // SAFETY: buffer/capacity pair; returns required size when small.
+        let n = unsafe {
+            (self.shim.token_to_piece)(
+                self.handle,
+                id as i32,
+                buf.as_mut_ptr() as *mut c_char,
+                buf.len() as i32,
+            )
+        };
+        if n < 0 {
+            buf = vec![0u8; (-n) as usize];
+            let n2 = unsafe {
+                (self.shim.token_to_piece)(
+                    self.handle,
+                    id as i32,
+                    buf.as_mut_ptr() as *mut c_char,
+                    buf.len() as i32,
+                )
+            };
+            if n2 < 0 {
+                return Err(TuckmillError::new(
+                    ErrorCode::WorkerFailed,
+                    "llama_token_to_piece failed twice",
+                ));
+            }
+            buf.truncate(n2 as usize);
+        } else {
+            buf.truncate(n as usize);
+        }
+        Ok(buf)
+    }
+}
+
+impl Drop for ReferenceTokenizer {
+    fn drop(&mut self) {
+        if !self.handle.is_null() {
+            // SAFETY: handle came from tm_load and is freed once.
+            unsafe { (self.shim.free)(self.handle) };
+            self.handle = std::ptr::null_mut();
+        }
+    }
+}
+
 /// Declared identity, available without loading the library.
 pub fn identity() -> EngineIdentity {
     EngineIdentity {
@@ -221,12 +387,23 @@ pub fn identity() -> EngineIdentity {
 }
 
 /// The reference backend instance.
+#[derive(Debug, Clone, serde::Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+struct LlamaRefOptions {
+    lib_path: Option<String>,
+    /// "f16" (llama.cpp default) or "f32"; explicit so comparisons never
+    /// leave cache precision uncontrolled.
+    kv_precision: Option<String>,
+}
+
 pub struct LlamaRef {
     shim: Shim,
     handle: *mut TmHandle,
     vocab: i32,
     eos: i32,
     ctx_tokens: u32,
+    kv_precision: String,
+    threads: u32,
     note: String,
 }
 
@@ -254,6 +431,8 @@ impl LlamaRef {
                 token_to_piece: unreachable_piece,
                 decode: unreachable_decode,
                 reset: unreachable_reset,
+                kv_type: unreachable_probe,
+                n_threads: unreachable_probe,
                 logits: unreachable_logits,
                 sample_greedy: unreachable_sample,
                 model_desc: unreachable_desc,
@@ -264,6 +443,8 @@ impl LlamaRef {
             vocab: 0,
             eos: -1,
             ctx_tokens: 0,
+            kv_precision: "f16".to_string(),
+            threads: 0,
             note: String::new(),
         }
     }
@@ -378,8 +559,17 @@ impl LlamaRef {
     }
 
     fn decode_chunked(&mut self, ids: &[u32]) -> Result<()> {
+        self.decode_chunked_with_poll(ids, None)
+    }
+
+    /// Decode with an optional poll hook between chunks, so cancellation is
+    /// consumed during long prefills instead of only at the next callback.
+    fn decode_chunked_with_poll(&mut self, ids: &[u32], poll: Option<&dyn Fn()>) -> Result<()> {
         let h = self.h()?;
         for chunk in ids.chunks(256) {
+            if let Some(poll) = poll {
+                poll();
+            }
             let c_chunk: Vec<i32> = chunk.iter().map(|v| *v as i32).collect();
             // SAFETY: ids buffer is valid for chunk length.
             let rc = unsafe { (self.shim.decode)(h, c_chunk.as_ptr(), c_chunk.len() as i32) };
@@ -412,6 +602,8 @@ unsafe extern "C" fn unreachable_fn() -> c_int {
 }
 unsafe extern "C" fn unreachable_load(
     _: *const c_char,
+    _: c_int,
+    _: c_int,
     _: c_int,
     _: c_int,
     _: *mut c_char,
@@ -470,6 +662,9 @@ unsafe extern "C" fn unreachable_meta(
 unsafe extern "C" fn unreachable_size(_: *const TmHandle) -> u64 {
     unreachable!("shim not open")
 }
+unsafe extern "C" fn unreachable_probe(_: *const TmHandle) -> i32 {
+    unreachable!("shim not open")
+}
 
 impl InferenceBackend for LlamaRef {
     fn backend_id(&self) -> BackendId {
@@ -509,7 +704,26 @@ impl InferenceBackend for LlamaRef {
                 "refusing to load a rejected plan",
             ));
         }
-        let lib_path = resolve_lib_path(options)?;
+        let opts: LlamaRefOptions = match options {
+            Some(v) => serde_json::from_value(v.clone()).map_err(|e| {
+                TuckmillError::new(
+                    ErrorCode::InvalidRequest,
+                    format!("invalid llama backend options: {e}"),
+                )
+            })?,
+            None => LlamaRefOptions::default(),
+        };
+        let kv_f16 = match opts.kv_precision.as_deref() {
+            None | Some("f16") => true,
+            Some("f32") => false,
+            Some(other) => {
+                return Err(TuckmillError::new(
+                    ErrorCode::InvalidRequest,
+                    format!("unknown kv_precision {other:?}; use \"f16\" or \"f32\""),
+                ))
+            }
+        };
+        let lib_path = resolve_lib_path(opts.lib_path.as_deref())?;
         let shim = Shim::open(&lib_path)?;
 
         let threads = std::thread::available_parallelism()
@@ -525,6 +739,8 @@ impl InferenceBackend for LlamaRef {
                 c_path.as_ptr(),
                 plan.context.total_context as c_int,
                 threads,
+                kv_f16 as c_int,
+                0, // full context
                 err_buf.as_mut_ptr() as *mut c_char,
                 err_buf.len() as c_int,
             )
@@ -574,6 +790,16 @@ impl InferenceBackend for LlamaRef {
             "unknown".into()
         };
 
+        let actual_kv = unsafe { (shim.kv_type)(handle) };
+        let actual_threads = unsafe { (shim.n_threads)(handle) };
+        self.kv_precision = if actual_kv == 1 {
+            "f16".to_string()
+        } else if actual_kv == 0 {
+            "f32".to_string()
+        } else {
+            "unreported".to_string()
+        };
+        self.threads = actual_threads.max(1) as u32;
         self.handle = handle;
         self.vocab = vocab;
         self.eos = eos;
@@ -584,8 +810,10 @@ impl InferenceBackend for LlamaRef {
         };
         self.shim = shim;
         self.note = format!(
-            "llama.cpp reference backend ({LLAMA_REVISION}, CPU): {desc} [arch {arch}], {vocab} vocab, {} context, {} model bytes; wrapper uncertified",
+            "llama.cpp reference backend ({LLAMA_REVISION}, CPU): {desc} [arch {arch}], {vocab} vocab, {} context, kv {}, {} threads, {} model bytes; wrapper uncertified",
             self.ctx_tokens,
+            self.kv_precision,
+            self.threads,
             tuckmill_manifest::units::Bytes(model_bytes)
         );
         Ok(self.note.clone())
@@ -616,7 +844,7 @@ impl InferenceBackend for LlamaRef {
         }
         (ctl.on_state)(RunState::Warming);
         (ctl.on_state)(RunState::Prefilling);
-        self.decode_chunked(&req.prompt_tokens)?;
+        self.decode_chunked_with_poll(&req.prompt_tokens, ctl.poll)?;
         if ctl.cancel.load(std::sync::atomic::Ordering::Relaxed) {
             return Ok(GenOutcome {
                 finish_reason: FinishReason::Cancelled,
@@ -627,6 +855,8 @@ impl InferenceBackend for LlamaRef {
         (ctl.on_state)(RunState::Generating);
         let mut committed: u64 = 0;
         let mut generated = String::new();
+        // Incremental UTF-8 assembly over exact piece bytes.
+        let mut decoder = tuckmill_manifest::utf8::Utf8StreamDecoder::new();
         for i in 0..req.max_output_tokens {
             if ctl.cancel.load(std::sync::atomic::Ordering::Relaxed) {
                 return Ok(GenOutcome {
@@ -644,7 +874,7 @@ impl InferenceBackend for LlamaRef {
                     format!("llama greedy sampling failed (rc {rc})"),
                 ));
             }
-            let text = self.piece(token as u32)?;
+            let text = decoder.push(&self.piece_bytes(token as u32)?);
             generated.push_str(&text);
             committed += 1;
             if !(ctl.on_token)(i, &text) {
@@ -670,7 +900,7 @@ impl InferenceBackend for LlamaRef {
                 });
             }
             if i + 1 < req.max_output_tokens {
-                self.decode_chunked(&[token as u32])?;
+                self.decode_chunked_with_poll(&[token as u32], ctl.poll)?;
             }
         }
         Ok(GenOutcome {
@@ -683,10 +913,17 @@ impl InferenceBackend for LlamaRef {
         &mut self,
         tokens: &[u32],
         positions: &[u64],
+        cancelled: &dyn Fn() -> bool,
         sink: &mut dyn FnMut(u64, &[f32]) -> bool,
     ) -> Result<u64> {
         let mut scored = 0u64;
         for position in positions {
+            if cancelled() {
+                return Err(TuckmillError::new(
+                    ErrorCode::Cancelled,
+                    "scoring cancelled at a position boundary",
+                ));
+            }
             let pos = *position as usize;
             if pos >= tokens.len() {
                 return Err(TuckmillError::new(
@@ -723,7 +960,13 @@ impl InferenceBackend for LlamaRef {
     }
 
     fn stats(&self) -> BackendStats {
-        BackendStats::default() // weight reads via mmap: unobservable here; 0 with no claim
+        // Weight reads go through mmap: physical reads are unobservable here
+        // (recorded as 0 with no claim). KV precision and threads are actual.
+        BackendStats {
+            kv_precision: Some(self.kv_precision.clone()),
+            threads: Some(self.threads),
+            ..Default::default()
+        }
     }
 
     fn shutdown(&mut self) {
@@ -812,6 +1055,7 @@ mod tests {
             tensor_index_hash: insp.tensor_index_hash().unwrap().as_str().to_string(),
             tokenizer_hash: None,
             arch_id: Some("qwen3".into()),
+            content_hash: None,
         };
         backend.load(&plan_for(512), &artifact, None).unwrap();
 
@@ -844,6 +1088,66 @@ mod tests {
     }
 
     #[test]
+    fn real_model_reference_tokenizer_goldens_when_available() {
+        let (Ok(lib), Ok(real)) = (
+            std::env::var("TUCKMILL_LLAMA_LIB"),
+            std::env::var("TUCKMILL_REAL_GGUF"),
+        ) else {
+            eprintln!("skipping: set TUCKMILL_LLAMA_LIB and TUCKMILL_REAL_GGUF");
+            return;
+        };
+        if !std::path::Path::new(&real).exists() {
+            eprintln!("skipping: TUCKMILL_REAL_GGUF does not exist");
+            return;
+        }
+        let _ = lib;
+        let tokenizer =
+            ReferenceTokenizer::open(None, std::path::Path::new(&real)).expect("vocab-only load");
+        assert!(
+            tokenizer.vocab_len().unwrap() > 100_000,
+            "real-quant vocabulary"
+        );
+        for text in [
+            "The capital of France is",
+            "123 456 7890",
+            "don't stop believing",
+            "multi   spaces\tand\nnewlines",
+            "unicode: héllo wörld 日本語 😀",
+        ] {
+            let ids = tokenizer.tokenize(text, false).unwrap();
+            assert!(!ids.is_empty(), "{text:?}");
+            // Exact byte assembly round-trips through the same reference.
+            let mut bytes = Vec::new();
+            for id in &ids {
+                bytes.extend_from_slice(&tokenizer.piece_bytes(*id).unwrap());
+            }
+            assert_eq!(
+                String::from_utf8(bytes).unwrap(),
+                text,
+                "reference piece roundtrip for {text:?}"
+            );
+            // Deterministic re-encode.
+            assert_eq!(tokenizer.tokenize(text, false).unwrap(), ids);
+        }
+        // And the built-in tokenizer refuses non-GPT-2 pre-tokenizers rather
+        // than approximating them (same-profile honesty).
+        let insp = tuckmill_manifest::gguf::inspect(
+            std::path::Path::new(&real),
+            &tuckmill_manifest::gguf::Limits::default(),
+        )
+        .unwrap();
+        let native = tuckmill_tuckcore::tokenizer::Tokenizer::from_gguf(&insp).unwrap();
+        if !native.encode_is_exact() {
+            let err = native.encode("test", false).unwrap_err();
+            assert_eq!(
+                err.code(),
+                tuckmill_manifest::ErrorCode::UnsupportedArchitecture
+            );
+            assert!(err.action().contains("TUCKMILL_LLAMA_LIB"));
+        }
+    }
+
+    #[test]
     fn reference_backend_scores_and_generates_when_available() {
         let Some(_lib) = lib_available() else {
             eprintln!("skipping: TUCKMILL_LLAMA_LIB not set (run scripts/fetch-llama.sh)");
@@ -860,6 +1164,7 @@ mod tests {
             tensor_index_hash: insp.tensor_index_hash().unwrap().as_str().to_string(),
             tokenizer_hash: None,
             arch_id: Some("qwen3".into()),
+            content_hash: None,
         };
         let mut backend = LlamaRef::new();
         let note = backend.load(&plan_for(512), &artifact, None).unwrap();
@@ -870,7 +1175,7 @@ mod tests {
         let tokens = [259u32, 260, 111];
         let mut a = Vec::new();
         backend
-            .score(&tokens, &[2], &mut |_, l| {
+            .score(&tokens, &[2], &|| false, &mut |_, l| {
                 a.extend_from_slice(l);
                 true
             })
@@ -878,7 +1183,7 @@ mod tests {
         assert_eq!(a.len(), 512);
         let mut b = Vec::new();
         backend
-            .score(&tokens, &[2], &mut |_, l| {
+            .score(&tokens, &[2], &|| false, &mut |_, l| {
                 b.extend_from_slice(l);
                 true
             })
@@ -894,12 +1199,7 @@ mod tests {
             true
         };
         let mut on_state = |_s: RunState| {};
-        let mut ctl = GenControl {
-            cancel: cancel.clone(),
-            paused: pause.clone(),
-            on_token: &mut on_token,
-            on_state: &mut on_state,
-        };
+        let mut ctl = GenControl::new(cancel.clone(), pause.clone(), &mut on_token, &mut on_state);
         let req = GenerateRequest {
             request_id: "ref-1".into(),
             prompt_tokens: tokens.to_vec(),

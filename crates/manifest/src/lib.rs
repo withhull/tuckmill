@@ -12,6 +12,7 @@
 
 pub mod adapter;
 pub mod bytes_alphabet;
+pub mod digest;
 pub mod error;
 pub mod ggml;
 pub mod gguf;
@@ -22,6 +23,7 @@ pub mod records;
 pub mod safetensors;
 pub mod testing;
 pub mod units;
+pub mod utf8;
 
 pub use error::{ErrorCode, Result, TuckmillError};
 pub use ids::Id;
@@ -41,6 +43,8 @@ pub const BACKEND_ABI_VERSION: u32 = 1;
 /// statistics (ADR-005).
 /// v3: ScoreChunk carries an `offset` and one position's logits stream in
 /// multiple frames sized for the 1 MiB cap — real vocabularies (150k+ logits)
-/// cannot fit a single JSON frame. Plans recorded against older versions are
-/// PLAN_STALE.
-pub const WORKER_PROTOCOL_VERSION: u16 = 3;
+/// cannot fit a single JSON frame.
+/// v4: Control/ControlAck frames give the governor a real command contract
+/// (cache trim, prefetch control) applied by engines at safe checkpoints.
+/// Plans recorded against older versions are PLAN_STALE.
+pub const WORKER_PROTOCOL_VERSION: u16 = 4;

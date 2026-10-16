@@ -53,7 +53,7 @@ clang -O2 -fPIC -shared \
     native/llamaref/tm_llama_shim.c \
     -I "${LLAMA_DIR}/include" \
     -L "${LLAMA_DIR}" \
-    -lllama \
+    -lllama -lggml -lggml-base \
     -Wl,-rpath,@loader_path
 
 echo

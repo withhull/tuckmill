@@ -2,14 +2,22 @@
 //! on a private local socket. This runs inside the dedicated worker process;
 //! the supervisor never computes tensors or holds model state.
 //!
-//! The control channel doubles as the cancellation path: the worker polls the
-//! socket between committed tokens, so a cancel is honored at a token
-//! boundary rather than at process teardown.
+//! Control/liveness design (Stage A review hardening):
+//! - all outbound frames go through one mutex-guarded writer, and a heartbeat
+//!   thread emits frames every 500 ms while the engine computes — a long
+//!   single position can no longer look like a stalled worker;
+//! - the engine receives a poll hook that drains inbound control frames
+//!   during long single-step work, so cancellation and governor commands are
+//!   consumed promptly instead of waiting for the next token callback;
+//! - `Control` frames apply locally (`trim-caches` bumps a shared epoch the
+//!   engine checks at safe points; in-flight buffers are never released) and
+//!   are acknowledged with `ControlAck`.
 
+use std::cell::{Cell, RefCell};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use tuckmill_backend::{BackendId, EngineKind, InferenceBackend};
@@ -34,6 +42,21 @@ fn make_backend(kind: EngineKind) -> Box<dyn InferenceBackend> {
         EngineKind::TuckCore => Box::new(tuckmill_tuckcore::TuckCore::new()),
         EngineKind::LlamaCpp => Box::new(tuckmill_llamaref::LlamaRef::new()),
     }
+}
+
+/// Shared outbound writer: the main thread and the heartbeat thread both
+/// write whole frames under this lock, so frames can never interleave.
+type Writer = Arc<Mutex<UnixStream>>;
+
+fn write_frame(writer: &Writer, frame: &WorkerFrame) -> Result<()> {
+    let mut stream = writer
+        .lock()
+        .map_err(|_| TuckmillError::new(ErrorCode::WorkerFailed, "worker writer lock poisoned"))?;
+    frame.write_to(&mut *stream)
+}
+
+fn write_frame_best_effort(writer: &Writer, frame: &WorkerFrame) {
+    let _ = write_frame(writer, frame);
 }
 
 /// Serve one supervisor connection until Shutdown or EOF. `socket_path` must
@@ -62,13 +85,57 @@ pub fn run_reference_worker(socket_path: &Path) -> Result<()> {
     run_worker(socket_path, EngineKind::ReferenceTest)
 }
 
-fn serve(mut stream: UnixStream, kind: EngineKind) -> Result<()> {
+struct HeartbeatScope {
+    stop: Arc<AtomicBool>,
+}
+
+impl Drop for HeartbeatScope {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+    }
+}
+
+/// Heartbeats every 500 ms from a helper thread while a long engine call
+/// runs on the main thread.
+fn heartbeat_thread(writer: &Writer, started: Instant) -> HeartbeatScope {
+    let stop = Arc::new(AtomicBool::new(false));
+    let stop2 = stop.clone();
+    let writer2 = writer.clone();
+    std::thread::spawn(move || {
+        while !stop2.load(Ordering::Relaxed) {
+            std::thread::sleep(HEARTBEAT_INTERVAL);
+            if stop2.load(Ordering::Relaxed) {
+                break;
+            }
+            write_frame_best_effort(
+                &writer2,
+                &WorkerFrame::Heartbeat {
+                    uptime_ms: started.elapsed().as_millis() as u64,
+                },
+            );
+        }
+    });
+    HeartbeatScope { stop }
+}
+
+fn serve(stream: UnixStream, kind: EngineKind) -> Result<()> {
     let started = Instant::now();
     let mut engine = make_backend(kind);
     let mut loaded = false;
 
+    // Reader (main thread only) and shared writer (main + heartbeat threads).
+    let reader = RefCell::new(stream.try_clone().map_err(TuckmillError::from)?);
+    let writer: Writer = Arc::new(Mutex::new(stream));
+    let cancel = Arc::new(AtomicBool::new(false));
+    let paused = Arc::new(AtomicBool::new(false));
+    // Local control state applied by engines at safe checkpoints. The trim
+    // epoch is the engine's own shared handle so Control drains and the
+    // engine's checkpoint checks act on the same counter.
+    let trim_epoch = engine.trim_epoch();
+    let prefetch_enabled = Arc::new(AtomicBool::new(true));
+
     // Handshake: the first frame must be Hello.
-    let first = read_frame_blocking(&mut stream)?;
+    let first = read_frame_blocking(&reader)?;
     match first {
         Some(WorkerFrame::Hello {
             protocol,
@@ -77,12 +144,14 @@ fn serve(mut stream: UnixStream, kind: EngineKind) -> Result<()> {
         }) => {
             validate_handshake(protocol, abi)?;
             let identity = engine.identity();
-            hello_ack(
-                &crate::engine::build_id(),
-                &identity.engine,
-                identity.certified,
-            )
-            .write_to(&mut stream)?;
+            write_frame(
+                &writer,
+                &hello_ack(
+                    &crate::engine::build_id(),
+                    &identity.engine,
+                    identity.certified,
+                ),
+            )?;
         }
         Some(_) => {
             return Err(TuckmillError::new(
@@ -93,19 +162,18 @@ fn serve(mut stream: UnixStream, kind: EngineKind) -> Result<()> {
         None => return Ok(()), // supervisor went away before handshake
     }
 
-    let cancel = Arc::new(AtomicBool::new(false));
-    let paused = Arc::new(AtomicBool::new(false));
     let mut last_heartbeat = Instant::now();
-
     loop {
         // Poll for the next control frame; emit heartbeats while idle.
-        match poll_frame(&mut stream, POLL_SLICE)? {
+        match poll_frame(&reader, POLL_SLICE)? {
             PollResult::Timeout => {
                 if last_heartbeat.elapsed() >= HEARTBEAT_INTERVAL {
-                    WorkerFrame::Heartbeat {
-                        uptime_ms: started.elapsed().as_millis() as u64,
-                    }
-                    .write_to(&mut stream)?;
+                    write_frame(
+                        &writer,
+                        &WorkerFrame::Heartbeat {
+                            uptime_ms: started.elapsed().as_millis() as u64,
+                        },
+                    )?;
                     last_heartbeat = Instant::now();
                 }
                 continue;
@@ -141,24 +209,22 @@ fn serve(mut stream: UnixStream, kind: EngineKind) -> Result<()> {
                                 }
                             }
                         }
+                        let _heartbeat = heartbeat_thread(&writer, started);
                         engine.load(&plan, &artifact, options.as_ref())
                     })();
                     match result {
                         Ok(note) => {
                             loaded = true;
-                            WorkerFrame::Loaded {
-                                note,
-                                footprint_bytes: crate::host_footprint_bytes(),
-                            }
-                            .write_to(&mut stream)?;
+                            write_frame(
+                                &writer,
+                                &WorkerFrame::Loaded {
+                                    note,
+                                    footprint_bytes: crate::host_footprint_bytes(),
+                                },
+                            )?;
                         }
                         Err(e) => {
-                            WorkerFrame::Error {
-                                code: e.code().as_str().into(),
-                                message: e.message().to_string(),
-                                action: e.action().to_string(),
-                            }
-                            .write_to(&mut stream)?;
+                            write_frame(&writer, &error_frame(&e))?;
                         }
                     }
                 }
@@ -170,24 +236,29 @@ fn serve(mut stream: UnixStream, kind: EngineKind) -> Result<()> {
                     seed,
                 } => {
                     if !loaded {
-                        WorkerFrame::Error {
-                            code: ErrorCode::WorkerFailed.as_str().into(),
-                            message: "Generate before Load".into(),
-                            action: "Load a plan first".into(),
-                        }
-                        .write_to(&mut stream)?;
+                        write_frame(
+                            &writer,
+                            &WorkerFrame::Error {
+                                code: ErrorCode::WorkerFailed.as_str().into(),
+                                message: "Generate before Load".into(),
+                                action: "Load a plan first".into(),
+                            },
+                        )?;
                         continue;
                     }
                     cancel.store(false, Ordering::Relaxed);
                     paused.store(false, Ordering::Relaxed);
                     last_heartbeat = Instant::now();
+                    let _heartbeat = heartbeat_thread(&writer, started);
                     let outcome = generate_streaming(
                         engine.as_mut(),
-                        &mut stream,
+                        &reader,
+                        &writer,
                         &cancel,
                         &paused,
-                        &started,
-                        &mut last_heartbeat,
+                        &trim_epoch,
+                        &prefetch_enabled,
+                        started,
                         crate::engine::GenerateRequest {
                             request_id,
                             prompt_tokens,
@@ -200,19 +271,16 @@ fn serve(mut stream: UnixStream, kind: EngineKind) -> Result<()> {
                     paused.store(false, Ordering::Relaxed);
                     match outcome {
                         Ok(outcome) => {
-                            WorkerFrame::Done {
-                                reason: outcome.finish_reason.as_str().to_string(),
-                                committed: outcome.committed,
-                            }
-                            .write_to(&mut stream)?;
+                            write_frame(
+                                &writer,
+                                &WorkerFrame::Done {
+                                    reason: outcome.finish_reason.as_str().to_string(),
+                                    committed: outcome.committed,
+                                },
+                            )?;
                         }
                         Err(e) => {
-                            WorkerFrame::Error {
-                                code: e.code().as_str().into(),
-                                message: e.message().to_string(),
-                                action: e.action().to_string(),
-                            }
-                            .write_to(&mut stream)?;
+                            write_frame(&writer, &error_frame(&e))?;
                         }
                     }
                 }
@@ -221,84 +289,97 @@ fn serve(mut stream: UnixStream, kind: EngineKind) -> Result<()> {
                     tokens,
                     positions,
                 } => {
-                    // Scoring can hold one position in compute for a long
-                    // time (a real model through the scalar oracle); emit a
-                    // heartbeat before each frame so supervisor liveness
-                    // tracking stays honest without loosening the timeout.
                     if !loaded {
-                        WorkerFrame::Error {
-                            code: ErrorCode::WorkerFailed.as_str().into(),
-                            message: "Score before Load".into(),
-                            action: "Load a plan first".into(),
-                        }
-                        .write_to(&mut stream)?;
+                        write_frame(
+                            &writer,
+                            &WorkerFrame::Error {
+                                code: ErrorCode::WorkerFailed.as_str().into(),
+                                message: "Score before Load".into(),
+                                action: "Load a plan first".into(),
+                            },
+                        )?;
                         continue;
                     }
                     let bounded = tokens.len() <= MAX_SCORE_TOKENS
                         && positions.len() <= MAX_SCORE_POSITIONS
                         && positions.iter().all(|p| (*p as usize) < tokens.len());
                     if !bounded {
-                        WorkerFrame::Error {
-                            code: ErrorCode::InvalidRequest.as_str().into(),
-                            message: format!(
-                                "scoring request outside bounds (max {MAX_SCORE_TOKENS} tokens, {MAX_SCORE_POSITIONS} positions, positions within the token sequence)"
-                            ),
-                            action: "Reduce the scoring request; the evaluation interface is deliberately bounded.".into(),
-                        }
-                        .write_to(&mut stream)?;
+                        write_frame(
+                            &writer,
+                            &WorkerFrame::Error {
+                                code: ErrorCode::InvalidRequest.as_str().into(),
+                                message: format!(
+                                    "scoring request outside bounds (max {MAX_SCORE_TOKENS} tokens, {MAX_SCORE_POSITIONS} positions, positions within the token sequence)"
+                                ),
+                                action: "Reduce the scoring request; the evaluation interface is deliberately bounded.".into(),
+                            },
+                        )?;
                         continue;
                     }
+                    let _heartbeat = heartbeat_thread(&writer, started);
                     let mut write_failed = false;
-                    let result = engine.score(&tokens, &positions, &mut |position, logits| {
-                        let heartbeat = WorkerFrame::Heartbeat {
-                            uptime_ms: started.elapsed().as_millis() as u64,
-                        };
-                        if heartbeat.write_to(&mut stream).is_err() {
-                            write_failed = true;
-                            return false;
+                    let cancelled = || {
+                        // Drains inbound control frames (Cancel, Shutdown,
+                        // Control) between chunks of long per-position work.
+                        if drain_control(
+                            &reader,
+                            &cancel,
+                            &paused,
+                            &trim_epoch,
+                            &prefetch_enabled,
+                            &writer,
+                        )
+                        .is_err()
+                        {
+                            cancel.store(true, Ordering::Relaxed);
                         }
-                        for (i, chunk) in logits.chunks(SCORE_CHUNK_FLOATS).enumerate() {
-                            let frame = WorkerFrame::ScoreChunk {
-                                position,
-                                offset: (i * SCORE_CHUNK_FLOATS) as u32,
-                                logits: chunk.to_vec(),
-                            };
-                            if frame.write_to(&mut stream).is_err() {
-                                write_failed = true;
-                                return false;
+                        cancel.load(Ordering::Relaxed)
+                    };
+                    let result =
+                        engine.score(&tokens, &positions, &cancelled, &mut |position, logits| {
+                            for (i, chunk) in logits.chunks(SCORE_CHUNK_FLOATS).enumerate() {
+                                let frame = WorkerFrame::ScoreChunk {
+                                    position,
+                                    offset: (i * SCORE_CHUNK_FLOATS) as u32,
+                                    logits: chunk.to_vec(),
+                                };
+                                if write_frame(&writer, &frame).is_err() {
+                                    write_failed = true;
+                                    return false;
+                                }
                             }
-                        }
-                        true
-                    });
+                            true
+                        });
+                    let _ = write_failed;
                     match result {
                         Ok(scored) => {
-                            WorkerFrame::ScoreDone { scored }.write_to(&mut stream)?;
+                            write_frame(&writer, &WorkerFrame::ScoreDone { scored })?;
                         }
                         Err(e) => {
-                            WorkerFrame::Error {
-                                code: e.code().as_str().into(),
-                                message: e.message().to_string(),
-                                action: e.action().to_string(),
-                            }
-                            .write_to(&mut stream)?;
+                            write_frame(&writer, &error_frame(&e))?;
                         }
                     }
-                    let _ = write_failed;
+                }
+                WorkerFrame::Control { action } => {
+                    let result = apply_control(&action, &trim_epoch, &prefetch_enabled);
+                    write_frame(&writer, &WorkerFrame::ControlAck { action, result })?;
                 }
                 WorkerFrame::Cancel { .. } => {
                     cancel.store(true, Ordering::Relaxed);
                 }
                 WorkerFrame::Stats => {
-                    WorkerFrame::StatsAck {
-                        footprint_bytes: crate::host_footprint_bytes(),
-                        uptime_ms: started.elapsed().as_millis() as u64,
-                        backend: Some(engine.stats()),
-                    }
-                    .write_to(&mut stream)?;
+                    write_frame(
+                        &writer,
+                        &WorkerFrame::StatsAck {
+                            footprint_bytes: crate::host_footprint_bytes(),
+                            uptime_ms: started.elapsed().as_millis() as u64,
+                            backend: Some(engine.stats()),
+                        },
+                    )?;
                 }
                 WorkerFrame::Shutdown => {
                     engine.shutdown();
-                    WorkerFrame::Bye.write_to(&mut stream)?;
+                    write_frame(&writer, &WorkerFrame::Bye)?;
                     return Ok(());
                 }
                 other => {
@@ -314,53 +395,80 @@ fn serve(mut stream: UnixStream, kind: EngineKind) -> Result<()> {
     }
 }
 
+fn error_frame(e: &TuckmillError) -> WorkerFrame {
+    WorkerFrame::Error {
+        code: e.code().as_str().into(),
+        message: e.message().to_string(),
+        action: e.action().to_string(),
+    }
+}
+
+/// Apply a control command to the local engine-facing flags. Honest about
+/// what this build supports: there is no speculative prefetch yet, so
+/// prefetch commands configure the flag for engines that add one and ack
+/// what actually happened.
+fn apply_control(
+    action: &str,
+    trim_epoch: &Arc<AtomicU64>,
+    prefetch_enabled: &Arc<AtomicBool>,
+) -> String {
+    match action {
+        "trim-caches" => {
+            trim_epoch.fetch_add(1, Ordering::Relaxed);
+            "queued: engine applies at its next safe check (in-flight buffers are never released)".into()
+        }
+        "set-prefetch=off" => {
+            prefetch_enabled.store(false, Ordering::Relaxed);
+            "recorded: no speculative prefetch exists in this build".into()
+        }
+        "set-prefetch=on" => {
+            prefetch_enabled.store(true, Ordering::Relaxed);
+            "recorded: no speculative prefetch exists in this build".into()
+        }
+        other => format!("unsupported control action {other:?} (this build applies: trim-caches, set-prefetch=on/off)"),
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn generate_streaming(
     engine: &mut dyn InferenceBackend,
-    stream: &mut UnixStream,
+    reader: &RefCell<UnixStream>,
+    writer: &Writer,
     cancel: &Arc<AtomicBool>,
     paused: &Arc<AtomicBool>,
-    started: &Instant,
-    last_heartbeat: &mut Instant,
+    trim_epoch: &Arc<AtomicU64>,
+    prefetch_enabled: &Arc<AtomicBool>,
+    started: Instant,
     req: crate::engine::GenerateRequest,
 ) -> Result<crate::engine::GenOutcome> {
-    // Control frames may arrive mid-generation; the backend only sees the
-    // shared flags, so we interleave a lightweight poll before each token.
-    // State transitions are coalesced through a cell and flushed by the token
-    // path (a single closure owns the socket, keeping the borrow graph simple).
+    // The poll hook lets engines service inbound control frames (cancel,
+    // shutdown, governor commands) inside long single-step compute, instead
+    // of waiting for the next token callback.
+    let poll_hook = || {
+        if drain_control(reader, cancel, paused, trim_epoch, prefetch_enabled, writer).is_err() {
+            cancel.store(true, Ordering::Relaxed);
+        }
+    };
+    let pending_state: Cell<Option<RunState>> = Cell::new(None);
     let mut outcome_slot: Option<TuckmillError> = None;
-    let pending_state: std::cell::RefCell<Option<RunState>> = std::cell::RefCell::new(None);
     let result = {
         let mut on_token = |index: u64, text: &str| -> bool {
-            // Interleave: check inbound control frames, heartbeat, emit.
-            if let Err(e) = drain_control(stream, cancel, paused) {
-                outcome_slot = Some(e);
-                return false;
+            let _ = drain_control(reader, cancel, paused, trim_epoch, prefetch_enabled, writer);
+            if let Some(state) = pending_state.take() {
+                write_frame_best_effort(
+                    writer,
+                    &WorkerFrame::State {
+                        state: state.as_str().to_string(),
+                    },
+                );
             }
-            if let Some(state) = pending_state.borrow_mut().take() {
-                let _ = WorkerFrame::State {
-                    state: state.as_str().to_string(),
-                }
-                .write_to(stream);
-            }
-            if last_heartbeat.elapsed() >= HEARTBEAT_INTERVAL {
-                let heartbeat = WorkerFrame::Heartbeat {
-                    uptime_ms: started.elapsed().as_millis() as u64,
-                };
-                if heartbeat.write_to(stream).is_err() {
-                    outcome_slot = Some(TuckmillError::new(
-                        ErrorCode::WorkerFailed,
-                        "supervisor connection lost while streaming",
-                    ));
-                    return false;
-                }
-                *last_heartbeat = Instant::now();
-            }
-            if (WorkerFrame::Token {
-                index,
-                text: text.to_string(),
-            })
-            .write_to(stream)
+            if write_frame(
+                writer,
+                &WorkerFrame::Token {
+                    index,
+                    text: text.to_string(),
+                },
+            )
             .is_err()
             {
                 outcome_slot = Some(TuckmillError::new(
@@ -372,35 +480,42 @@ fn generate_streaming(
             true
         };
         let mut on_state = |state: RunState| {
-            *pending_state.borrow_mut() = Some(state);
+            pending_state.set(Some(state));
         };
-        let mut ctl = GenControl {
-            cancel: cancel.clone(),
-            paused: paused.clone(),
-            on_token: &mut on_token,
-            on_state: &mut on_state,
-        };
+        let mut ctl = GenControl::new(cancel.clone(), paused.clone(), &mut on_token, &mut on_state);
+        ctl.trim_epoch = trim_epoch.clone();
+        ctl.poll = Some(&poll_hook);
         engine.generate(&req, &mut ctl)
     };
+    let _ = started;
     if let Some(err) = outcome_slot {
         return Err(err);
     }
     result
 }
 
-/// Non-blocking check for Cancel/Shutdown between tokens.
+/// Non-blocking drain of inbound control frames: Cancel/Shutdown set flags;
+/// Control applies locally and is acknowledged; everything else is ignored
+/// mid-run.
 fn drain_control(
-    stream: &mut UnixStream,
+    reader: &RefCell<UnixStream>,
     cancel: &Arc<AtomicBool>,
     _paused: &Arc<AtomicBool>,
+    trim_epoch: &Arc<AtomicU64>,
+    prefetch_enabled: &Arc<AtomicBool>,
+    writer: &Writer,
 ) -> Result<()> {
     loop {
-        match poll_frame(stream, Duration::ZERO)? {
+        match poll_frame(reader, Duration::ZERO)? {
             PollResult::Frame(WorkerFrame::Cancel { .. }) => {
                 cancel.store(true, Ordering::Relaxed);
             }
             PollResult::Frame(WorkerFrame::Shutdown) => {
                 cancel.store(true, Ordering::Relaxed);
+            }
+            PollResult::Frame(WorkerFrame::Control { action }) => {
+                let result = apply_control(&action, trim_epoch, prefetch_enabled);
+                write_frame_best_effort(writer, &WorkerFrame::ControlAck { action, result });
             }
             PollResult::Frame(_) => { /* ignore other frames mid-run */ }
             PollResult::Timeout => return Ok(()),
@@ -418,15 +533,17 @@ enum PollResult {
     Eof,
 }
 
-fn poll_frame(stream: &mut UnixStream, timeout: Duration) -> Result<PollResult> {
+fn poll_frame(reader: &RefCell<UnixStream>, timeout: Duration) -> Result<PollResult> {
     use std::os::unix::io::AsRawFd;
+    let stream = reader.borrow_mut();
     let mut pfd = libc::pollfd {
         fd: stream.as_raw_fd(),
         events: libc::POLLIN,
         revents: 0,
     };
     let ms = timeout.as_millis().min(i32::MAX as u128) as i32;
-    // SAFETY: poll with one initialized pollfd.
+    // SAFETY: poll with one initialized pollfd; the fd is valid while the
+    // RefCell borrow is held.
     let rc = unsafe { libc::poll(&mut pfd, 1, ms) };
     if rc < 0 {
         let err = std::io::Error::last_os_error();
@@ -442,20 +559,23 @@ fn poll_frame(stream: &mut UnixStream, timeout: Duration) -> Result<PollResult> 
         return Ok(PollResult::Eof);
     }
     // Readable: a full frame is waiting; a short blocking read is safe.
+    drop(stream);
+    let mut stream = reader.borrow_mut();
     stream
         .set_read_timeout(Some(Duration::from_secs(5)))
         .map_err(TuckmillError::from)?;
-    match WorkerFrame::read_from(stream)? {
+    match WorkerFrame::read_from(&mut *stream)? {
         Some(frame) => Ok(PollResult::Frame(frame)),
         None => Ok(PollResult::Eof),
     }
 }
 
-fn read_frame_blocking(stream: &mut UnixStream) -> Result<Option<WorkerFrame>> {
+fn read_frame_blocking(reader: &RefCell<UnixStream>) -> Result<Option<WorkerFrame>> {
+    let mut stream = reader.borrow_mut();
     stream
         .set_read_timeout(Some(Duration::from_secs(30)))
         .map_err(TuckmillError::from)?;
-    WorkerFrame::read_from(stream)
+    WorkerFrame::read_from(&mut *stream)
 }
 
 /// Parse the `--engine <name>` worker argument. Absent means reference-test.
@@ -508,6 +628,21 @@ mod tests {
             tensor_index_hash: "0".repeat(64),
             tokenizer_hash: None,
             arch_id: Some("qwen3".into()),
+            content_hash: None,
+        }
+    }
+
+    fn connect(dir: &Path, kind: EngineKind) -> (UnixStream, std::thread::JoinHandle<Result<()>>) {
+        let socket = dir.join("w.sock");
+        let socket2 = socket.clone();
+        let handle = std::thread::spawn(move || run_worker(&socket2, kind));
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            if let Ok(s) = UnixStream::connect(&socket) {
+                break (s, handle);
+            }
+            assert!(std::time::Instant::now() < deadline, "worker never bound");
+            std::thread::sleep(Duration::from_millis(20));
         }
     }
 
@@ -518,6 +653,10 @@ mod tests {
             engine_from_args(&["--engine".into(), "tuckcore".into()]).unwrap(),
             EngineKind::TuckCore
         );
+        assert_eq!(
+            engine_from_args(&["--engine".into(), "llama".into()]).unwrap(),
+            EngineKind::LlamaCpp
+        );
         assert!(engine_from_args(&["--engine".into()]).is_err());
         assert!(engine_from_args(&["--engine".into(), "nope".into()]).is_err());
     }
@@ -525,24 +664,10 @@ mod tests {
     #[test]
     fn worker_serves_handshake_load_generate_and_cancel() {
         let dir = tempfile::tempdir().unwrap();
-        let socket = dir.path().join("w.sock");
-        let socket2 = socket.clone();
-        let handle = std::thread::spawn(move || run_worker(&socket2, EngineKind::ReferenceTest));
-
-        // Connect with retry while the worker binds.
-        let mut stream = {
-            let deadline = std::time::Instant::now() + Duration::from_secs(5);
-            loop {
-                if let Ok(s) = UnixStream::connect(&socket) {
-                    break s;
-                }
-                assert!(std::time::Instant::now() < deadline, "worker never bound");
-                std::thread::sleep(Duration::from_millis(20));
-            }
-        };
+        let (mut stream, handle) = connect(dir.path(), EngineKind::ReferenceTest);
 
         hello("test").write_to(&mut stream).unwrap();
-        match read_frame_blocking(&mut stream).unwrap().unwrap() {
+        match read_frame_blocking_client(&mut stream) {
             WorkerFrame::HelloAck {
                 engine, certified, ..
             } => {
@@ -559,7 +684,7 @@ mod tests {
         }
         .write_to(&mut stream)
         .unwrap();
-        match read_frame_blocking(&mut stream).unwrap().unwrap() {
+        match read_frame_blocking_client(&mut stream) {
             WorkerFrame::Loaded { note, .. } => assert!(note.contains("synthetic")),
             other => panic!("expected Loaded, got {other:?}"),
         }
@@ -605,7 +730,7 @@ mod tests {
 
         // Stats carry backend statistics.
         WorkerFrame::Stats.write_to(&mut stream).unwrap();
-        match read_frame_blocking(&mut stream).unwrap().unwrap() {
+        match read_frame_blocking_client(&mut stream) {
             WorkerFrame::StatsAck { backend, .. } => {
                 let backend = backend.expect("stats include backend data");
                 assert_eq!(
@@ -616,6 +741,20 @@ mod tests {
             other => panic!("expected StatsAck, got {other:?}"),
         }
 
+        // Control frames are applied locally and acknowledged honestly.
+        WorkerFrame::Control {
+            action: "trim-caches".into(),
+        }
+        .write_to(&mut stream)
+        .unwrap();
+        match read_frame_blocking_client(&mut stream) {
+            WorkerFrame::ControlAck { action, result } => {
+                assert_eq!(action, "trim-caches");
+                assert!(result.contains("queued"), "{result}");
+            }
+            other => panic!("expected ControlAck, got {other:?}"),
+        }
+
         // Scoring is refused by the synthetic engine with a typed error.
         WorkerFrame::Score {
             request_id: "s1".into(),
@@ -624,7 +763,7 @@ mod tests {
         }
         .write_to(&mut stream)
         .unwrap();
-        match read_frame_blocking(&mut stream).unwrap().unwrap() {
+        match read_frame_blocking_client(&mut stream) {
             WorkerFrame::Error { code, .. } => assert_eq!(code, "UNAVAILABLE"),
             other => panic!("expected Error, got {other:?}"),
         }
@@ -667,25 +806,88 @@ mod tests {
         handle.join().unwrap().unwrap();
     }
 
+    fn read_frame_blocking_client(stream: &mut UnixStream) -> WorkerFrame {
+        stream
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .unwrap();
+        loop {
+            match WorkerFrame::read_from(stream).unwrap() {
+                Some(WorkerFrame::Heartbeat { .. }) => continue,
+                Some(frame) => return frame,
+                None => panic!("worker closed unexpectedly"),
+            }
+        }
+    }
+
+    #[test]
+    fn control_commands_reach_the_engine_during_generation() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut stream, handle) = connect(dir.path(), EngineKind::ReferenceTest);
+        hello("test").write_to(&mut stream).unwrap();
+        let _ = read_frame_blocking_client(&mut stream);
+        WorkerFrame::Load {
+            plan: Box::new(admitted_plan()),
+            artifact: artifact(),
+            options: None,
+        }
+        .write_to(&mut stream)
+        .unwrap();
+        let _ = read_frame_blocking_client(&mut stream);
+
+        // Long synthetic run; send a control command mid-stream and expect a
+        // ControlAck delivered while generation is still in flight.
+        WorkerFrame::Generate {
+            request_id: "r2".into(),
+            prompt_tokens: vec![1, 2],
+            max_output_tokens: 60,
+            stop: vec![],
+            seed: 0,
+        }
+        .write_to(&mut stream)
+        .unwrap();
+        let mut tokens = 0u64;
+        let mut acked = false;
+        WorkerFrame::Control {
+            action: "trim-caches".into(),
+        }
+        .write_to(&mut stream)
+        .unwrap();
+        loop {
+            stream
+                .set_read_timeout(Some(Duration::from_secs(10)))
+                .unwrap();
+            match WorkerFrame::read_from(&mut stream).unwrap().unwrap() {
+                WorkerFrame::Token { .. } => tokens += 1,
+                WorkerFrame::ControlAck { action, result } => {
+                    assert_eq!(action, "trim-caches");
+                    assert!(result.contains("queued"));
+                    acked = true;
+                }
+                WorkerFrame::Done { reason, .. } => {
+                    assert_eq!(reason, "length");
+                    assert!(acked, "control ack must arrive during generation");
+                    assert!(tokens >= 60, "acks do not disturb token flow");
+                    break;
+                }
+                WorkerFrame::State { .. } | WorkerFrame::Heartbeat { .. } => {}
+                other => panic!("unexpected frame {other:?}"),
+            }
+        }
+        WorkerFrame::Shutdown.write_to(&mut stream).unwrap();
+        let _ = WorkerFrame::read_from(&mut stream);
+        handle.join().unwrap().unwrap();
+    }
+
     #[test]
     fn worker_requires_hello_first() {
         let dir = tempfile::tempdir().unwrap();
-        let socket = dir.path().join("w.sock");
-        let socket2 = socket.clone();
-        let handle = std::thread::spawn(move || run_worker(&socket2, EngineKind::ReferenceTest));
-        let mut stream = {
-            let deadline = std::time::Instant::now() + Duration::from_secs(5);
-            loop {
-                if let Ok(s) = UnixStream::connect(&socket) {
-                    break s;
-                }
-                assert!(std::time::Instant::now() < deadline);
-                std::thread::sleep(Duration::from_millis(20));
-            }
-        };
+        let (mut stream, handle) = connect(dir.path(), EngineKind::ReferenceTest);
         WorkerFrame::Stats.write_to(&mut stream).unwrap();
         // The worker must close/refuse rather than continue.
-        let result = read_frame_blocking(&mut stream);
+        stream
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .unwrap();
+        let result = WorkerFrame::read_from(&mut stream);
         assert!(result.is_err() || result.unwrap().is_none());
         let _ = handle.join();
     }

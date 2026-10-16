@@ -178,9 +178,18 @@ enum Cmd {
         tolerance: f64,
         /// TuckCore numerical profile for --reference comparisons:
         /// "llama-cpu" (mirrors pinned llama.cpp CPU kernels; default) or
-        /// "oracle-f32" (exact scalar arithmetic).
+        /// "oracle-f32" (scalar FP32 reference, no activation quantization).
         #[arg(long, default_value = "llama-cpu")]
         tuckcore_profile: String,
+        /// KV cache precision for both sides in --reference comparisons:
+        /// "f16" (matches llama.cpp's default) or "f32".
+        #[arg(long, default_value = "f16")]
+        kv_precision: String,
+        /// Held-out qualification run: frozen inputs disjoint from the
+        /// calibration workload (required before a configuration counts as
+        /// qualified, not just calibrated).
+        #[arg(long)]
+        held_out: bool,
     },
 
     /// Run the standard benchmark suite and write a machine-readable record.
