@@ -30,13 +30,15 @@ quality.
 scripts/build.sh                # cargo build + native ABI stub check
 scripts/test.sh                 # fmt + clippy -D warnings + full test suite
 scripts/demo.sh                 # end-to-end on a generated fixture
+scripts/fetch-llama.sh          # pinned llama.cpp reference build + tm shim (into .deps/)
 
 tuckmill doctor                                  # device profile, honest labels
 tuckmill inspect model.gguf                      # validate without loading weights
 tuckmill import model.gguf --alias my-model      # atomic, resumable, verified
 tuckmill plan my-model                           # R+U+H<=B admission, mode, assumptions
 tuckmill run my-model --prompt "explain RoPE" --engine tuckcore   # real weights
-tuckmill verify my-model                         # bit-exact residency/streaming equivalence
+tuckmill verify my-model                         # residency/streaming equivalence
+tuckmill verify my-model --reference             # llama.cpp vs TuckCore logits (needs TUCKMILL_LLAMA_LIB)
 tuckmill run my-model --allow-test-engine        # synthetic pipeline run
 tuckmill bench my-model --engine tuckcore        # machine-readable record
 tuckmill serve --allow-test-engine               # loopback API (127.0.0.1:8378)
@@ -89,7 +91,7 @@ architecture.
 | `verify` — resident vs forced-streaming with identical token IDs: teacher-forced logits (bit-exact at Stage 0), eviction and footprint evidence, machine-readable record | ✅ |
 | Governor — Normal/Constrained/Paused/Draining/Failed with stability-window resume; driven by real memory-pressure and thermal signals | ✅ |
 | `bench` — standard-v1 records with per-prompt data, cache-state labels, caveats | ✅ |
-| llama.cpp/ggml reference backend | ⛔ designated (ADR-005/ADR-006), not yet integrated |
+| llama.cpp/ggml reference backend (`--engine llama`) — pinned revision via a header-checked C shim, loaded at runtime (never vendored); `verify --reference` compares it against TuckCore on identical token IDs | ✅ integrated (wrapper uncertified) |
 | Custom Metal kernels (K01–K09) | ⛔ specified only; TuckCore Stage 0 is the scalar oracle they will be validated against |
 | MoE streaming, hybrid/compressed (Bonsai) execution | ⛔ gated milestones |
 
@@ -129,10 +131,12 @@ crates/manifest     schemas, GGUF/Safetensors inspection, adapters, fixtures
 crates/backend      versioned inference-backend interface
 crates/planner      device profiler, admission/KV math, cost model, calibration, kernel registry
 crates/store        imports, downloads, packing, cache/GC
-crates/tuckcore     experimental executor: block loader, completion fences, scalar Qwen3 forward
+crates/tuckcore     experimental executor: block loader, completion fences, scalar Qwen3 forward, tokenizer
+crates/llamaref     pinned llama.cpp reference backend (dlopen of the checked tm shim)
 crates/supervisor   queue, ledger, governor, worker protocol/process, API, bench, verify
 crates/cli          the tuckmill binary (incl. hidden __worker-reference)
 native/executor     C ABI header + protocol spec (PROTOCOL.md, v2)
+native/llamaref     tm_llama_shim.c: narrow C surface over pinned llama.cpp
 kernels/            K01–K09 work-package registry (all "specified")
 adapters/           qwen3, qwen3moe, qwen3.5-hybrid, bonsai2-hybrid specs
 benchmarks/         standard-v1 frozen workload; comparator program (llama.cpp, MLX, Splash)

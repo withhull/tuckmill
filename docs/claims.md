@@ -17,6 +17,8 @@ the code, output, or documentation.
 | Importing = redistributable | Import records a license note only | Always: importing is not a license review |
 | Tuckmill is an engine "for 8 GB Macs" | 8 GiB is the minimum target tier; strategies scale to 512 GiB+ (ADR-006) | "Mac-native high-performance inference for Apple Silicon, from 8 GB upward" |
 | Tuckmill beats llama.cpp / MLX / Splash | No matched measurement exists | Unproven; comparisons run only under the four-way identity rules with registered tolerances (`benchmarks/README.md`) |
+| TuckCore matches llama.cpp numerically | First profile measured on the fixture (M3 8 GiB, ctx 512): max abs logit diff 1.98e-4 under a 1e-2 registered tolerance, identical greedy text | "Within the registered tolerance on this artifact and configuration" — never "matches" without the record |
+| Our tokenizer matches llama.cpp | Fixture goldens: exact id equality on ASCII/contractions/multi-space/unicode; exact byte roundtrip | Fixture-scale evidence only; real-corpus goldens and `qwen2` pre-tokenizer equivalence pending |
 | Benchmarks measure model performance | This build benches the pipeline | Records carry `engine: reference-test`, `certified: false` and caveats |
 | TuckCore "runs" a model | It executes the artifact's real tensor bytes through scalar f32 kernels; fixture weights are synthetic (untrained), so outputs are meaningless outside equivalence tests | "Experimental, uncertified executor; bit-exact streaming equivalence demonstrated; quality and performance unmeasured" |
 | TuckCore has a tokenizer | It does not; prompts map deterministically into the artifact vocabulary and the limitation is labeled in run output and API extensions | Always: "no text tokenizer in this build" |

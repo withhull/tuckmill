@@ -15,6 +15,7 @@ the framing of the product.
 scripts/build.sh     # cargo build --workspace + native ABI stub check
 scripts/test.sh      # fmt check + clippy -D warnings + full test suite
 scripts/demo.sh      # end-to-end demo on a generated fixture (temp data dir)
+scripts/fetch-llama.sh # pinned llama.cpp reference + tm shim into .deps/ (gitignored)
 
 cargo test -p tuckmill-tuckcore          # single crate
 TUCKMILL_DATA_DIR=$(mktemp -d) target/debug/tuckmill doctor
@@ -47,7 +48,10 @@ CI would run.
 6. **Comparisons are measured, not asserted.** Benchmark against
    llama.cpp / MLX / Splash only under the four-way identity rules
    (identical artifacts, token IDs, numerical profiles, declared cache
-   state) with registered tolerances (`benchmarks/README.md`).
+   state) with registered tolerances (`benchmarks/README.md`). Reference
+   comparisons run through `tuckmill verify --reference`; llama.cpp is
+   pinned and loaded at runtime (`scripts/fetch-llama.sh`,
+   `TUCKMILL_LLAMA_LIB`), never vendored.
 7. **No unmeasured rewrites.** Profile first; a custom kernel or replacement
    subsystem must demonstrate a gap or a capability the reference path lacks.
 8. **Architecture decisions get an ADR** in `docs/adr/` before restructuring

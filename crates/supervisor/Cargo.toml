@@ -10,6 +10,7 @@ description = "Tuckmill supervisor: admission, queues, worker lifecycle, governo
 tuckmill-manifest.workspace = true
 tuckmill-backend.workspace = true
 tuckmill-tuckcore.workspace = true
+tuckmill-llamaref.workspace = true
 tuckmill-planner.workspace = true
 tuckmill-store.workspace = true
 serde.workspace = true

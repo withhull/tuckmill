@@ -28,6 +28,32 @@ use crate::worker::IsolatedWorker;
 /// record never carries a full logit matrix.
 type ScoredLogits = Vec<(u64, Vec<f32>)>;
 
+/// Bounded parameters for the llama.cpp-reference comparison (ADR-006):
+/// identical token IDs through TuckCore and the pinned llama.cpp backend,
+/// teacher-forced logits compared under a registered tolerance.
+#[derive(Debug, Clone)]
+pub struct ReferenceCompareOptions {
+    pub token_count: u64,
+    pub max_score_positions: u64,
+    pub generate_tokens: u64,
+    pub tuckcore_cache_bytes: u64,
+    /// Registered tolerance for LlamaRef-vs-TuckCore logits. Set from the
+    /// first measured profile; tightened only with new evidence.
+    pub max_abs_tolerance: f64,
+}
+
+impl Default for ReferenceCompareOptions {
+    fn default() -> Self {
+        Self {
+            token_count: 12,
+            max_score_positions: 6,
+            generate_tokens: 8,
+            tuckcore_cache_bytes: 32 * 1024 * 1024,
+            max_abs_tolerance: 1e-2,
+        }
+    }
+}
+
 /// Bounded verification parameters.
 #[derive(Debug, Clone)]
 pub struct VerifyOptions {
@@ -81,6 +107,9 @@ pub struct LogitComparison {
 #[derive(Debug, Clone, Serialize)]
 pub struct VerifyReport {
     pub schema_version: u32,
+    /// "scheduling-equivalence" (resident vs forced-streaming TuckCore) or
+    /// "reference-comparison" (llama.cpp vs TuckCore over identical ids).
+    pub mode: String,
     pub run_id: Id,
     pub created_unix_ms: u64,
     pub artifact_id: Id,
@@ -115,60 +144,29 @@ impl Runtime {
         }
         self.check_plan_fresh(plan)?;
         self.plan_admitted(plan)?;
-
-        // Deterministic token IDs within the artifact's vocabulary.
-        let path = std::path::Path::new(&artifact.path);
-        let insp =
-            tuckmill_manifest::gguf::inspect(path, &tuckmill_manifest::gguf::Limits::default())?;
-        let embd = insp
-            .tensors
-            .iter()
-            .find(|t| t.name == "token_embd.weight")
-            .ok_or_else(|| {
-                TuckmillError::new(
-                    ErrorCode::UnsupportedArchitecture,
-                    "artifact is missing token_embd.weight",
-                )
-            })?;
-        let vocab = embd.dims.get(1).copied().unwrap_or(0);
-        if vocab == 0 || options.token_count < 2 {
-            return Err(TuckmillError::new(
-                ErrorCode::InvalidRequest,
-                "verification needs a vocabulary and at least two tokens",
-            ));
-        }
-        let tokens: Vec<u32> = (0..options.token_count)
-            .map(|i| ((i * 37 + 5) % vocab) as u32)
-            .collect();
-        let positions: Vec<u64> = (1..=options.max_score_positions)
-            .map(|i| i * 2 - 1)
-            .filter(|p| *p < options.token_count)
-            .collect();
-        if positions.is_empty() {
-            return Err(TuckmillError::new(
-                ErrorCode::InvalidRequest,
-                "no scoring positions fit inside the token sequence",
-            ));
-        }
+        let (tokens, positions, _vocab) =
+            derive_verify_inputs(artifact, options.token_count, options.max_score_positions)?;
 
         let (resident, resident_logits) = self.run_side(
+            EngineKind::TuckCore,
             "resident",
             plan,
             artifact,
             &tokens,
             &positions,
-            options,
-            options.resident_cache_bytes,
+            options.generate_tokens,
+            Some(options.resident_cache_bytes),
             false,
         )?;
         let (streamed, streamed_logits) = self.run_side(
+            EngineKind::TuckCore,
             "forced-streaming",
             plan,
             artifact,
             &tokens,
             &positions,
-            options,
-            options.streamed_cache_bytes,
+            options.generate_tokens,
+            Some(options.streamed_cache_bytes),
             true,
         )?;
 
@@ -252,6 +250,7 @@ impl Runtime {
         }))?;
         let report = VerifyReport {
             schema_version: 1,
+            mode: "scheduling-equivalence".to_string(),
             run_id: run_id.clone(),
             created_unix_ms: now_unix_ms(),
             artifact_id: plan.artifact_id.clone(),
@@ -290,26 +289,27 @@ impl Runtime {
     #[allow(clippy::too_many_arguments)]
     fn run_side(
         &self,
+        kind: EngineKind,
         label: &str,
         plan: &ExecutionPlan,
         artifact: &ArtifactRef,
         tokens: &[u32],
         positions: &[u64],
-        options: &VerifyOptions,
-        cache_bytes: u64,
+        generate_tokens: u64,
+        cache_bytes: Option<u64>,
         sample_footprint: bool,
     ) -> Result<(RunSide, ScoredLogits)> {
-        let mut worker = IsolatedWorker::spawn(
-            &self.worker_exe,
-            &self.layout.tmp_dir(),
-            EngineKind::TuckCore,
-        )?;
-        let block_bytes = cache_bytes.clamp(64 * 1024, 4 * 1024 * 1024);
-        let load_options = serde_json::json!({
-            "weight_cache_bytes": cache_bytes,
-            "block_bytes": block_bytes,
+        let mut worker = IsolatedWorker::spawn(&self.worker_exe, &self.layout.tmp_dir(), kind)?;
+        // Only TuckCore takes streaming options; llama.cpp manages its own
+        // memory (mmap) and rejects unknown option keys nowhere else.
+        let load_options = cache_bytes.map(|cache_bytes| {
+            let block_bytes = cache_bytes.clamp(64 * 1024, 4 * 1024 * 1024);
+            serde_json::json!({
+                "weight_cache_bytes": cache_bytes,
+                "block_bytes": block_bytes,
+            })
         });
-        let note = worker.load(plan, artifact, Some(&load_options))?;
+        let note = worker.load(plan, artifact, load_options.as_ref())?;
         self.logger.info(
             "VERIFY_LOAD",
             [
@@ -360,7 +360,7 @@ impl Runtime {
             crate::engine::GenerateRequest {
                 request_id: format!("verify-{label}"),
                 prompt_tokens: prompt,
-                max_output_tokens: options.generate_tokens,
+                max_output_tokens: generate_tokens,
                 stop: Vec::new(),
                 seed: 0,
             },
@@ -382,7 +382,7 @@ impl Runtime {
         // carries digests and maxima only.
         let side = RunSide {
             label: label.to_string(),
-            cache_bytes,
+            cache_bytes: cache_bytes.unwrap_or(0),
             scored_positions: scored.len() as u64,
             generated_text: text,
             committed_tokens: outcome.committed,
@@ -397,11 +397,208 @@ impl Runtime {
     }
 }
 
+/// Deterministic verification inputs: token ids within the artifact's
+/// vocabulary and odd scoring positions inside the sequence.
+fn derive_verify_inputs(
+    artifact: &ArtifactRef,
+    token_count: u64,
+    max_score_positions: u64,
+) -> Result<(Vec<u32>, Vec<u64>, u64)> {
+    let path = std::path::Path::new(&artifact.path);
+    let insp = tuckmill_manifest::gguf::inspect(path, &tuckmill_manifest::gguf::Limits::default())?;
+    let embd = insp
+        .tensors
+        .iter()
+        .find(|t| t.name == "token_embd.weight")
+        .ok_or_else(|| {
+            TuckmillError::new(
+                ErrorCode::UnsupportedArchitecture,
+                "artifact is missing token_embd.weight",
+            )
+        })?;
+    let vocab = embd.dims.get(1).copied().unwrap_or(0);
+    if vocab == 0 || token_count < 2 {
+        return Err(TuckmillError::new(
+            ErrorCode::InvalidRequest,
+            "verification needs a vocabulary and at least two tokens",
+        ));
+    }
+    let tokens: Vec<u32> = (0..token_count)
+        .map(|i| ((i * 37 + 5) % vocab) as u32)
+        .collect();
+    let positions: Vec<u64> = (1..=max_score_positions)
+        .map(|i| i * 2 - 1)
+        .filter(|p| *p < token_count)
+        .collect();
+    if positions.is_empty() {
+        return Err(TuckmillError::new(
+            ErrorCode::InvalidRequest,
+            "no scoring positions fit inside the token sequence",
+        ));
+    }
+    Ok((tokens, positions, vocab))
+}
+
+impl Runtime {
+    /// Reference comparison (ADR-006): identical token IDs through TuckCore
+    /// and the pinned llama.cpp backend; teacher-forced logits compared under
+    /// a registered tolerance. Generated-text equality is recorded but is not
+    /// a pass criterion: greedy argmax can diverge on exact ties, and the
+    /// numerical claim is about logits, not tie-breaking luck.
+    pub fn run_reference_comparison(
+        &self,
+        plan: &ExecutionPlan,
+        artifact: &ArtifactRef,
+        options: &ReferenceCompareOptions,
+    ) -> Result<VerifyReport> {
+        self.check_plan_fresh(plan)?;
+        self.plan_admitted(plan)?;
+        let (tokens, positions, _vocab) =
+            derive_verify_inputs(artifact, options.token_count, options.max_score_positions)?;
+
+        let (tuckcore, tuckcore_logits) = self.run_side(
+            EngineKind::TuckCore,
+            "tuckcore",
+            plan,
+            artifact,
+            &tokens,
+            &positions,
+            options.generate_tokens,
+            Some(options.tuckcore_cache_bytes),
+            false,
+        )?;
+        let (llama, llamaref_logits) = self.run_side(
+            EngineKind::LlamaCpp,
+            "llama.cpp",
+            plan,
+            artifact,
+            &tokens,
+            &positions,
+            options.generate_tokens,
+            None,
+            true,
+        )?;
+
+        if tuckcore.scored_positions as usize != positions.len()
+            || llama.scored_positions as usize != positions.len()
+        {
+            return Err(TuckmillError::new(
+                ErrorCode::WorkerFailed,
+                format!(
+                    "scoring incomplete: tuckcore {} / llama.cpp {} of {} positions",
+                    tuckcore.scored_positions,
+                    llama.scored_positions,
+                    positions.len()
+                ),
+            ));
+        }
+
+        let mut max_abs: f64 = 0.0;
+        let mut max_rel: f64 = 0.0;
+        let mut exact = true;
+        let mut vocab_seen = 0u64;
+        for (a, b) in tuckcore_logits.iter().zip(llamaref_logits.iter()) {
+            let (pos_a, la) = a;
+            let (pos_b, lb) = b;
+            if pos_a != pos_b || la.len() != lb.len() {
+                exact = false;
+                continue;
+            }
+            vocab_seen = la.len() as u64;
+            for (x, y) in la.iter().zip(lb.iter()) {
+                if x.to_bits() != y.to_bits() {
+                    exact = false;
+                }
+                let diff = (*x as f64 - *y as f64).abs();
+                max_abs = max_abs.max(diff);
+                let denom = x.abs().max(y.abs()).max(1e-9) as f64;
+                max_rel = max_rel.max(diff / denom);
+            }
+        }
+        let within_tolerance = max_abs <= options.max_abs_tolerance;
+        let texts_equal = tuckcore.generated_text == llama.generated_text;
+        let mut notes = Vec::new();
+        if exact {
+            notes.push("logits are bit-identical across backends".into());
+        } else {
+            notes.push(format!(
+                "logits differ by at most {max_abs:.3e} (registered tolerance {:.3e}): expected from different kernel/accumulation orderings",
+                options.max_abs_tolerance
+            ));
+        }
+        if !texts_equal {
+            notes.push(
+                "greedy generated text diverged (argmax tie or amplified difference); recorded, not a pass criterion"
+                    .into(),
+            );
+        }
+        let passed = within_tolerance;
+
+        let caveats = vec![
+            format!(
+                "reference backend: pinned llama.cpp {} via tm shim, CPU execution (n_gpu_layers=0)",
+                tuckmill_llamaref::LLAMA_REVISION
+            ),
+            "TuckCore is the scalar f32 oracle: comparison establishes the numerical profile envelope for this artifact and context, not performance"
+                .into(),
+            "fixture artifacts carry synthetic (non-trained) weights: equivalence speaks to execution paths, never model quality"
+                .into(),
+            format!(
+                "tolerance registered before tuning: max_abs = {:.3e}",
+                options.max_abs_tolerance
+            ),
+        ];
+
+        let run_id = hash_of(&serde_json::json!({
+            "artifact": artifact.metadata_hash,
+            "tokens": tokens,
+            "positions": positions,
+            "mode": "reference-comparison",
+            "llama_revision": tuckmill_llamaref::LLAMA_REVISION,
+        }))?;
+        let report = VerifyReport {
+            schema_version: 1,
+            mode: "reference-comparison".to_string(),
+            run_id: run_id.clone(),
+            created_unix_ms: now_unix_ms(),
+            artifact_id: plan.artifact_id.clone(),
+            artifact_metadata_hash: artifact.metadata_hash.clone(),
+            engine: "tuckcore vs llama.cpp".to_string(),
+            token_ids: tokens,
+            resident: tuckcore,
+            streamed: llama,
+            logits: LogitComparison {
+                positions,
+                vocab: vocab_seen,
+                exact_equal: exact,
+                max_abs_diff: max_abs,
+                max_rel_diff: max_rel,
+            },
+            generated_texts_equal: texts_equal,
+            streaming_exercised: false,
+            confidence: Confidence::Estimated,
+            passed,
+            notes,
+            caveats,
+        };
+
+        let dir = self.layout.records_dir().join("verify");
+        std::fs::create_dir_all(&dir).map_err(TuckmillError::from)?;
+        let path = dir.join(format!("{}.json", run_id.as_str()));
+        let bytes = serde_json::to_vec_pretty(&report).map_err(|e| {
+            tuckmill_manifest::error::json_error(e, ErrorCode::Internal, "verify record")
+        })?;
+        std::fs::write(&path, bytes).map_err(TuckmillError::from)?;
+        Ok(report)
+    }
+}
+
 /// Format a report for the terminal.
 pub fn format_report(report: &VerifyReport) -> String {
     let mut lines = Vec::new();
     lines.push(format!(
-        "equivalence: {} ({})",
+        "equivalence [{}]: {} ({})",
+        report.mode,
         if report.passed { "PASS" } else { "FAIL" },
         report.engine
     ));
@@ -416,13 +613,15 @@ pub fn format_report(report: &VerifyReport) -> String {
         report.logits.positions
     ));
     lines.push(format!(
-        "  resident side: cache {}, {} positioned scores, {} committed tokens",
+        "  {} side: cache {}, {} positioned scores, {} committed tokens",
+        report.resident.label,
         tuckmill_manifest::units::Bytes(report.resident.cache_bytes),
         report.resident.scored_positions,
         report.resident.committed_tokens
     ));
     lines.push(format!(
-        "  streamed side: cache {}, evictions {}, logical reads {}, {} committed",
+        "  {} side: cache {}, evictions {}, logical reads {}, {} committed",
+        report.streamed.label,
         tuckmill_manifest::units::Bytes(report.streamed.cache_bytes),
         report.streamed.stats.evictions,
         tuckmill_manifest::units::Bytes(report.streamed.stats.logical_read_bytes),

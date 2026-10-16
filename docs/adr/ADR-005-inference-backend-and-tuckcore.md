@@ -4,6 +4,15 @@ Status: **committed** (2026-10-16). Runtime + Systems. Amends ADR-003 (the
 "one engine exists" statement) and prepares the llama.cpp integration planned
 by ADR-002.
 
+**Update (2026-10-16):** the llama.cpp reference backend is integrated as
+decision 2 anticipated: pinned revision `b11695`, runtime-loaded via the
+header-checked C shim `native/llamaref/tm_llama_shim.c`
+(`scripts/fetch-llama.sh`), never vendored. `verify --reference` records
+cross-backend teacher-forced logits under a registered tolerance; the first
+profile on the fixture measured max|Δ| = 1.98e-4 against a 1e-2 registration.
+The wrapper remains uncertified, and llama.cpp execution is CPU-only here
+(`n_gpu_layers = 0`) — GPU offload is a separately measured milestone.
+
 ## Context and review
 
 The v0.2 engineering build finished the orchestration stack with exactly one

@@ -470,6 +470,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "tuckmill-llamaref"
+version = "0.2.0"
+dependencies = [
+ "libc",
+ "serde_json",
+ "tempfile",
+ "tuckmill-backend",
+ "tuckmill-manifest",
+ "tuckmill-tuckcore",
+]
+
+[[package]]
 name = "tuckmill-manifest"
 version = "0.2.0"
 dependencies = [
@@ -515,6 +527,7 @@ dependencies = [
  "serde_json",
  "tempfile",
  "tuckmill-backend",
+ "tuckmill-llamaref",
  "tuckmill-manifest",
  "tuckmill-planner",
  "tuckmill-store",

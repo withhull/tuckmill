@@ -6,6 +6,7 @@ members = [
     "crates/planner",
     "crates/store",
     "crates/tuckcore",
+    "crates/llamaref",
     "crates/supervisor",
     "crates/cli",
 ]
@@ -24,6 +25,7 @@ description = "Tuckmill: local-first model inference framework for Apple Silicon
 tuckmill-manifest = { path = "crates/manifest", version = "0.2.0" }
 tuckmill-backend = { path = "crates/backend", version = "0.2.0" }
 tuckmill-tuckcore = { path = "crates/tuckcore", version = "0.2.0" }
+tuckmill-llamaref = { path = "crates/llamaref", version = "0.2.0" }
 tuckmill-planner = { path = "crates/planner", version = "0.2.0" }
 tuckmill-store = { path = "crates/store", version = "0.2.0" }
 tuckmill-supervisor = { path = "crates/supervisor", version = "0.2.0" }

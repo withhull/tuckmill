@@ -28,6 +28,7 @@ fn make_backend(kind: EngineKind) -> Box<dyn InferenceBackend> {
     match kind {
         EngineKind::ReferenceTest => Box::new(ReferenceTestEngine::new()),
         EngineKind::TuckCore => Box::new(tuckmill_tuckcore::TuckCore::new()),
+        EngineKind::LlamaCpp => Box::new(tuckmill_llamaref::LlamaRef::new()),
     }
 }
 
@@ -453,6 +454,7 @@ pub fn engine_from_args(args: &[String]) -> Result<EngineKind> {
             return match BackendId::parse(value) {
                 Some(BackendId::ReferenceTest) => Ok(EngineKind::ReferenceTest),
                 Some(BackendId::TuckCore) => Ok(EngineKind::TuckCore),
+                Some(BackendId::LlamaCpp) => Ok(EngineKind::LlamaCpp),
                 None => Err(TuckmillError::new(
                     ErrorCode::InvalidRequest,
                     format!("unknown worker engine {value:?}"),

@@ -1,0 +1,20 @@
+[package]
+name = "tuckmill-llamaref"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Tuckmill reference backend: pinned llama.cpp via a checked C shim"
+
+[dependencies]
+tuckmill-manifest.workspace = true
+tuckmill-backend.workspace = true
+serde_json.workspace = true
+libc.workspace = true
+
+[dev-dependencies]
+tempfile = "3"
+tuckmill-tuckcore.workspace = true
+
+[lints]
+workspace = true

@@ -572,6 +572,56 @@ fn verify_proves_streaming_equivalence_bit_exact() {
 }
 
 #[test]
+fn llama_reference_comparison_when_available() {
+    let Some(lib) = std::env::var("TUCKMILL_LLAMA_LIB")
+        .ok()
+        .filter(|p| std::path::Path::new(p).exists())
+    else {
+        eprintln!("skipping: TUCKMILL_LLAMA_LIB not set (run scripts/fetch-llama.sh)");
+        return;
+    };
+    let _ = lib;
+    let env = TestEnv::new();
+    let fixture = env.fixture.display().to_string();
+    env.run_ok(&["import", &fixture, "--alias", "m"]);
+
+    // Run through the pinned llama.cpp reference backend (real weights).
+    let out = env.run_ok(&[
+        "run",
+        "m",
+        "--prompt",
+        "hello world",
+        "--max-output",
+        "3",
+        "--engine",
+        "llama",
+        "--json",
+    ]);
+    let v: serde_json::Value = serde_json::from_str(&out).expect("run json");
+    assert_eq!(v["backend"], "llama.cpp");
+    assert_eq!(v["synthetic_output"], false);
+    assert_eq!(v["committed_tokens"], 3);
+
+    // Cross-backend numerical comparison: identical ids, registered tolerance.
+    let out = env.run_ok(&[
+        "verify",
+        "m",
+        "--reference",
+        "--tolerance",
+        "0.01",
+        "--json",
+    ]);
+    let v: serde_json::Value = serde_json::from_str(&out).expect("verify json");
+    assert_eq!(v["mode"], "reference-comparison");
+    assert_eq!(v["passed"], true, "comparison must pass: {v}");
+    assert_eq!(v["resident"]["label"], "tuckcore");
+    assert_eq!(v["streamed"]["label"], "llama.cpp");
+    let max_abs = v["logits"]["max_abs_diff"].as_f64().unwrap();
+    assert!(max_abs <= 0.01, "within registered tolerance: {max_abs}");
+    assert!(v["logits"]["vocab"].as_u64().unwrap() == 512);
+}
+
+#[test]
 fn worker_and_adapter_consistency() {
     // The fixture must resolve the builtin qwen3 adapter metadata fully; this
     // guards against fixture/adapter drift that would shadow real bugs.

@@ -427,7 +427,7 @@ mod tests {
         assert_eq!(t.vocab_len(), 512);
         assert!(t.pretokenizer_note().is_none());
         assert_eq!(t.special.eos, Some(510));
-        assert_eq!(t.token_type(0), Some(TOKEN_TYPE_BYTE));
+        assert_eq!(t.token_type(0), Some(TOKEN_TYPE_NORMAL));
         assert_eq!(t.token_type(510), Some(TOKEN_TYPE_CONTROL));
     }
 

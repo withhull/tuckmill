@@ -97,12 +97,16 @@ pub fn dispatch(cmd: &Cmd, json: bool, data_dir: Option<&Path>) -> Result<ExitCo
             context,
             positions,
             generate,
+            reference,
+            tolerance,
         } => verify(
             model,
             memory_budget.as_deref(),
             *context,
             *positions,
             *generate,
+            *reference,
+            *tolerance,
             json,
             data_dir,
         ),
@@ -134,13 +138,20 @@ pub fn dispatch(cmd: &Cmd, json: bool, data_dir: Option<&Path>) -> Result<ExitCo
             CacheCmd::Prune { dry_run } => cache_prune(*dry_run, json, data_dir),
         },
         Cmd::WorkerReference { socket, engine } => {
-            let kind = match engine.as_str() {
-                "reference-test" => tuckmill_backend::EngineKind::ReferenceTest,
-                "tuckcore" => tuckmill_backend::EngineKind::TuckCore,
-                other => {
+            let kind = match tuckmill_backend::BackendId::parse(engine) {
+                Some(tuckmill_backend::BackendId::ReferenceTest) => {
+                    tuckmill_backend::EngineKind::ReferenceTest
+                }
+                Some(tuckmill_backend::BackendId::TuckCore) => {
+                    tuckmill_backend::EngineKind::TuckCore
+                }
+                Some(tuckmill_backend::BackendId::LlamaCpp) => {
+                    tuckmill_backend::EngineKind::LlamaCpp
+                }
+                None => {
                     return Err(TuckmillError::new(
                         ErrorCode::InvalidRequest,
-                        format!("unknown worker engine {other:?}"),
+                        format!("unknown worker engine {engine:?}"),
                     ))
                 }
             };
@@ -172,16 +183,18 @@ fn open_layout(data_dir: Option<&Path>) -> Result<StoreLayout> {
 /// - "isolated" / "reference-test": reference test engine in a worker process
 /// - "in-process": reference test engine in the CLI process (debugging)
 /// - "tuckcore": experimental custom executor (isolated worker)
+/// - "llama" / "llama.cpp": pinned llama.cpp reference (isolated worker)
 fn parse_engine(engine: &str) -> Result<(tuckmill_backend::EngineKind, EngineMode)> {
     use tuckmill_backend::EngineKind;
     match engine {
         "isolated" | "reference-test" => Ok((EngineKind::ReferenceTest, EngineMode::Isolated)),
         "in-process" => Ok((EngineKind::ReferenceTest, EngineMode::InProcess)),
         "tuckcore" => Ok((EngineKind::TuckCore, EngineMode::Isolated)),
+        "llama" | "llama.cpp" => Ok((EngineKind::LlamaCpp, EngineMode::Isolated)),
         other => Err(TuckmillError::new(
             ErrorCode::InvalidRequest,
             format!(
-                "unknown engine {other:?}; use 'reference-test' (alias 'isolated'), 'in-process', or 'tuckcore'"
+                "unknown engine {other:?}; use 'reference-test' (alias 'isolated'), 'in-process', 'tuckcore', or 'llama'"
             ),
         )),
     }
@@ -785,8 +798,9 @@ fn run(
             );
         } else {
             eprintln!(
-                "experimental backend {} — scalar f32 reference kernels; real weights executed; performance and quality are uncertified (plan {}, mode {})",
+                "backend {} [{}] — real weights executed; uncertified kernels and quality (plan {}, mode {})",
                 identity.engine,
+                identity.kernels.join(","),
                 plan.plan_id.short(),
                 plan.mode.as_str()
             );
@@ -1083,12 +1097,15 @@ fn artifact_tokenizer(
 
 // ---------------- verify ----------------
 
+#[allow(clippy::too_many_arguments)]
 fn verify(
     model: &str,
     memory_budget: Option<&str>,
     context: u64,
     positions: u64,
     generate: u64,
+    reference: bool,
+    tolerance: f64,
     json: bool,
     data_dir: Option<&Path>,
 ) -> Result<ExitCode> {
@@ -1101,12 +1118,22 @@ fn verify(
         &artifact,
         &runtime.layout.artifact_payload_path(&artifact.artifact_id),
     );
-    let options = tuckmill_supervisor::verify::VerifyOptions {
-        max_score_positions: positions,
-        generate_tokens: generate,
-        ..Default::default()
+    let report = if reference {
+        let options = tuckmill_supervisor::verify::ReferenceCompareOptions {
+            max_score_positions: positions,
+            generate_tokens: generate,
+            max_abs_tolerance: tolerance,
+            ..Default::default()
+        };
+        runtime.run_reference_comparison(&plan, &artifact_ref, &options)?
+    } else {
+        let options = tuckmill_supervisor::verify::VerifyOptions {
+            max_score_positions: positions,
+            generate_tokens: generate,
+            ..Default::default()
+        };
+        runtime.run_equivalence(&plan, &artifact_ref, &options)?
     };
-    let report = runtime.run_equivalence(&plan, &artifact_ref, &options)?;
     let passed = report.passed;
     if json {
         println!(

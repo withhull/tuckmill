@@ -197,12 +197,15 @@ struct WorkerSlot {
 
 impl Runtime {
     pub fn open(options: RuntimeOptions) -> Result<Arc<Self>> {
-        if options.engine_kind == EngineKind::TuckCore
+        if options.engine_kind != EngineKind::ReferenceTest
             && options.engine_mode == EngineMode::InProcess
         {
             return Err(TuckmillError::new(
                 ErrorCode::InvalidConfiguration,
-                "tuckcore runs in the isolated worker process; in-process placement is reserved for the reference test engine",
+                format!(
+                    "{} runs in the isolated worker process; in-process placement is reserved for the reference test engine",
+                    options.engine_kind.backend_id().as_str()
+                ),
             ));
         }
         let layout = match options.data_dir {
@@ -396,7 +399,7 @@ impl Runtime {
     pub fn admit_engine(&self, plan: &ExecutionPlan) -> Result<()> {
         use tuckmill_manifest::plan::EngineAvailability;
         match self.engine_kind {
-            EngineKind::TuckCore => Ok(()),
+            EngineKind::TuckCore | EngineKind::LlamaCpp => Ok(()),
             EngineKind::ReferenceTest => match plan.engine.availability {
                 EngineAvailability::Certified if self.engine_kind == EngineKind::ReferenceTest => {
                     Ok(())
@@ -453,6 +456,7 @@ impl Runtime {
         match self.engine_kind {
             EngineKind::ReferenceTest => crate::engine::reference_test_identity(),
             EngineKind::TuckCore => tuckmill_tuckcore::TuckCore::new().identity(),
+            EngineKind::LlamaCpp => tuckmill_llamaref::identity(),
         }
     }
 

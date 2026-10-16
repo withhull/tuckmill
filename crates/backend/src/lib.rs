@@ -32,6 +32,10 @@ pub enum BackendId {
     /// reference kernels at Stage 0.
     #[serde(rename = "tuckcore")]
     TuckCore,
+    /// Pinned llama.cpp via the checked C shim: the compatibility backend and
+    /// numerical oracle (ADR-005/ADR-006).
+    #[serde(rename = "llama.cpp")]
+    LlamaCpp,
 }
 
 impl BackendId {
@@ -39,6 +43,7 @@ impl BackendId {
         match self {
             BackendId::ReferenceTest => "reference-test",
             BackendId::TuckCore => "tuckcore",
+            BackendId::LlamaCpp => "llama.cpp",
         }
     }
 
@@ -46,6 +51,7 @@ impl BackendId {
         match s {
             "reference-test" => Some(BackendId::ReferenceTest),
             "tuckcore" => Some(BackendId::TuckCore),
+            "llama.cpp" | "llama" => Some(BackendId::LlamaCpp),
             _ => None,
         }
     }
@@ -250,6 +256,7 @@ impl ArtifactRef {
 pub enum EngineKind {
     ReferenceTest,
     TuckCore,
+    LlamaCpp,
 }
 
 impl EngineKind {
@@ -257,6 +264,7 @@ impl EngineKind {
         match self {
             EngineKind::ReferenceTest => BackendId::ReferenceTest,
             EngineKind::TuckCore => BackendId::TuckCore,
+            EngineKind::LlamaCpp => BackendId::LlamaCpp,
         }
     }
 }
@@ -272,14 +280,18 @@ mod tests {
 
     #[test]
     fn backend_ids_roundtrip_on_the_wire() {
-        for id in [BackendId::ReferenceTest, BackendId::TuckCore] {
+        for id in [
+            BackendId::ReferenceTest,
+            BackendId::TuckCore,
+            BackendId::LlamaCpp,
+        ] {
             let s = serde_json::to_string(&id).unwrap();
             assert_eq!(s, format!("\"{}\"", id.as_str()));
             let back: BackendId = serde_json::from_str(&s).unwrap();
             assert_eq!(back, id);
             assert_eq!(BackendId::parse(id.as_str()), Some(id));
         }
-        assert_eq!(BackendId::parse("llama.cpp"), None);
+        assert_eq!(BackendId::parse("llama"), Some(BackendId::LlamaCpp));
     }
 
     #[test]

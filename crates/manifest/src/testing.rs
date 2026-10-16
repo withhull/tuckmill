@@ -224,7 +224,9 @@ fn build(cfg: &SyntheticConfig) -> Result<Vec<u8>> {
     // the same way.
     let alphabet = crate::bytes_alphabet::bytes_to_unicode();
     let mut tokens: Vec<KV> = alphabet.iter().map(|c| KV::Str(c.to_string())).collect();
-    let mut token_types: Vec<KV> = (0..256).map(|_| KV::I32(6)).collect();
+    // Byte pieces are NORMAL (1), exactly as in real GPT-2-style GGUFs;
+    // type 6 (BYTE) means SPM-style "<0xNN>" fallback pieces in llama.cpp.
+    let mut token_types: Vec<KV> = (0..256).map(|_| KV::I32(1)).collect();
 
     // Merge table (rank order matters): enough to compress "hello world"
     // into two committed pieces and to test multi-step merges.

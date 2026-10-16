@@ -124,8 +124,9 @@ enum Cmd {
         /// refused.
         #[arg(long)]
         allow_test_engine: bool,
-        /// Engine placement: isolated (worker process, default) or
-        /// in-process (debugging only).
+        /// Backend: reference-test (default; also 'isolated'), tuckcore, or
+        /// llama (pinned llama.cpp reference). 'in-process' is a debugging
+        /// placement for the reference test engine.
         #[arg(long, default_value = "isolated")]
         engine: String,
         /// Suppress state messages on stderr.
@@ -165,6 +166,14 @@ enum Cmd {
         /// Tokens generated per side for text equality.
         #[arg(long, default_value_t = 8)]
         generate: u64,
+        /// Compare against the pinned llama.cpp reference backend instead of
+        /// the resident/streamed scheduling comparison (requires
+        /// TUCKMILL_LLAMA_LIB; see scripts/fetch-llama.sh).
+        #[arg(long)]
+        reference: bool,
+        /// Registered logit tolerance for --reference comparisons.
+        #[arg(long, default_value_t = 1e-2)]
+        tolerance: f64,
     },
 
     /// Run the standard benchmark suite and write a machine-readable record.

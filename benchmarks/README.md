@@ -42,8 +42,9 @@ evidence only when:
 
 - the same artifact and the same token IDs are used (identity-verified),
 - declared numerical profiles and cache states match,
-- tolerances are registered before the run (`tuckmill verify` is the harness;
-  reference-vs-custom logits arrive when the pinned llama.cpp backend lands),
+- tolerances are registered before the run (`tuckmill verify --reference` is
+  the harness; the pinned llama.cpp backend is integrated and the first
+  numerical profile is recorded),
 - ordering is randomized/ABBA with matched foreground controls, and
 - the record states the tier, chip, OS, and build for every engine.
 
