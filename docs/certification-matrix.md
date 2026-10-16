@@ -13,7 +13,7 @@ Status vocabulary:
 
 | Area | Status | Evidence in this build | What remains for certification (PRD gate) |
 | --- | --- | --- | --- |
-| Orchestration stack (CLI, planner, store, supervisor, API) | implemented | 235 repository tests; live M3 8 GB smoke run in `scripts/demo.sh` | G4 reliability campaign, G5 distribution |
+| Orchestration stack (CLI, planner, store, supervisor, API) | implemented | 236 repository tests; live M3 8 GiB (minimum tier) smoke run in `scripts/demo.sh` | G4 reliability campaign, G5 distribution |
 | GGUF inspection & validation | implemented | synthetic + adversarial fixtures; checked overflow/bounds rejects | Fuzzing campaign against real artifact corpus |
 | Safetensors inspection | implemented (header-level) | synthetic fixtures; offset/dtype validation | Real-corpus validation; adapter mapping |
 | Planner admission math | implemented | unit tests incl. PRD worked example (2.5 GiB KV for 80×8×128 @8k) | Calibration at G0 (U, bandwidths) on physical devices |
@@ -31,9 +31,9 @@ Status vocabulary:
 | Qwen3 MoE streaming | unmeasured | adapter + expert geometry resolution implemented | Stage G; FR-06; native routing preserved |
 | Qwen3.5 hybrid adapter | unmeasured | adapter specified; metadata namespace unverified against a real artifact | FR-29; K07 state tests |
 | Bonsai 2 (PQ2_0/PTQ1_0) | unmeasured | adapter specified with transform contract + certification blockers | FR-29/30; K04–K07; vendor-compatible reference first |
-| M1 / M2 8 GB cohorts | unmeasured | profiler reads them; nothing ran on them | Physical M1/M2 qualification (FR-27) |
-| M3 8 GB cohort (this machine) | partially exercised | CLI/planner/store/supervisor smoke flows ran on macOS 27, 8 GiB | G2-small with a real executor; foreground workload tests |
-| Performance claims (any) | unmeasured | benchmark harness produces labeled records | G3 controlled experiments |
+| M1 / M2 minimum-tier cohorts | unmeasured | profiler reads them; nothing ran on them | Physical M1/M2 qualification (FR-27) |
+| M3 minimum-tier cohort (this machine) | partially exercised | CLI/planner/store/supervisor smoke flows ran on macOS 27, 8 GiB | G2 with a real executor; foreground workload tests |
+| Performance claims (any) | unmeasured | benchmark harness produces labeled records; comparator program defined (`benchmarks/README.md`) | G3 controlled experiments across memory tiers vs llama.cpp / MLX / Splash under four-way identity |
 
 ## Benchmark labels in use
 
@@ -42,10 +42,16 @@ matching identity), `certified` (named tests on a named configuration).
 The reference test engine's measurements are stored for pipeline
 diagnostics only and can never promote a plan's confidence.
 
-## Device cohort record
+## Device tier record
 
-| Cohort | Physically exercised | Notes |
+Qualification is tier-based (ADR-006); 8 GiB is the first qualifiable tier,
+never the ceiling of ambition.
+
+| Tier | Physically exercised | Notes |
 | --- | --- | --- |
-| MacBook Air M3, 8 GiB, macOS 27.0.1 (26A434) | yes (this build's development machine) | pressure: warning observed during development (host swapping); no large-model run performed |
-| MacBook Air M1/M2, 8 GiB | no | unsupported claim until FR-27 passes |
+| 8 GiB (floor): MacBook Air M3, macOS 27.0.1 (26A434) | yes (this build's development machine) | minimum-tier smoke flows; pressure: warning observed during development (host swapping); no large-model run performed |
+| 8 GiB: MacBook Air M1/M2 | no | unsupported claim until FR-27 passes |
+| 16–24 GiB | no | strategy designed (ADR-006); unmeasured |
+| 32–48 GiB | no | Metal kernels + larger resident models pending |
+| 64–128 GiB+ | no | maximum-resident and batching work pending |
 | Intel MacBook Air | excluded | not a target |

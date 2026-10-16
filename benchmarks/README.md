@@ -33,3 +33,19 @@ Real measurements require a certified executor and the four-way comparison
 of PRD §20.1 (R0 source baseline, R1 compressed reference, T0 Tuckmill
 reference kernels, T1 Tuckmill custom kernels) with randomized/ABBA ordering
 and matched no-inference foreground controls.
+
+## Comparator program (ADR-006)
+
+Tuckmill is measured against **llama.cpp**, **MLX**, and **Splash** across
+memory tiers — not only validated on the 8 GiB floor. A comparison counts as
+evidence only when:
+
+- the same artifact and the same token IDs are used (identity-verified),
+- declared numerical profiles and cache states match,
+- tolerances are registered before the run (`tuckmill verify` is the harness;
+  reference-vs-custom logits arrive when the pinned llama.cpp backend lands),
+- ordering is randomized/ABBA with matched foreground controls, and
+- the record states the tier, chip, OS, and build for every engine.
+
+No comparative performance or quality claim exists until its measurement is
+in `docs/claims.md`.

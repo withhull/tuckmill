@@ -40,5 +40,7 @@ observation and headroom.
 
 - Infeasible configurations are rejected before loading with exact numbers in
   the error (`INVALID_PLAN` / `CONTEXT_EXCEEDS_BUDGET`) and a safe next action.
-- A 2 GiB starter budget on the 8 GB cohort follows the PRD's initial
-  experiment; 3 GiB experiments require measured host headroom.
+- The default process budget is hardware-adaptive (ADR-006): a quarter of
+  unified memory, clamped to 2–24 GiB; the 8 GiB floor tier therefore starts
+  at the PRD's 2 GiB experiment while larger machines are not artificially
+  capped. Larger budgets require measured host headroom.

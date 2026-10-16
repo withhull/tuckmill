@@ -7,10 +7,18 @@
 
 use tuckmill_manifest::plan::{PlanBudget, PlanContext};
 use tuckmill_manifest::records::{ReservationBreakdown, ReserveClass, TensorStats};
-use tuckmill_manifest::units::Bytes;
+use tuckmill_manifest::units::{Bytes, GIB};
 
 use crate::kv::estimate_kv_bytes;
 use crate::PlannerPolicy;
+
+/// Hardware-adaptive default process budget (ADR-006): a quarter of unified
+/// memory, floored at 2 GiB (the PRD's conservative starter on the 8 GB
+/// minimum tier) and capped at 24 GiB so the admission reserve stays
+/// meaningful on very large machines. Always overridable per request.
+pub fn suggested_process_budget(memory_bytes: u64) -> Bytes {
+    Bytes((memory_bytes / 4).clamp(2 * GIB, 24 * GIB))
+}
 
 /// Byte split of the tensor payload used for mode selection.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -228,6 +236,19 @@ mod tests {
         );
         let res2 = reserve_streamed_moe(&s, 0, 1_000, &policy);
         assert_eq!(res2.expert_cache, 1_000);
+    }
+
+    #[test]
+    fn suggested_budget_scales_with_unified_memory() {
+        assert_eq!(suggested_process_budget(8 * GIB).bytes(), 2 * GIB);
+        assert_eq!(suggested_process_budget(16 * GIB).bytes(), 4 * GIB);
+        assert_eq!(suggested_process_budget(24 * GIB).bytes(), 6 * GIB);
+        assert_eq!(suggested_process_budget(32 * GIB).bytes(), 8 * GIB);
+        assert_eq!(suggested_process_budget(64 * GIB).bytes(), 16 * GIB);
+        assert_eq!(suggested_process_budget(128 * GIB).bytes(), 24 * GIB);
+        assert_eq!(suggested_process_budget(512 * GIB).bytes(), 24 * GIB);
+        // Floor holds below the minimum tier too (never below 2 GiB).
+        assert_eq!(suggested_process_budget(4 * GIB).bytes(), 2 * GIB);
     }
 
     #[test]

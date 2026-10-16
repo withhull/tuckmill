@@ -956,7 +956,7 @@ mod tests {
             data_dir: Some(layout.root().to_path_buf()),
             engine_mode: crate::runtime::EngineMode::InProcess,
             queue_capacity: 4,
-            default_budget: Bytes::parse("2GiB").unwrap(),
+            default_budget: Some(Bytes::parse("2GiB").unwrap()),
             default_context: 2048,
             default_max_output: 64,
             governor_poll: Duration::from_millis(200),

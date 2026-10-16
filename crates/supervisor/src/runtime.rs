@@ -51,7 +51,9 @@ pub struct RuntimeOptions {
     /// current executable).
     pub worker_exe: Option<PathBuf>,
     pub queue_capacity: usize,
-    pub default_budget: Bytes,
+    /// Default request budget; None resolves to the hardware-adaptive
+    /// suggestion (ADR-006: memory/4, clamped to 2..24 GiB).
+    pub default_budget: Option<Bytes>,
     pub default_context: u64,
     pub default_max_output: u64,
     pub policy: PlannerPolicy,
@@ -76,7 +78,7 @@ impl Default for RuntimeOptions {
             engine_kind: EngineKind::ReferenceTest,
             worker_exe: None,
             queue_capacity: 4,
-            default_budget: Bytes::parse("2GiB").expect("valid default"),
+            default_budget: None,
             default_context: 2048,
             default_max_output: 256,
             policy: PlannerPolicy::default(),
@@ -223,6 +225,9 @@ impl Runtime {
         let logger = Logger::new(&layout.logs_dir());
         let calibration = CalibrationStore::load(&layout.calibration_path())?;
 
+        let default_budget = options.default_budget.unwrap_or_else(|| {
+            tuckmill_planner::budget::suggested_process_budget(device.memory_bytes)
+        });
         let runtime = Arc::new(Self {
             layout,
             device,
@@ -235,13 +240,9 @@ impl Runtime {
             calibration: Mutex::new(calibration),
             active: Mutex::new(None),
             ledger: Mutex::new(Arc::new(LiveLedger::new(
-                options.default_budget,
+                default_budget,
                 Bytes(options.policy.overhead_estimate_bytes),
-                Bytes(
-                    options
-                        .policy
-                        .safety_reserve(options.default_budget.bytes()),
-                ),
+                Bytes(options.policy.safety_reserve(default_budget.bytes())),
             ))),
             engine_mode: options.engine_mode,
             engine_kind: options.engine_kind,
@@ -251,7 +252,7 @@ impl Runtime {
             in_process: Mutex::new(ReferenceTestEngine::new()),
             worker: Mutex::new(None),
             policy: options.policy,
-            default_budget: options.default_budget,
+            default_budget,
             default_context: options.default_context,
             default_max_output: options.default_max_output,
             monitor_thread: Mutex::new(None),
@@ -1054,7 +1055,7 @@ mod tests {
             engine_kind: EngineKind::ReferenceTest,
             worker_exe: None,
             queue_capacity: 2,
-            default_budget: Bytes::parse("2GiB").unwrap(),
+            default_budget: Some(Bytes::parse("2GiB").unwrap()),
             default_context: 2048,
             default_max_output: 256,
             policy: PlannerPolicy::default(),

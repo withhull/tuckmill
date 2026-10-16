@@ -15,7 +15,7 @@
     "state": "unmeasured",
     "notes": [
       "Stage A/B/C development anchor (Qwen3-0.6B -> 1.7B -> 4B).",
-      "No plan may claim certification before the G1 kernel gates pass on a physical 8GB Mac."
+      "No plan may claim certification before the G1 kernel gates pass on a physical minimum-tier (8 GB) Mac."
     ]
   },
   "required_kernels": ["K01", "K02", "K03", "K08"],

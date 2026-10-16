@@ -15,6 +15,8 @@ the code, output, or documentation.
 | The reference test engine "runs" a model | It executes no weights | Always: "synthetic output; no model weights are executed" |
 | Budgets protect the host absolutely | Managed admission policy only | Always: "not an OS guarantee; footprint measured separately" |
 | Importing = redistributable | Import records a license note only | Always: importing is not a license review |
+| Tuckmill is an engine "for 8 GB Macs" | 8 GiB is the minimum target tier; strategies scale to 512 GiB+ (ADR-006) | "Mac-native high-performance inference for Apple Silicon, from 8 GB upward" |
+| Tuckmill beats llama.cpp / MLX / Splash | No matched measurement exists | Unproven; comparisons run only under the four-way identity rules with registered tolerances (`benchmarks/README.md`) |
 | Benchmarks measure model performance | This build benches the pipeline | Records carry `engine: reference-test`, `certified: false` and caveats |
 | TuckCore "runs" a model | It executes the artifact's real tensor bytes through scalar f32 kernels; fixture weights are synthetic (untrained), so outputs are meaningless outside equivalence tests | "Experimental, uncertified executor; bit-exact streaming equivalence demonstrated; quality and performance unmeasured" |
 | TuckCore has a tokenizer | It does not; prompts map deterministically into the artifact vocabulary and the limitation is labeled in run output and API extensions | Always: "no text tokenizer in this build" |
@@ -23,10 +25,13 @@ the code, output, or documentation.
 
 ## Build status statement (canonical)
 
-> Tuckmill v0.2 engineering build: the orchestration stack (inspection,
-> planning, admission, storage, packing, worker isolation, local API,
-> benchmark harness) is implemented and tested. No model-execution kernel is
-> implemented; no configuration is certified; no performance claim is made.
-> Running a model requires a certified executor that does not yet exist; the
-> reference test engine exercises the pipeline with clearly-labeled synthetic
-> output only.
+> Tuckmill v0.2 engineering build: a Mac-native, high-performance local
+> inference framework for Apple Silicon, engineered from the 8 GiB minimum
+> tier upward (ADR-006). The orchestration stack (inspection, planning,
+> admission, storage, packing, worker isolation, local API, benchmark
+> harness) is implemented and tested. TuckCore, the experimental custom
+> executor, runs real dense-Qwen3 weights through scalar f32 reference
+> kernels with bit-exact residency/streaming equivalence demonstrated; no
+> Metal kernel is implemented; no configuration is certified; no performance
+> comparison against llama.cpp / MLX / Splash is claimed before it is
+> measured.

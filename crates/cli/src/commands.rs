@@ -49,7 +49,14 @@ pub fn dispatch(cmd: &Cmd, json: bool, data_dir: Option<&Path>) -> Result<ExitCo
             memory_budget,
             context,
             max_output,
-        } => plan(model, memory_budget, *context, *max_output, json, data_dir),
+        } => plan(
+            model,
+            memory_budget.as_deref(),
+            *context,
+            *max_output,
+            json,
+            data_dir,
+        ),
         Cmd::Run {
             model,
             prompt,
@@ -62,7 +69,7 @@ pub fn dispatch(cmd: &Cmd, json: bool, data_dir: Option<&Path>) -> Result<ExitCo
         } => run(
             model,
             prompt.clone(),
-            memory_budget,
+            memory_budget.as_deref(),
             *context,
             *max_output,
             *allow_test_engine,
@@ -92,7 +99,7 @@ pub fn dispatch(cmd: &Cmd, json: bool, data_dir: Option<&Path>) -> Result<ExitCo
             generate,
         } => verify(
             model,
-            memory_budget,
+            memory_budget.as_deref(),
             *context,
             *positions,
             *generate,
@@ -115,7 +122,7 @@ pub fn dispatch(cmd: &Cmd, json: bool, data_dir: Option<&Path>) -> Result<ExitCo
             *input,
             *output,
             *repetitions,
-            memory_budget,
+            memory_budget.as_deref(),
             *context,
             *allow_test_engine,
             engine,
@@ -140,6 +147,15 @@ pub fn dispatch(cmd: &Cmd, json: bool, data_dir: Option<&Path>) -> Result<ExitCo
             tuckmill_supervisor::worker_host::run_worker(socket, kind)?;
             Ok(ExitCode::SUCCESS)
         }
+    }
+}
+
+/// Resolve the requested budget: explicit argument, else the
+/// hardware-adaptive default (ADR-006).
+fn resolve_budget(runtime: &Runtime, requested: Option<&str>) -> Result<Bytes> {
+    match requested {
+        Some(text) => Bytes::parse(text),
+        None => Ok(runtime.default_budget),
     }
 }
 
@@ -607,14 +623,14 @@ fn pack(model: &str, json: bool, data_dir: Option<&Path>) -> Result<ExitCode> {
 
 fn plan(
     model: &str,
-    memory_budget: &str,
+    memory_budget: Option<&str>,
     context: u64,
     max_output: u64,
     json: bool,
     data_dir: Option<&Path>,
 ) -> Result<ExitCode> {
     let runtime = open_runtime(data_dir, "in-process", true)?;
-    let budget = Bytes::parse(memory_budget)?;
+    let budget = resolve_budget(&runtime, memory_budget)?;
     let (artifact, adapter) = runtime.resolve_artifact(model)?;
     let plan = runtime.plan_for(&artifact, &adapter, budget, context, max_output)?;
 
@@ -713,7 +729,7 @@ fn plan(
 fn run(
     model: &str,
     prompt: Option<String>,
-    memory_budget: &str,
+    memory_budget: Option<&str>,
     context: u64,
     max_output: u64,
     allow_test_engine: bool,
@@ -723,7 +739,7 @@ fn run(
     data_dir: Option<&Path>,
 ) -> Result<ExitCode> {
     let runtime = open_runtime(data_dir, engine, allow_test_engine)?;
-    let budget = Bytes::parse(memory_budget)?;
+    let budget = resolve_budget(&runtime, memory_budget)?;
     let (artifact, adapter) = runtime.resolve_artifact(model)?;
     let plan = runtime.plan_for(&artifact, &adapter, budget, context, max_output)?;
     runtime.plan_admitted(&plan)?;
@@ -928,6 +944,7 @@ fn serve(
     let addr = server.local_addr();
     let token_file = tuckmill_supervisor::api::token_file_path(&runtime);
 
+    let identity = runtime.engine_identity();
     if json {
         println!(
             "{}",
@@ -936,6 +953,9 @@ fn serve(
                 "token_file": token_file.display().to_string(),
                 "allow_test_engine": allow_test_engine,
                 "engine_mode": runtime.engine_mode_label_str(),
+                "backend": identity.engine,
+                "certified": identity.certified,
+                "default_budget_bytes": runtime.default_budget.bytes(),
             }))
             .map_err(|e| tuckmill_manifest::error::json_error(
                 e,
@@ -951,13 +971,23 @@ fn serve(
         );
         println!("routes: GET /healthz, GET /v1/models, POST /v1/chat/completions, GET /control/status, POST /control/cancel, GET /control/bench/latest");
         println!(
-            "engine: {} | test-engine accepted: {}",
+            "engine: {} ({}) | test-engine accepted: {}",
+            identity.engine,
             runtime.engine_mode_label_str(),
             if allow_test_engine {
                 "yes (synthetic output)"
             } else {
                 "no"
             }
+        );
+        if !tuckmill_backend::is_synthetic_engine(&identity.engine) {
+            println!(
+                "note: experimental backend — real weights, scalar reference kernels, uncertified"
+            );
+        }
+        println!(
+            "default request budget: {} (hardware-adaptive; override per request)",
+            runtime.default_budget
         );
         println!("press ctrl-c to stop");
     }
@@ -989,7 +1019,7 @@ fn bench(
     input: u32,
     output: u32,
     repetitions: u32,
-    memory_budget: &str,
+    memory_budget: Option<&str>,
     context: u64,
     allow_test_engine: bool,
     engine: &str,
@@ -1003,7 +1033,7 @@ fn bench(
         ));
     }
     let runtime = open_runtime(data_dir, engine, allow_test_engine)?;
-    let budget = Bytes::parse(memory_budget)?;
+    let budget = resolve_budget(&runtime, memory_budget)?;
     let (artifact, adapter) = runtime.resolve_artifact(model)?;
     let plan = runtime.plan_for(&artifact, &adapter, budget, context, output as u64)?;
     runtime.plan_admitted(&plan)?;
@@ -1062,7 +1092,7 @@ fn artifact_vocabulary(
 
 fn verify(
     model: &str,
-    memory_budget: &str,
+    memory_budget: Option<&str>,
     context: u64,
     positions: u64,
     generate: u64,
@@ -1070,7 +1100,7 @@ fn verify(
     data_dir: Option<&Path>,
 ) -> Result<ExitCode> {
     let runtime = open_runtime(data_dir, "tuckcore", false)?;
-    let budget = Bytes::parse(memory_budget)?;
+    let budget = resolve_budget(&runtime, memory_budget)?;
     let (artifact, adapter) = runtime.resolve_artifact(model)?;
     let plan = runtime.plan_for(&artifact, &adapter, budget, context, generate.max(1))?;
     runtime.plan_admitted(&plan)?;

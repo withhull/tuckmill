@@ -36,7 +36,7 @@ pub fn install_sigint_handler() {
 #[command(
     name = "tuckmill",
     version,
-    about = "Big models. Small footprint. Local-first model inference for Apple Silicon (uncertified engineering build).",
+    about = "Big models. Small footprint. High-performance local inference for Apple Silicon Macs (uncertified engineering build).",
     propagate_version = true
 )]
 struct Cli {
@@ -92,9 +92,10 @@ enum Cmd {
     Plan {
         /// Alias or artifact id.
         model: String,
-        /// Requested process budget, e.g. 2GiB or 3GiB (binary units).
-        #[arg(long, default_value = "2GiB")]
-        memory_budget: String,
+        /// Requested process budget (binary units, e.g. 2GiB). Defaults to
+        /// a hardware-adaptive quarter of unified memory (2–24GiB).
+        #[arg(long)]
+        memory_budget: Option<String>,
         /// Total sequence allowance in tokens, including output.
         #[arg(long, default_value_t = 2048)]
         context: u64,
@@ -110,8 +111,10 @@ enum Cmd {
         /// Prompt text (reads stdin when omitted).
         #[arg(long)]
         prompt: Option<String>,
-        #[arg(long, default_value = "2GiB")]
-        memory_budget: String,
+        /// Requested process budget (binary units, e.g. 2GiB). Defaults to
+        /// a hardware-adaptive quarter of unified memory (2–24GiB).
+        #[arg(long)]
+        memory_budget: Option<String>,
         #[arg(long, default_value_t = 2048)]
         context: u64,
         #[arg(long, default_value_t = 256)]
@@ -150,8 +153,10 @@ enum Cmd {
     Verify {
         /// Alias or artifact id.
         model: String,
-        #[arg(long, default_value = "2GiB")]
-        memory_budget: String,
+        /// Requested process budget (binary units, e.g. 2GiB). Defaults to
+        /// a hardware-adaptive quarter of unified memory (2–24GiB).
+        #[arg(long)]
+        memory_budget: Option<String>,
         #[arg(long, default_value_t = 2048)]
         context: u64,
         /// Number of deterministic token ids scored per side.
@@ -174,8 +179,10 @@ enum Cmd {
         output: u32,
         #[arg(long, default_value_t = 3)]
         repetitions: u32,
-        #[arg(long, default_value = "2GiB")]
-        memory_budget: String,
+        /// Requested process budget (binary units, e.g. 2GiB). Defaults to
+        /// a hardware-adaptive quarter of unified memory (2–24GiB).
+        #[arg(long)]
+        memory_budget: Option<String>,
         #[arg(long, default_value_t = 2048)]
         context: u64,
         #[arg(long)]
