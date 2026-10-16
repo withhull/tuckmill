@@ -50,3 +50,20 @@ evidence only when:
 
 No comparative performance or quality claim exists until its measurement is
 in `docs/claims.md`.
+
+## Fixture smoke baselines (not claims)
+
+Recorded on the development machine (MacBook Air M3, 8 GiB, macOS 27.0.1),
+release build, standard-v1 shape 64 in / 32 out, 3 repetitions, synthetic
+fixture weights, context 2048:
+
+| Engine | ttft p50 | throughput (median) | footprint peak |
+| --- | --- | --- | --- |
+| TuckCore (scalar f32 oracle) | 72 ms | 314 tok/s | 7.2 MiB |
+| llama.cpp b11695 (CPU via tm shim) | 1.6 ms | 6412 tok/s | 86.8 MiB |
+
+These exercise the harness and provide a kernel-work baseline; they say
+nothing about real-model behavior (untrained fixture weights, tiny shapes).
+Repetition 1 includes worker spawn and model load, which shows up in the p95
+values; `serve` keeps workers warm. Kernel work (K01–K09) is accepted only
+against measured gaps on real models, not against these numbers.

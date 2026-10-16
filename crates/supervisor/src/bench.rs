@@ -79,8 +79,10 @@ impl Default for BenchOptions {
 
 /// Deterministic frozen prompt set: exact token IDs derived from the prompt
 /// identifier, stable across runs and machines (no private prompts are
-/// collected; PRD §20).
-fn prompt_tokens_for(prompt_id: &str, input_tokens: u32) -> Vec<u32> {
+/// collected; PRD §20). When `vocab` is known (real backends), ids are
+/// bounded into the artifact's vocabulary so the same frozen prompts are
+/// valid for every backend.
+fn prompt_tokens_for(prompt_id: &str, input_tokens: u32, vocab: Option<u64>) -> Vec<u32> {
     let seed = tuckmill_manifest::ids::sha256_hex(prompt_id.as_bytes());
     let mut out = Vec::with_capacity(input_tokens as usize);
     let mut acc: u64 = u64::from_str_radix(&seed[..16], 16).unwrap_or(0x9e37);
@@ -89,9 +91,24 @@ fn prompt_tokens_for(prompt_id: &str, input_tokens: u32) -> Vec<u32> {
         acc ^= acc >> 12;
         acc ^= acc << 25;
         acc ^= acc >> 27;
-        out.push((acc.wrapping_mul(0x2545F4914F6CDD1D) >> 32) as u32);
+        let raw = (acc.wrapping_mul(0x2545F4914F6CDD1D) >> 32) as u32;
+        out.push(match vocab {
+            Some(v) if v > 0 => raw % v as u32,
+            _ => raw,
+        });
     }
     out
+}
+
+/// Vocabulary length of the artifact, when it exposes one (bounded header
+/// read; used to keep frozen prompts valid for every backend).
+fn artifact_vocab(artifact: &tuckmill_backend::ArtifactRef) -> Option<u64> {
+    let insp = tuckmill_manifest::gguf::inspect(
+        std::path::Path::new(&artifact.path),
+        &tuckmill_manifest::gguf::Limits::default(),
+    )
+    .ok()?;
+    insp.vocabulary_len()
 }
 
 fn percentile(values: &mut [f64], p: f64) -> f64 {
@@ -116,6 +133,7 @@ pub fn run_standard_bench(
     let suite = load_suite()?;
 
     let started = now_unix_ms();
+    let vocab = artifact_vocab(artifact);
     let mut samples: Vec<PromptSample> = Vec::new();
     let mut ttfts: Vec<f64> = Vec::new();
     let mut tps_values: Vec<f64> = Vec::new();
@@ -127,7 +145,7 @@ pub fn run_standard_bench(
             "std-{}-{}-r{rep}",
             options.input_tokens, options.output_tokens
         );
-        let prompt = prompt_tokens_for(&prompt_id, options.input_tokens);
+        let prompt = prompt_tokens_for(&prompt_id, options.input_tokens, vocab);
 
         let ticket = runtime.submit()?;
         let run = runtime.start_run(
@@ -446,12 +464,16 @@ mod tests {
 
     #[test]
     fn prompt_ids_are_deterministic_and_parameterized() {
-        let a = prompt_tokens_for("std-512-256-r0", 512);
-        let b = prompt_tokens_for("std-512-256-r0", 512);
+        let a = prompt_tokens_for("std-512-256-r0", 512, None);
+        let b = prompt_tokens_for("std-512-256-r0", 512, None);
         assert_eq!(a, b);
         assert_eq!(a.len(), 512);
-        let c = prompt_tokens_for("std-512-256-r1", 512);
+        let c = prompt_tokens_for("std-512-256-r1", 512, None);
         assert_ne!(a, c, "different repetitions use different fixed prompts");
+        // Vocab-bounded ids stay deterministic and inside the vocabulary.
+        let v = prompt_tokens_for("std-512-256-r0", 512, Some(512));
+        assert_eq!(v, prompt_tokens_for("std-512-256-r0", 512, Some(512)));
+        assert!(v.iter().all(|id| *id < 512));
     }
 
     #[test]

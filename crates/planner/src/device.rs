@@ -388,9 +388,9 @@ fn sysctl_string(name: &str) -> Option<String> {
 #[cfg(target_os = "macos")]
 pub fn physical_footprint_of(pid: i32) -> Option<u64> {
     let mut info = std::mem::MaybeUninit::<libc::rusage_info_v4>::zeroed();
-    // SAFETY: proc_pid_rusage writes the flavor's struct into the buffer we
-    // pass; libc models the C `(rusage_info_t *)&buffer` cast in its
-    // signature, so the buffer address is passed with that pointer type.
+    // SAFETY (call): proc_pid_rusage writes the flavor's struct into the
+    // buffer we pass; libc models the C `(rusage_info_t *)&buffer` cast in
+    // its signature, so the buffer address is passed with that pointer type.
     let rc = unsafe {
         libc::proc_pid_rusage(
             pid,

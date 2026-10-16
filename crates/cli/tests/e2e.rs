@@ -442,6 +442,7 @@ fn worker_crash_surfaces_as_worker_failed_and_supervisor_survives() {
     std::thread::sleep(Duration::from_millis(200)); // let some tokens commit
 
     // Kill -9: no cleanup, no farewell.
+    // SAFETY: test-only signal to a child process we spawned.
     assert_eq!(
         unsafe { libc::kill(worker_pid, libc::SIGKILL) },
         0,
@@ -488,6 +489,7 @@ fn sigint_cancels_a_run_at_a_committed_token_boundary() {
 
     // Let a few tokens commit, then interrupt.
     std::thread::sleep(Duration::from_millis(500));
+    // SAFETY: test-only signal to the child process we spawned.
     assert_eq!(
         unsafe { libc::kill(child.id() as i32, libc::SIGINT) },
         0,

@@ -307,6 +307,7 @@ impl LlamaRef {
         if n < 0 {
             let needed = (-n) as usize;
             out = vec![0i32; needed];
+            // SAFETY: retry with a buffer of the size llama.cpp requested.
             let n2 = unsafe {
                 (self.shim.tokenize)(
                     h,
@@ -348,6 +349,7 @@ impl LlamaRef {
         };
         if n < 0 {
             buf = vec![0u8; (-n) as usize];
+            // SAFETY: retry with a buffer of the size llama.cpp requested.
             let n2 = unsafe {
                 (self.shim.token_to_piece)(
                     h,
@@ -538,11 +540,14 @@ impl InferenceBackend for LlamaRef {
                 format!("llama.cpp failed to load {}: {msg}", artifact.path),
             ));
         }
-        // SAFETY: handle is non-null and owned by this instance.
+        // SAFETY (all shim calls below): `handle` was checked non-null and is
+        // owned by this instance; the shim was version-verified at open; every
+        // buffer/capacity pair is valid for the call.
         let vocab = unsafe { (shim.vocab_size)(handle) };
         let eos = unsafe { (shim.eos)(handle) };
         let ctx_tokens = unsafe { (shim.n_ctx)(handle) };
         let mut desc_buf = vec![0u8; 256];
+        // SAFETY: handle valid; buffer sized 256 with cap passed as 256.
         let desc_len =
             unsafe { (shim.model_desc)(handle, desc_buf.as_mut_ptr() as *mut c_char, 256) };
         let desc = if desc_len > 0 {
@@ -550,9 +555,11 @@ impl InferenceBackend for LlamaRef {
         } else {
             "unknown".into()
         };
+        // SAFETY: handle valid; read-only metadata query.
         let model_bytes = unsafe { (shim.model_size)(handle) };
         let mut arch_buf = vec![0u8; 64];
         let arch_key = CString::new("general.architecture").expect("static");
+        // SAFETY: handle valid; key is a stored CString; buffer sized/capped.
         let arch_len = unsafe {
             (shim.meta)(
                 handle,
