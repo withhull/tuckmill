@@ -5,6 +5,32 @@
 //! block that in-flight work still references. Measured evidence (logical
 //! reads, cache hits/misses, evictions) is tracked separately from
 //! reservations (PRD §9, §13).
+//!
+//! ## Storage modes and what eviction proves
+//!
+//! Two block storages exist and are explicitly selectable: `owned` (every
+//! block is copied into a bounded heap buffer) and `mapped` (blocks are
+//! read-only views of one `mmap` of the artifact). Cache-entry eviction drops
+//! the loader's *reference*; it is **not** proof that mapped pages left RAM.
+//! Mapped-mode eviction additionally issues `madvise(MADV_DONTNEED)` on the
+//! evicted range (advisory on macOS — recorded as `page_advice_bytes`), and
+//! observed page residency is measured separately with `mincore`
+//! ([`BlockLoader::residency`]). Owned and mapped byte counts are reported
+//! separately and are never summed into one "memory used" number; charged
+//! process footprint is measured by the supervisor (`proc_pid_rusage`) and is
+//! a third, independently sampled metric.
+//!
+//! ## File identity and immutability
+//!
+//! [`BlockLoader::open_file`] takes one open `File` handle: positioned reads
+//! and the mapping come from the *same* object, and its size is checked
+//! against the expected artifact length before anything is mapped. Store
+//! installs publish atomically (write to temp, rename), replacement unlinks
+//! or renames rather than writing in place, and delete-while-open keeps the
+//! inode alive for an open handle — so a loaded artifact cannot be mutated
+//! from under execution by Tuckmill's own components. External in-place
+//! modification of the payload is outside the contract: the content-digest
+//! verification in the executor detects it before execution begins.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::File;
@@ -13,11 +39,50 @@ use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use tuckmill_manifest::error::{ErrorCode, Result, TuckmillError};
 
 use crate::tensor::{self, RowGeometry};
+
+/// Storage selection for weight blocks (a load-time option, recorded in
+/// stats). `Auto` maps when the platform and file allow it and falls back to
+/// owned reads; `Mapped` requires the zero-copy mapping; `Owned` never maps.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum StorageSelection {
+    Auto,
+    Mapped,
+    Owned,
+}
+
+impl StorageSelection {
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "auto" => Some(Self::Auto),
+            "mapped" => Some(Self::Mapped),
+            "owned" => Some(Self::Owned),
+            _ => None,
+        }
+    }
+}
+
+/// The storage mode actually resolved for a loaded artifact.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ResolvedStorage {
+    Mapped,
+    Owned,
+}
+
+impl ResolvedStorage {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Mapped => "mapped",
+            Self::Owned => "owned",
+        }
+    }
+}
 
 #[derive(Debug, Clone, Copy)]
 pub struct BlockPolicy {
@@ -98,9 +163,11 @@ unsafe impl Send for MappedFile {}
 unsafe impl Sync for MappedFile {}
 
 impl MappedFile {
-    pub fn open(path: &Path) -> std::io::Result<Arc<Self>> {
+    /// Map an already-open file. The mapping is created from this exact
+    /// object; callers must have validated the file identity (and, where
+    /// required, content) through the same handle.
+    pub fn from_file(file: &File) -> std::io::Result<Arc<Self>> {
         use std::os::unix::io::AsRawFd;
-        let file = File::open(path)?;
         let len = file.metadata()?.len() as usize;
         if len == 0 {
             return Err(std::io::Error::new(
@@ -128,6 +195,11 @@ impl MappedFile {
             ptr: ptr as *const u8,
             len,
         }))
+    }
+
+    pub fn open(path: &Path) -> std::io::Result<Arc<Self>> {
+        let file = File::open(path)?;
+        Self::from_file(&file)
     }
 
     pub fn len(&self) -> usize {
@@ -217,17 +289,51 @@ impl WeightBlock {
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
+
+    /// True when this block is a zero-copy view of the artifact mapping
+    /// (no owned heap buffer backs it).
+    pub fn is_mapped(&self) -> bool {
+        matches!(self.storage, BlockStorage::Mapped { .. })
+    }
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct LoaderSnapshot {
+    /// Logical weight bytes loaded (cache misses); not physical SSD traffic.
     pub logical_read_bytes: u64,
     pub blocks_loaded: u64,
     pub cache_hits: u64,
     pub cache_misses: u64,
-    pub evictions: u64,
+    /// Cache-entry evictions: entries dropped from the application cache.
+    /// For mapped blocks this is **not** evidence that pages left RAM — see
+    /// [`BlockLoader::residency`] and `page_advice_bytes`.
+    pub cache_entry_evictions: u64,
+    /// All bytes currently retained in the cache (owned + mapped views).
     pub cache_bytes_used: u64,
+    /// Subset of `cache_bytes_used` that is owned heap buffers (copied).
+    pub owned_cache_bytes: u64,
     pub pinned_blocks: u64,
+    /// The storage mode actually resolved at load ("mapped"/"owned").
+    pub storage_mode: String,
+    /// Address space covered by the artifact mapping (0 in owned mode). This
+    /// is virtual address space, not resident memory.
+    pub mapped_vm_bytes: u64,
+    /// Bytes handed to `madvise(MADV_DONTNEED)` on cache-entry eviction
+    /// (advisory on macOS; recorded as issued advice, not as freed memory).
+    pub page_advice_bytes: u64,
+}
+
+/// A point-in-time measurement of mapped-page residency (via `mincore`).
+/// Distinct from address space and from charged process footprint; never
+/// summed with either.
+#[derive(Debug, Clone, Serialize)]
+pub struct ResidencySample {
+    pub page_size_bytes: u64,
+    pub mapped_bytes: u64,
+    pub scanned_bytes: u64,
+    pub resident_bytes: u64,
+    /// True when the mapping exceeded the scan cap and windows were sampled.
+    pub sampled: bool,
 }
 
 #[derive(Default)]
@@ -236,7 +342,8 @@ struct Stats {
     blocks_loaded: AtomicU64,
     cache_hits: AtomicU64,
     cache_misses: AtomicU64,
-    evictions: AtomicU64,
+    cache_entry_evictions: AtomicU64,
+    page_advice_bytes: AtomicU64,
 }
 
 #[derive(Default)]
@@ -245,12 +352,14 @@ struct Cache {
     order: VecDeque<(usize, u32)>,
     pinned: HashSet<(usize, u32)>,
     used_bytes: u64,
+    owned_bytes: u64,
 }
 
 /// The bounded loader. One process-wide instance per loaded artifact.
 pub struct BlockLoader {
     file: File,
     mapped: Option<Arc<MappedFile>>,
+    storage: ResolvedStorage,
     data_start: u64,
     tensors: Vec<TensorEntry>,
     by_name: HashMap<String, usize>,
@@ -261,13 +370,16 @@ pub struct BlockLoader {
 }
 
 impl BlockLoader {
-    pub fn open(
+    /// Open by path with an explicit storage selection and no length check
+    /// (convenience for tests/tooling; the executor uses
+    /// [`Self::open_file`] after content verification).
+    pub fn open_with_storage(
         path: &Path,
         data_start: u64,
         tensors: Vec<TensorEntry>,
         policy: BlockPolicy,
+        storage: StorageSelection,
     ) -> Result<Self> {
-        policy.validate()?;
         let file = File::open(path).map_err(|e| {
             TuckmillError::new(
                 ErrorCode::StorageLost,
@@ -275,17 +387,77 @@ impl BlockLoader {
             )
             .with_source(e)
         })?;
+        Self::open_file(file, data_start, tensors, policy, storage, None)
+    }
+
+    pub fn open(
+        path: &Path,
+        data_start: u64,
+        tensors: Vec<TensorEntry>,
+        policy: BlockPolicy,
+    ) -> Result<Self> {
+        Self::open_with_storage(path, data_start, tensors, policy, StorageSelection::Auto)
+    }
+
+    /// Build the loader around one already-open artifact handle. Positioned
+    /// reads and the mapping use this exact object (no re-open by path), so
+    /// the file identity verified by the caller is the file identity
+    /// executed. When `expected_len` is set, the current size must match it —
+    /// a truncated or drifted file is refused before anything is mapped.
+    pub fn open_file(
+        file: File,
+        data_start: u64,
+        tensors: Vec<TensorEntry>,
+        policy: BlockPolicy,
+        storage: StorageSelection,
+        expected_len: Option<u64>,
+    ) -> Result<Self> {
+        policy.validate()?;
+        let len = file.metadata().map_err(TuckmillError::from)?.len();
+        if len == 0 {
+            return Err(TuckmillError::new(
+                ErrorCode::StorageLost,
+                "artifact file is empty",
+            ));
+        }
+        if let Some(expected) = expected_len {
+            if len != expected {
+                return Err(TuckmillError::new(
+                    ErrorCode::IntegrityFailure,
+                    format!(
+                        "artifact file is {len} bytes but the recorded identity says {expected}; refusing to map or execute"
+                    ),
+                )
+                .with_action("Re-import the artifact; never execute drifted weights."));
+            }
+        }
         let by_name = tensors
             .iter()
             .enumerate()
             .map(|(i, t)| (t.name.clone(), i))
             .collect();
-        // Zero-copy block views when the file can be mapped; the owned-read
-        // path remains as a fallback (and for platforms without mmap).
-        let mapped = MappedFile::open(path).ok();
+        let (mapped, resolved) = match storage {
+            StorageSelection::Owned => (None, ResolvedStorage::Owned),
+            StorageSelection::Mapped => match MappedFile::from_file(&file) {
+                Ok(map) => (Some(map), ResolvedStorage::Mapped),
+                Err(e) => {
+                    return Err(TuckmillError::new(
+                        ErrorCode::StorageLost,
+                        format!("mapped weight storage was requested but mmap failed: {e}"),
+                    )
+                    .with_source(e)
+                    .with_action("Use --storage auto (map when possible) or --storage owned."))
+                }
+            },
+            StorageSelection::Auto => match MappedFile::from_file(&file) {
+                Ok(map) => (Some(map), ResolvedStorage::Mapped),
+                Err(_) => (None, ResolvedStorage::Owned),
+            },
+        };
         Ok(Self {
             file,
             mapped,
+            storage: resolved,
             data_start,
             tensors,
             by_name,
@@ -294,6 +466,11 @@ impl BlockLoader {
             generation: AtomicU64::new(1),
             policy,
         })
+    }
+
+    /// The resolved storage mode for this loader.
+    pub fn storage_mode(&self) -> ResolvedStorage {
+        self.storage
     }
 
     pub fn tensor_index(&self, name: &str) -> Option<usize> {
@@ -393,6 +570,9 @@ impl BlockLoader {
         });
 
         let mut cache = self.cache.lock().expect("loader cache lock");
+        if !block.is_mapped() {
+            cache.owned_bytes += len as u64;
+        }
         cache.map.insert(key, block.clone());
         cache.order.retain(|k| *k != key);
         cache.order.push_back(key);
@@ -455,8 +635,47 @@ impl BlockLoader {
         cache.pinned.remove(&(tensor, chunk));
     }
 
+    fn drop_entry(&self, cache: &mut Cache, block: &WeightBlock) {
+        cache.used_bytes = cache.used_bytes.saturating_sub(block.len() as u64);
+        if !block.is_mapped() {
+            cache.owned_bytes = cache.owned_bytes.saturating_sub(block.len() as u64);
+        } else {
+            self.advise_release(block);
+        }
+    }
+
+    /// Advise the kernel that a mapped block's pages are reclaimable. This is
+    /// advice, not a guaranteed release; the bytes are recorded as
+    /// `page_advice_bytes` and observed residency is measured separately by
+    /// [`Self::residency`].
+    fn advise_release(&self, block: &WeightBlock) {
+        let BlockStorage::Mapped { map, offset, len } = &block.storage else {
+            return;
+        };
+        let page = page_size_bytes();
+        let start = (*offset as u64 / page) * page;
+        let end = ((*offset as u64 + *len as u64).div_ceil(page) * page).min(map.len() as u64);
+        if end <= start {
+            return;
+        }
+        // SAFETY: the range is inside the read-only mapping (clamped above);
+        // MADV_DONTNEED is a read-only lifetime hint and cannot fault.
+        unsafe {
+            libc::madvise(
+                map.ptr.add(start as usize) as *mut libc::c_void,
+                (end - start) as usize,
+                libc::MADV_DONTNEED,
+            );
+        }
+        self.stats
+            .page_advice_bytes
+            .fetch_add(end - start, Ordering::Relaxed);
+    }
+
     /// Forced eviction (tests, governor cache trimming, shutdown). Pinned
     /// blocks are never evicted. Returns the number of evicted blocks.
+    /// Eviction drops cache references (and, for mapped blocks, issues page
+    /// advice); it is not proof that pages left RAM.
     pub fn evict_all(&self) -> usize {
         let mut cache = self.cache.lock().expect("loader cache lock");
         let before = cache.map.len();
@@ -469,13 +688,13 @@ impl BlockLoader {
             .collect();
         for key in keys {
             if let Some(block) = cache.map.remove(&key) {
-                cache.used_bytes = cache.used_bytes.saturating_sub(block.len() as u64);
+                self.drop_entry(&mut cache, &block);
                 cache.order.retain(|k| *k != key);
             }
         }
         let evicted = before - cache.map.len();
         self.stats
-            .evictions
+            .cache_entry_evictions
             .fetch_add(evicted as u64, Ordering::Relaxed);
         evicted
     }
@@ -491,10 +710,12 @@ impl BlockLoader {
             match victim {
                 Some(key) => {
                     if let Some(block) = cache.map.remove(&key) {
-                        cache.used_bytes = cache.used_bytes.saturating_sub(block.len() as u64);
+                        self.drop_entry(cache, &block);
                     }
                     cache.order.retain(|k| *k != key);
-                    self.stats.evictions.fetch_add(1, Ordering::Relaxed);
+                    self.stats
+                        .cache_entry_evictions
+                        .fetch_add(1, Ordering::Relaxed);
                 }
                 None => break, // everything pinned: stay over budget briefly
             }
@@ -513,11 +734,58 @@ impl BlockLoader {
             blocks_loaded: self.stats.blocks_loaded.load(Ordering::Relaxed),
             cache_hits: self.stats.cache_hits.load(Ordering::Relaxed),
             cache_misses: self.stats.cache_misses.load(Ordering::Relaxed),
-            evictions: self.stats.evictions.load(Ordering::Relaxed),
+            cache_entry_evictions: self.stats.cache_entry_evictions.load(Ordering::Relaxed),
             cache_bytes_used: cache.used_bytes,
+            owned_cache_bytes: cache.owned_bytes,
             pinned_blocks: cache.pinned.len() as u64,
+            storage_mode: self.storage.as_str().to_string(),
+            mapped_vm_bytes: self.mapped.as_ref().map(|m| m.len() as u64).unwrap_or(0),
+            page_advice_bytes: self.stats.page_advice_bytes.load(Ordering::Relaxed),
         }
     }
+
+    /// Measure mapped-page residency via `mincore`. Returns `None` in owned
+    /// mode or when the platform call fails. The scan is bounded: mappings
+    /// above [`Self::MAX_FULL_RESIDENCY_SCAN`] are sampled in evenly spaced
+    /// windows and reported as `sampled` — never extrapolated into a total.
+    pub fn residency(&self) -> Option<ResidencySample> {
+        let map = self.mapped.as_ref()?;
+        let page = page_size_bytes();
+        let mapped = map.len() as u64;
+        let (scanned, resident, sampled) = if mapped <= Self::MAX_FULL_RESIDENCY_SCAN {
+            let (resident, scanned) = mincore_resident_bytes(map.ptr, 0, mapped as usize, page)?;
+            (scanned, resident, false)
+        } else {
+            let windows = 512usize;
+            let window_bytes = 8 * 1024 * 1024usize;
+            let span = mapped.saturating_sub(window_bytes as u64) / windows as u64;
+            let mut resident = 0u64;
+            let mut scanned = 0u64;
+            for w in 0..windows {
+                let offset = (w as u64 * span) as usize;
+                let len = window_bytes.min(map.len().saturating_sub(offset));
+                if len == 0 {
+                    continue;
+                }
+                let (r, s) = mincore_resident_bytes(map.ptr, offset, len, page)?;
+                resident += r;
+                scanned += s;
+            }
+            (scanned, resident, true)
+        };
+        Some(ResidencySample {
+            page_size_bytes: page,
+            mapped_bytes: mapped,
+            scanned_bytes: scanned,
+            // mincore counts whole pages: never report more resident bytes
+            // than the mapping covers.
+            resident_bytes: resident.min(mapped),
+            sampled,
+        })
+    }
+
+    /// Mappings at or below this size are scanned fully by `residency()`.
+    pub const MAX_FULL_RESIDENCY_SCAN: u64 = 8 * 1024 * 1024 * 1024;
 
     /// Dequantize a whole (small) tensor, streaming through the cache so the
     /// memory ceiling holds even for large 1D weights.
@@ -546,6 +814,52 @@ impl BlockLoader {
         }
         Ok(out)
     }
+}
+
+fn page_size_bytes() -> u64 {
+    // SAFETY: sysconf is thread-safe and takes no pointers.
+    let v = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+    if v <= 0 {
+        4096
+    } else {
+        v as u64
+    }
+}
+
+/// Count resident bytes in `[offset, offset+len)` of the mapping at `ptr`
+/// using `mincore`. Returns `(resident_bytes, scanned_bytes)` page-aligned to
+/// the containing pages; `None` when the call fails.
+fn mincore_resident_bytes(
+    ptr: *const u8,
+    offset: usize,
+    len: usize,
+    page: u64,
+) -> Option<(u64, u64)> {
+    if len == 0 {
+        return Some((0, 0));
+    }
+    let start = (offset as u64) / page * page;
+    let end = (offset as u64 + len as u64).div_ceil(page) * page;
+    let span = (end - start) as usize;
+    let pages = span / page as usize;
+    if pages == 0 {
+        return Some((0, 0));
+    }
+    let mut vec = vec![0i8; pages];
+    // SAFETY: the range lies inside the mapping (caller clamps), the output
+    // buffer has one byte per page as required, and mincore only reads.
+    let rc = unsafe {
+        libc::mincore(
+            ptr.add(start as usize) as *mut libc::c_void,
+            span,
+            vec.as_mut_ptr() as *mut libc::c_char,
+        )
+    };
+    if rc != 0 {
+        return None;
+    }
+    let resident_pages = vec.iter().filter(|&&b| b & 1 != 0).count() as u64;
+    Some((resident_pages * page, span as u64))
 }
 
 #[cfg(test)]
@@ -622,7 +936,7 @@ mod tests {
             .collect();
         assert_eq!(first, second, "reloads must return identical bytes");
         let stats = loader.stats();
-        assert!(stats.evictions > 0, "{stats:?}");
+        assert!(stats.cache_entry_evictions > 0, "{stats:?}");
         assert_eq!(stats.blocks_loaded, chunks * 2);
     }
 
@@ -797,5 +1111,283 @@ mod tests {
         assert!(loader.block(10_000, 0).is_err());
         let idx = loader.tensor_index("output_norm.weight").unwrap();
         assert!(loader.block(idx, 9999).is_err());
+    }
+
+    fn entries_for(
+        insp: &tuckmill_manifest::gguf::GgufInspection,
+        block_bytes: u64,
+    ) -> Vec<TensorEntry> {
+        insp.tensors
+            .iter()
+            .map(|t| {
+                let row = tensor::row_geometry(t.type_id, &t.dims, block_bytes);
+                let chunks = match &row {
+                    Some(r) => r.rows.div_ceil(r.rows_per_chunk),
+                    None => t.byte_size.div_ceil(block_bytes),
+                };
+                TensorEntry {
+                    name: t.name.clone(),
+                    type_id: t.type_id,
+                    dims: t.dims.clone(),
+                    rel_offset: t.offset,
+                    byte_size: t.byte_size,
+                    row,
+                    chunks,
+                }
+            })
+            .collect()
+    }
+
+    #[test]
+    fn owned_storage_is_selectable_and_bounded() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("f.gguf");
+        write_synthetic(&path, &SyntheticConfig::tiny_qwen3()).unwrap();
+        let raw = std::fs::read(&path).unwrap();
+        let insp =
+            tuckmill_manifest::gguf::inspect(&path, &tuckmill_manifest::gguf::Limits::default())
+                .unwrap();
+        let policy = BlockPolicy {
+            block_bytes: 64 * 1024,
+            cache_bytes: 256 * 1024,
+        };
+        let loader = BlockLoader::open_with_storage(
+            &path,
+            insp.data_start,
+            entries_for(&insp, policy.block_bytes),
+            policy,
+            StorageSelection::Owned,
+        )
+        .unwrap();
+        assert_eq!(loader.storage_mode(), ResolvedStorage::Owned);
+        assert!(!loader.has_zero_copy());
+        assert!(loader.residency().is_none(), "no mapping, no residency");
+
+        let idx = loader.tensor_index("token_embd.weight").unwrap();
+        let entry = loader.entry(idx);
+        let block = loader.block(idx, 0).unwrap();
+        assert!(
+            !block.is_mapped(),
+            "owned storage never returns mapped views"
+        );
+        let file_start = (insp.data_start + entry.rel_offset) as usize;
+        assert_eq!(
+            block.bytes(),
+            &raw[file_start..file_start + block.bytes().len()]
+        );
+
+        let stats = loader.stats();
+        assert_eq!(stats.storage_mode, "owned");
+        assert_eq!(stats.mapped_vm_bytes, 0);
+        assert!(stats.owned_cache_bytes > 0, "{stats:?}");
+        assert_eq!(stats.owned_cache_bytes, stats.cache_bytes_used);
+    }
+
+    #[test]
+    fn mapped_storage_reports_vm_separately_from_measured_residency() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("f.gguf");
+        write_synthetic(&path, &SyntheticConfig::tiny_qwen3()).unwrap();
+        let insp =
+            tuckmill_manifest::gguf::inspect(&path, &tuckmill_manifest::gguf::Limits::default())
+                .unwrap();
+        let policy = BlockPolicy {
+            block_bytes: 64 * 1024,
+            cache_bytes: 256 * 1024,
+        };
+        let loader = BlockLoader::open_with_storage(
+            &path,
+            insp.data_start,
+            entries_for(&insp, policy.block_bytes),
+            policy,
+            StorageSelection::Mapped,
+        )
+        .unwrap();
+        assert_eq!(loader.storage_mode(), ResolvedStorage::Mapped);
+        assert!(loader.has_zero_copy());
+
+        // Touch a block through the mapping, then measure pages.
+        let idx = loader.tensor_index("token_embd.weight").unwrap();
+        let block = loader.block(idx, 0).unwrap();
+        assert!(block.is_mapped());
+        assert!(!block.bytes().is_empty());
+        let sample = loader.residency().expect("mincore on a mapping");
+        let file_len = std::fs::metadata(&path).unwrap().len();
+        assert_eq!(sample.mapped_bytes, file_len);
+        assert!(
+            sample.resident_bytes > 0,
+            "touched pages must be observed resident: {sample:?}"
+        );
+        assert!(sample.resident_bytes <= sample.scanned_bytes);
+
+        let stats = loader.stats();
+        assert_eq!(stats.storage_mode, "mapped");
+        assert_eq!(stats.mapped_vm_bytes, sample.mapped_bytes);
+        assert_eq!(stats.owned_cache_bytes, 0, "mapped blocks own no buffers");
+    }
+
+    #[test]
+    fn auto_falls_back_to_owned_when_mapping_fails_and_mapped_is_strict() {
+        // Directories open as Files but cannot be mapped: Auto must resolve
+        // to owned without error, Mapped must refuse explicitly.
+        let dir = tempfile::tempdir().unwrap();
+        let policy = BlockPolicy::default();
+        let auto = BlockLoader::open_with_storage(
+            dir.path(),
+            0,
+            Vec::new(),
+            policy,
+            StorageSelection::Auto,
+        )
+        .unwrap();
+        assert_eq!(auto.storage_mode(), ResolvedStorage::Owned);
+        let mapped = BlockLoader::open_with_storage(
+            dir.path(),
+            0,
+            Vec::new(),
+            policy,
+            StorageSelection::Mapped,
+        );
+        let err = mapped
+            .err()
+            .expect("mapped storage must refuse unmappable files");
+        assert_eq!(err.code(), ErrorCode::StorageLost);
+        assert!(err.message().contains("mmap failed"), "{}", err.message());
+    }
+
+    #[test]
+    fn replacement_by_rename_does_not_change_the_open_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("f.gguf");
+        write_synthetic(&path, &SyntheticConfig::tiny_qwen3()).unwrap();
+        let raw_before = std::fs::read(&path).unwrap();
+        let insp =
+            tuckmill_manifest::gguf::inspect(&path, &tuckmill_manifest::gguf::Limits::default())
+                .unwrap();
+        let policy = BlockPolicy {
+            block_bytes: 64 * 1024,
+            cache_bytes: 256 * 1024,
+        };
+        // The loader holds the original handle; mapping and reads use it.
+        let file = File::open(&path).unwrap();
+        let loader = BlockLoader::open_file(
+            file,
+            insp.data_start,
+            entries_for(&insp, policy.block_bytes),
+            policy,
+            StorageSelection::Auto,
+            Some(raw_before.len() as u64),
+        )
+        .unwrap();
+
+        // Atomically replace the path with a different (truncated-shape) byte
+        // stream: the open handle must keep serving the original inode.
+        let other = dir.path().join("other.gguf");
+        std::fs::write(&other, vec![0xAAu8; raw_before.len()]).unwrap();
+        std::fs::rename(&other, &path).unwrap();
+        let raw_after = std::fs::read(&path).unwrap();
+        assert_ne!(raw_before, raw_after, "path now names different bytes");
+
+        let idx = loader.tensor_index("token_embd.weight").unwrap();
+        let entry = loader.entry(idx);
+        let block = loader.block(idx, 0).unwrap();
+        let file_start = (insp.data_start + entry.rel_offset) as usize;
+        assert_eq!(
+            block.bytes(),
+            &raw_before[file_start..file_start + block.bytes().len()],
+            "execution follows the verified open file, not the path"
+        );
+    }
+
+    #[test]
+    fn truncation_is_refused_when_the_expected_length_is_known() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("f.gguf");
+        write_synthetic(&path, &SyntheticConfig::tiny_qwen3()).unwrap();
+        let original_len = std::fs::metadata(&path).unwrap().len();
+        let insp =
+            tuckmill_manifest::gguf::inspect(&path, &tuckmill_manifest::gguf::Limits::default())
+                .unwrap();
+        let policy = BlockPolicy::default();
+        let tensors = entries_for(&insp, policy.block_bytes);
+
+        // Truncate the payload before opening: the recorded identity says
+        // original_len, so the loader must refuse before mapping anything.
+        let f = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+        f.set_len(original_len - 1).unwrap();
+        let file = File::open(&path).unwrap();
+        let err = BlockLoader::open_file(
+            file,
+            insp.data_start,
+            tensors.clone(),
+            policy,
+            StorageSelection::Auto,
+            Some(original_len),
+        )
+        .err()
+        .expect("truncated artifact must be refused");
+        assert_eq!(err.code(), ErrorCode::IntegrityFailure);
+        assert!(
+            err.message().contains("refusing to map or execute"),
+            "{}",
+            err.message()
+        );
+
+        // Without the recorded length the file still opens (the executor's
+        // digest pass is what refuses drifted content); this proves the
+        // length check is the second line of defense, not the only one.
+        let file = File::open(&path).unwrap();
+        assert!(BlockLoader::open_file(
+            file,
+            insp.data_start,
+            tensors,
+            policy,
+            StorageSelection::Auto,
+            None
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn eviction_evidence_distinguishes_entries_advice_and_residency() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("f.gguf");
+        write_synthetic(&path, &SyntheticConfig::tiny_qwen3()).unwrap();
+        let insp =
+            tuckmill_manifest::gguf::inspect(&path, &tuckmill_manifest::gguf::Limits::default())
+                .unwrap();
+        let policy = BlockPolicy {
+            block_bytes: 64 * 1024,
+            cache_bytes: 256 * 1024,
+        };
+        let loader = BlockLoader::open_with_storage(
+            &path,
+            insp.data_start,
+            entries_for(&insp, policy.block_bytes),
+            policy,
+            StorageSelection::Mapped,
+        )
+        .unwrap();
+        let idx = loader.tensor_index("token_embd.weight").unwrap();
+        for chunk in [0u32, 1] {
+            let block = loader.block(idx, chunk).unwrap();
+            std::hint::black_box(block.bytes()[0]);
+        }
+        let before = loader.residency().unwrap();
+        assert!(before.resident_bytes > 0, "{before:?}");
+
+        let evicted = loader.evict_all();
+        assert!(evicted >= 1, "unpinned entries evict");
+        let stats = loader.stats();
+        assert_eq!(stats.cache_entry_evictions, evicted as u64);
+        assert!(
+            stats.page_advice_bytes > 0,
+            "mapped eviction issues page advice: {stats:?}"
+        );
+        // Residency is re-measured, not assumed: the sample stays bounded by
+        // the mapping and never exceeds it.
+        let after = loader.residency().unwrap();
+        assert!(after.resident_bytes <= after.scanned_bytes);
+        assert!(after.resident_bytes <= before.resident_bytes.max(after.scanned_bytes));
     }
 }

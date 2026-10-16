@@ -46,36 +46,56 @@ pub fn supported_type_names() -> &'static str {
 }
 
 /// Decode `bytes` (a whole number of blocks) of `type_id` into `out`
-/// (extended, not cleared). Returns the element count written. The caller
-/// guarantees `bytes` is block aligned, which artifact inspection already
-/// validated.
+/// (extended, not cleared). Returns the element count written. Malformed
+/// (not block-aligned) byte slices are rejected with a typed error — a
+/// trailing partial block is never silently dropped.
 pub fn dequant_into(type_id: u32, bytes: &[u8], out: &mut Vec<f32>) -> Result<usize> {
     let info = ggml::lookup(type_id).ok_or_else(|| unsupported(type_id))?;
     if !is_supported(type_id) {
         return Err(unsupported(type_id));
+    }
+    if !(bytes.len() as u64).is_multiple_of(info.block_bytes) {
+        return Err(TuckmillError::new(
+            ErrorCode::InvalidArtifact,
+            format!(
+                "packed {} data is {} bytes, not a multiple of the {}-byte block size",
+                ggml::type_name(type_id),
+                bytes.len(),
+                info.block_bytes
+            ),
+        )
+        .with_action("Re-import the artifact; block geometry is validated at inspection."));
     }
     let blocks = bytes.len() as u64 / info.block_bytes;
     let elems = (blocks * info.block_elems) as usize;
     out.reserve(elems);
     match type_id {
         0 => {
-            for chunk in bytes.chunks_exact(4) {
-                out.push(f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
+            let (chunks, rest) = bytes.as_chunks::<4>();
+            debug_assert!(rest.is_empty(), "block-aligned above");
+            for [b0, b1, b2, b3] in chunks {
+                out.push(f32::from_le_bytes([*b0, *b1, *b2, *b3]));
             }
         }
         1 => {
-            for chunk in bytes.chunks_exact(2) {
-                out.push(f16_to_f32(u16::from_le_bytes([chunk[0], chunk[1]])));
+            let (chunks, rest) = bytes.as_chunks::<2>();
+            debug_assert!(rest.is_empty(), "block-aligned above");
+            for [b0, b1] in chunks {
+                out.push(f16_to_f32(u16::from_le_bytes([*b0, *b1])));
             }
         }
         30 => {
-            for chunk in bytes.chunks_exact(2) {
-                out.push(bf16_to_f32(u16::from_le_bytes([chunk[0], chunk[1]])));
+            let (chunks, rest) = bytes.as_chunks::<2>();
+            debug_assert!(rest.is_empty(), "block-aligned above");
+            for [b0, b1] in chunks {
+                out.push(bf16_to_f32(u16::from_le_bytes([*b0, *b1])));
             }
         }
         8 => {
             // Q8_0: [f16 d][i8 qs; 32]
-            for block in bytes.chunks_exact(34) {
+            let (chunks, rest) = bytes.as_chunks::<34>();
+            debug_assert!(rest.is_empty(), "block-aligned above");
+            for block in chunks {
                 let d = f16_to_f32(read_u16(block, 0));
                 for q in &block[2..34] {
                     out.push(d * (*q as i8) as f32);
@@ -85,7 +105,9 @@ pub fn dequant_into(type_id: u32, bytes: &[u8], out: &mut Vec<f32>) -> Result<us
         2 => {
             // Q4_0: [f16 d][u8 qs; 16]; low nibble = element j,
             // high nibble = element j+16 (llama.cpp layout).
-            for block in bytes.chunks_exact(18) {
+            let (chunks, rest) = bytes.as_chunks::<18>();
+            debug_assert!(rest.is_empty(), "block-aligned above");
+            for block in chunks {
                 let d = f16_to_f32(read_u16(block, 0));
                 let qs = &block[2..18];
                 for &b in qs {
@@ -98,7 +120,9 @@ pub fn dequant_into(type_id: u32, bytes: &[u8], out: &mut Vec<f32>) -> Result<us
         }
         3 => {
             // Q4_1: [f16 d][f16 m][u8 qs; 16]; x = d*q + m.
-            for block in bytes.chunks_exact(20) {
+            let (chunks, rest) = bytes.as_chunks::<20>();
+            debug_assert!(rest.is_empty(), "block-aligned above");
+            for block in chunks {
                 let d = f16_to_f32(read_u16(block, 0));
                 let m = f16_to_f32(read_u16(block, 2));
                 let qs = &block[4..20];

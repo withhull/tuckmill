@@ -31,6 +31,7 @@ pub struct CompletionTracker {
     next_fence: AtomicU64,
     in_flight: Mutex<BTreeMap<u64, Lease>>,
     completed: AtomicU64,
+    released_bytes: AtomicU64,
 }
 
 impl CompletionTracker {
@@ -58,8 +59,10 @@ impl CompletionTracker {
     /// only here — never on eviction, cancellation, or shutdown shortcuts.
     pub fn complete(&self, fence: u64) -> Option<Lease> {
         let lease = self.in_flight.lock().expect("tracker lock").remove(&fence);
-        if lease.is_some() {
+        if let Some(lease) = &lease {
             self.completed.fetch_add(1, Ordering::Relaxed);
+            self.released_bytes
+                .fetch_add(lease.bytes(), Ordering::Relaxed);
         }
         lease
     }
@@ -77,8 +80,26 @@ impl CompletionTracker {
             .sum()
     }
 
+    /// In-flight bytes held by leases over owned (copied) blocks — distinct
+    /// from mapped view leases, which own no heap buffer.
+    pub fn in_flight_owned_bytes(&self) -> u64 {
+        self.in_flight
+            .lock()
+            .expect("tracker lock")
+            .values()
+            .flat_map(|l| l.blocks.iter())
+            .filter(|b| !b.is_mapped())
+            .map(|b| b.len() as u64)
+            .sum()
+    }
+
     pub fn completed(&self) -> u64 {
         self.completed.load(Ordering::Relaxed)
+    }
+
+    /// Bytes released through completed fences since creation.
+    pub fn released_bytes(&self) -> u64 {
+        self.released_bytes.load(Ordering::Relaxed)
     }
 }
 

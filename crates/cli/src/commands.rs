@@ -67,6 +67,8 @@ pub fn dispatch(cmd: &Cmd, json: bool, data_dir: Option<&Path>) -> Result<ExitCo
             engine,
             quiet,
             gpu_layers,
+            kernels,
+            storage,
         } => run(
             model,
             prompt.clone(),
@@ -77,6 +79,8 @@ pub fn dispatch(cmd: &Cmd, json: bool, data_dir: Option<&Path>) -> Result<ExitCo
             engine,
             *quiet,
             *gpu_layers,
+            kernels.as_deref(),
+            storage.as_deref(),
             json,
             data_dir,
         ),
@@ -104,6 +108,8 @@ pub fn dispatch(cmd: &Cmd, json: bool, data_dir: Option<&Path>) -> Result<ExitCo
             tuckcore_profile,
             kv_precision,
             held_out,
+            kernels,
+            storage,
         } => verify(
             model,
             memory_budget.as_deref(),
@@ -115,6 +121,8 @@ pub fn dispatch(cmd: &Cmd, json: bool, data_dir: Option<&Path>) -> Result<ExitCo
             tuckcore_profile,
             kv_precision,
             *held_out,
+            kernels.as_deref(),
+            storage.as_deref(),
             json,
             data_dir,
         ),
@@ -129,6 +137,8 @@ pub fn dispatch(cmd: &Cmd, json: bool, data_dir: Option<&Path>) -> Result<ExitCo
             allow_test_engine,
             engine,
             gpu_layers,
+            kernels,
+            storage,
         } => bench(
             model,
             suite,
@@ -140,6 +150,8 @@ pub fn dispatch(cmd: &Cmd, json: bool, data_dir: Option<&Path>) -> Result<ExitCo
             *allow_test_engine,
             engine,
             *gpu_layers,
+            kernels.as_deref(),
+            storage.as_deref(),
             json,
             data_dir,
         ),
@@ -147,7 +159,17 @@ pub fn dispatch(cmd: &Cmd, json: bool, data_dir: Option<&Path>) -> Result<ExitCo
             model,
             engine,
             tokens,
-        } => stats(model, engine, *tokens, json, data_dir),
+            kernels,
+            storage,
+        } => stats(
+            model,
+            engine,
+            *tokens,
+            kernels.as_deref(),
+            storage.as_deref(),
+            json,
+            data_dir,
+        ),
         Cmd::Cache { cmd } => match cmd {
             CacheCmd::List => cache_list(json, data_dir),
             CacheCmd::Prune { dry_run } => cache_prune(*dry_run, json, data_dir),
@@ -244,6 +266,69 @@ fn open_runtime_with_options(
 
 /// Fold --gpu-layers into backend options; only the llama backend accepts it
 /// (and only for performance baselines, never arithmetic diagnostics).
+/// Build the backend load options for run/bench/stats: llama gets
+/// `gpu_layers`; tuckcore gets the resolved kernel/storage selections.
+fn engine_load_options(
+    engine: &str,
+    gpu_layers: Option<i32>,
+    kernels: Option<&str>,
+    storage: Option<&str>,
+) -> Result<Option<serde_json::Value>> {
+    let (kind, _) = parse_engine(engine)?;
+    match kind {
+        tuckmill_backend::EngineKind::LlamaCpp => {
+            if kernels.is_some() || storage.is_some() {
+                return Err(TuckmillError::new(
+                    ErrorCode::InvalidRequest,
+                    "--kernels/--storage apply to the tuckcore engine; llama.cpp selects its own kernels",
+                ));
+            }
+            llama_gpu_options(engine, gpu_layers)
+        }
+        tuckmill_backend::EngineKind::TuckCore => {
+            if gpu_layers.is_some() {
+                return Err(TuckmillError::new(
+                    ErrorCode::InvalidRequest,
+                    "--gpu-layers applies only to --engine llama (the Metal performance baseline)",
+                ));
+            }
+            let mut obj = serde_json::Map::new();
+            if let Some(k) = kernels {
+                if tuckmill_tuckcore::KernelSelection::parse(k).is_none() {
+                    return Err(TuckmillError::new(
+                        ErrorCode::InvalidRequest,
+                        format!("unknown --kernels {k:?}; use auto, scalar, or neon"),
+                    ));
+                }
+                obj.insert("kernels".into(), serde_json::json!(k));
+            }
+            if let Some(st) = storage {
+                if tuckmill_tuckcore::StorageSelection::parse(st).is_none() {
+                    return Err(TuckmillError::new(
+                        ErrorCode::InvalidRequest,
+                        format!("unknown --storage {st:?}; use auto, mapped, or owned"),
+                    ));
+                }
+                obj.insert("storage".into(), serde_json::json!(st));
+            }
+            if obj.is_empty() {
+                Ok(None)
+            } else {
+                Ok(Some(serde_json::Value::Object(obj)))
+            }
+        }
+        _ => {
+            if kernels.is_some() || storage.is_some() || gpu_layers.is_some() {
+                return Err(TuckmillError::new(
+                    ErrorCode::InvalidRequest,
+                    "--kernels/--storage/--gpu-layers require an engine that selects them (tuckcore or llama)",
+                ));
+            }
+            Ok(None)
+        }
+    }
+}
+
 fn llama_gpu_options(engine: &str, gpu_layers: Option<i32>) -> Result<Option<serde_json::Value>> {
     match gpu_layers {
         None => Ok(None),
@@ -798,6 +883,8 @@ fn run(
     engine: &str,
     quiet: bool,
     gpu_layers: Option<i32>,
+    kernels: Option<&str>,
+    storage: Option<&str>,
     json: bool,
     data_dir: Option<&Path>,
 ) -> Result<ExitCode> {
@@ -805,7 +892,7 @@ fn run(
         data_dir,
         engine,
         allow_test_engine,
-        llama_gpu_options(engine, gpu_layers)?,
+        engine_load_options(engine, gpu_layers, kernels, storage)?,
     )?;
     let budget = resolve_budget(&runtime, memory_budget)?;
     let (artifact, adapter) = runtime.resolve_artifact(model)?;
@@ -1090,6 +1177,8 @@ fn bench(
     allow_test_engine: bool,
     engine: &str,
     gpu_layers: Option<i32>,
+    kernels: Option<&str>,
+    storage: Option<&str>,
     json: bool,
     data_dir: Option<&Path>,
 ) -> Result<ExitCode> {
@@ -1103,7 +1192,7 @@ fn bench(
         data_dir,
         engine,
         allow_test_engine,
-        llama_gpu_options(engine, gpu_layers)?,
+        engine_load_options(engine, gpu_layers, kernels, storage)?,
     )?;
     let budget = resolve_budget(&runtime, memory_budget)?;
     let (artifact, adapter) = runtime.resolve_artifact(model)?;
@@ -1170,10 +1259,17 @@ fn verify(
     tuckcore_profile: &str,
     kv_precision: &str,
     held_out: bool,
+    kernels: Option<&str>,
+    storage: Option<&str>,
     json: bool,
     data_dir: Option<&Path>,
 ) -> Result<ExitCode> {
-    let runtime = open_runtime(data_dir, "tuckcore", false)?;
+    let runtime = open_runtime_with_options(
+        data_dir,
+        "tuckcore",
+        false,
+        engine_load_options("tuckcore", None, kernels, storage)?,
+    )?;
     let budget = resolve_budget(&runtime, memory_budget)?;
     let (artifact, adapter) = runtime.resolve_artifact(model)?;
     let plan = runtime.plan_for(&artifact, &adapter, budget, context, generate.max(1))?;
@@ -1247,23 +1343,18 @@ fn stats(
     model: &str,
     engine: &str,
     tokens: u64,
+    kernels: Option<&str>,
+    storage: Option<&str>,
     json: bool,
     data_dir: Option<&Path>,
 ) -> Result<ExitCode> {
+    let mut options = engine_load_options(engine, None, kernels, storage)?
+        .unwrap_or_else(|| serde_json::json!({}));
+    options["profile"] = serde_json::json!(true);
     let runtime = if engine.starts_with("llama") {
-        open_runtime_with_options(
-            data_dir,
-            engine,
-            false,
-            Some(serde_json::json!({ "profile": true })),
-        )?
+        open_runtime_with_options(data_dir, engine, false, Some(options))?
     } else {
-        open_runtime_with_options(
-            data_dir,
-            engine,
-            true,
-            Some(serde_json::json!({ "profile": true })),
-        )?
+        open_runtime_with_options(data_dir, engine, true, Some(options))?
     };
     let budget = runtime.default_budget;
     let (artifact, adapter) = runtime.resolve_artifact(model)?;
@@ -1364,12 +1455,26 @@ fn stats(
                 "cache_misses",
                 "evictions",
                 "in_flight_leases",
+                "buffer_releases",
+                "released_bytes",
                 "kv_precision",
                 "threads",
+                "kernel_impl",
+                "numerical_profile",
             ] {
                 if let Some(v) = stats.get(key) {
                     println!("  {key}: {v}");
                 }
+            }
+        }
+        if let Some(storage) = value
+            .get("stats")
+            .and_then(|s| s.get("storage"))
+            .and_then(|s| s.as_object())
+        {
+            println!("  storage:");
+            for (k, v) in storage {
+                println!("    {k}: {v}");
             }
         }
         if let Some(profile) = value.get("profile").and_then(|p| p.as_object()) {

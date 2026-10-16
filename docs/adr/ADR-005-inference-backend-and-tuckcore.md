@@ -83,6 +83,44 @@ further K01 lane work or a Metal kernel, gated per the kernel registry.
 `tuckmill stats` exposes the phase counters and loader statistics behind
 these numbers.
 
+**Update 5 (K01 hardening + matched baseline, 2026-10-16):** the update-4
+increment landed, and this update closes its boundary, control, and
+measurement gaps. (1) **Checked kernel boundary:** the public entry points
+validate packed-row alignment, activation length, block count, and scale
+length per row; malformed shapes are refused with typed errors (the unsafe
+NEON implementations are private behind that boundary; regression tests
+include a valid block paired with an empty activation). (2) **Explicit,
+recorded selection:** `--kernels auto|scalar|neon` (NEON refused off
+aarch64) and `--storage auto|mapped|owned` (mapped refused when the file
+cannot be mapped) resolve at load; the resolved choices are reported in the
+load note, `BackendStats` (`kernel_impl`, `numerical_profile`, `storage`),
+the engine identity (`K01:q8_0+f16:<impl>` — Q4 acceleration and Metal are
+not implemented), and per-sample benchmark records. Forced-scalar tests
+prove the selection changes the implementation. (3) **Accounting:** owned
+buffers, mapped address space, `mincore`-measured page residency, issued
+`madvise(MADV_DONTNEED)` advice on mapped eviction, and charged process
+footprint are separate numbers, never summed; eviction counts are
+cache-entry evidence, not RAM release. (4) **File identity:** the executor
+opens the artifact once — content verification, the length check, and the
+weight mapping use the same file object; replacement and truncation are
+tested (loader unit tests and isolated-worker e2e). (5) **Records:**
+benchmarks report end-to-end and decode-only throughput separately (record
+schema v2) and name the resolved kernel/storage per sample; protocol v5
+carries resolved kernels on `Loaded`. (6) **Matched smoke matrix** (real
+Qwen3-0.6B Q8_0, 64/64, single-run, cache-uncontrolled; e2e/decode tok/s):
+scalar+owned 1.24/2.65, scalar+mapped 1.57/3.24, neon+owned 2.69/5.70,
+neon+mapped 4.19/9.18; footprint 1.10 GiB → 512 MiB with mapped storage;
+llama.cpp CPU 35.2/89.6 and Metal 61.4/88.4 speed baselines on the same
+artifact. Both selections PASS `verify --reference` with identical
+statistics (max |Δ| 4.624e-1 @ registered 5e-1, top-1 100%) — the
+`llama-cpu` int32 block dot is bit-identical across scalar and NEON. (7)
+**Live bug fixed:** a governor `ControlAck` landing mid-generation aborted
+the run as an "unexpected frame" under memory pressure; the generate and
+stats read loops now absorb it (regression-tested in the isolated-worker
+round trip). (8) **Toolchain:** `rust-toolchain.toml` pins 1.96.0 and CI
+runs the same pin (floating stable failed run 38910541208 on lints not
+reproducible locally); constant-size chunk iteration uses `as_chunks`.
+
 ## Context and review
 
 The v0.2 engineering build finished the orchestration stack with exactly one

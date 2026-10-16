@@ -49,6 +49,11 @@ pub enum WorkerFrame {
     Loaded {
         note: String,
         footprint_bytes: u64,
+        /// Kernel ids resolved by the backend at load (empty for engines
+        /// without kernel selection). Recorded into engine identities so
+        /// records name the implementation that actually ran.
+        #[serde(default)]
+        resolved_kernels: Vec<String>,
     },
     Generate {
         request_id: String,
@@ -298,9 +303,23 @@ mod tests {
                     cache_misses: 3,
                     evictions: 1,
                     in_flight_leases: 0,
+                    buffer_releases: Some(9),
+                    released_bytes: Some(8192),
+                    storage: Some(tuckmill_backend::StorageStats {
+                        mode: "mapped".into(),
+                        owned_cache_bytes: 0,
+                        owned_in_flight_bytes: 0,
+                        mapped_vm_bytes: 1 << 20,
+                        mapped_resident_bytes: Some(4096),
+                        mapped_resident_sampled: false,
+                        page_size_bytes: 16384,
+                        page_advice_bytes: 65536,
+                    }),
                     footprint_bytes: Some(999),
                     kv_precision: Some("f16".into()),
                     threads: Some(4),
+                    kernel_impl: Some("neon".into()),
+                    numerical_profile: Some("oracle-f32".into()),
                     profile: None,
                 }),
             },

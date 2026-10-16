@@ -205,6 +205,41 @@ pub struct GenOutcome {
     pub committed: u64,
 }
 
+/// Storage accounting reported by backends that manage weight storage.
+/// These numbers overlap nothing: `owned_cache_bytes` and
+/// `owned_in_flight_bytes` are heap buffers, `mapped_vm_bytes` is address
+/// space, `mapped_resident_bytes` is a measured page-residency sample, and
+/// the process footprint is sampled separately (`BackendStats::
+/// footprint_bytes`). They must never be summed into one figure.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct StorageStats {
+    /// Resolved mode actually in use ("mapped" = zero-copy views of one
+    /// read-only artifact mapping; "owned" = copied into bounded buffers).
+    pub mode: String,
+    /// Owned (copied) buffer bytes currently retained in the cache.
+    pub owned_cache_bytes: u64,
+    /// Owned (copied) buffer bytes leased to in-flight work.
+    pub owned_in_flight_bytes: u64,
+    /// Address space covered by the artifact mapping (0 in owned mode).
+    /// Virtual address space — not resident memory.
+    pub mapped_vm_bytes: u64,
+    /// Measured resident bytes within the mapping (`mincore`), when
+    /// measurable; `None` in owned mode or when the call fails.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mapped_resident_bytes: Option<u64>,
+    /// True when the residency scan was sampled (bounded windows) rather
+    /// than covering the whole mapping.
+    #[serde(default)]
+    pub mapped_resident_sampled: bool,
+    /// Page size used for the residency scan.
+    #[serde(default)]
+    pub page_size_bytes: u64,
+    /// Bytes handed to `madvise(MADV_DONTNEED)` on cache-entry eviction
+    /// (advisory; issued advice, not freed memory).
+    #[serde(default)]
+    pub page_advice_bytes: u64,
+}
+
 /// Measured backend statistics. Reservations are never reported here;
 /// these are observed values or explicit zeros with no claim.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -214,11 +249,25 @@ pub struct BackendStats {
     pub blocks_loaded: u64,
     pub cache_hits: u64,
     pub cache_misses: u64,
+    /// Cache-entry evictions: entries dropped from the application cache.
+    /// Not evidence that mapped pages left RAM — see `storage`.
     pub evictions: u64,
     /// Weight blocks currently leased to in-flight work (completion fences
     /// not yet signaled). Must be 0 after a drained shutdown.
     pub in_flight_leases: u64,
-    /// Process footprint attributed to the backend, when measurable.
+    /// Completed completion fences (buffer release events) since load.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub buffer_releases: Option<u64>,
+    /// Bytes released through completed fences since load.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub released_bytes: Option<u64>,
+    /// Resolved storage mode and its accounting, when the backend manages
+    /// weight storage.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub storage: Option<StorageStats>,
+    /// Process footprint attributed to the backend, when measurable. This is
+    /// the charged footprint metric; it is sampled independently of the
+    /// storage object above and never summed with it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub footprint_bytes: Option<u64>,
     /// Actual KV cache precision in use ("f16"/"f32"), reported by the
@@ -229,6 +278,13 @@ pub struct BackendStats {
     /// Thread count in use for compute, when the backend is threaded.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub threads: Option<u32>,
+    /// Resolved packed-kernel implementation actually selected at load
+    /// ("scalar"/"neon"), when the backend selects kernels.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kernel_impl: Option<String>,
+    /// Declared numerical profile in effect, when the backend has one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub numerical_profile: Option<String>,
     /// Optional backend profile counters (phase attribution); present only
     /// when profiling was explicitly enabled for the run.
     #[serde(default, skip_serializing_if = "Option::is_none")]

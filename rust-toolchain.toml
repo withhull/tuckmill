@@ -1,0 +1,7 @@
+# Pinned development and CI toolchain. Local development and the CI gate
+# must run the same rustc/clippy: floating "stable" moved past this pin and
+# surfaced lints that could not be reproduced locally (Actions run
+# 38910541208). Update this file and .github/workflows/ci.yml together.
+[toolchain]
+channel = "1.96.0"
+components = ["rustfmt", "clippy"]

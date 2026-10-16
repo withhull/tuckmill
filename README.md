@@ -22,7 +22,11 @@ quality.
 > logits under registered per-dtype tolerances, and the measured gap to
 > llama.cpp named the kernel work: K01's first CPU increment (NEON fused
 > packed dot, zero-copy mapped weight blocks) is implemented and re-validated
-> — scheduling stays bit-exact and the registered envelopes are unchanged.
+> — scheduling stays bit-exact, the registered envelopes are unchanged under
+> both forced selections, and the matched smoke matrix separates
+> vectorization from copy-avoidance effects. Kernel implementation and
+> weight storage are explicit, recorded load choices (`--kernels`,
+> `--storage`); eviction counts are never presented as RAM release.
 > Nothing is certified; no Metal kernel exists (K02–K09 specified); no
 > performance comparative claim is made. Stage A verification is hardened:
 > malformed scoring fails closed, verification records are immutable with
@@ -47,13 +51,14 @@ tuckmill inspect model.gguf                      # validate without loading weig
 tuckmill import model.gguf --alias my-model      # atomic, resumable, verified
 tuckmill plan my-model                           # R+U+H<=B admission, mode, assumptions
 tuckmill run my-model --prompt "explain RoPE" --engine tuckcore   # real weights
+tuckmill run my-model --engine tuckcore --kernels scalar --storage owned   # forced reference variants
 tuckmill verify my-model                         # residency/streaming equivalence
 tuckmill verify my-model --reference             # llama.cpp vs TuckCore logits (needs TUCKMILL_LLAMA_LIB);
                                                  # registered per-dtype tolerances
 tuckmill run my-model --allow-test-engine        # synthetic pipeline run
-tuckmill bench my-model --engine tuckcore        # machine-readable record
+tuckmill bench my-model --engine tuckcore        # record: e2e + decode-only throughput, resolved selections
 tuckmill bench my-model --engine llama --gpu-layers 99   # Metal baseline (performance only)
-tuckmill stats my-model --engine tuckcore        # backend stats + phase profile counters
+tuckmill stats my-model --engine tuckcore        # resolved kernel/storage, storage accounting, phase counters
 tuckmill serve --allow-test-engine               # loopback API (127.0.0.1:8378)
 tuckmill cache list && tuckmill cache prune --dry-run
 ```
@@ -100,7 +105,7 @@ architecture.
 | `import` / `pack` — resumable chunked-digest imports, atomic publish, bounded lossless packer with per-tile checksums and verify | ✅ |
 | `plan` — `R + U + H ≤ B` admission, KV math, resident / streamed-MoE / streamed-dense selection, typed infeasibility, deterministic cost model with recorded assumptions | ✅ |
 | `run` / `serve` — isolated worker process, versioned framed protocol, streaming, cancellation, pause/resume, bounded queue, typed errors, loopback HTTP with bearer auth + SSE | ✅ |
-| `run --engine tuckcore` — real-weight dense-Qwen3 execution: bounded block loader (LRU byte budget, pinned/leased buffers, zero-copy mapped views with owned-read fallback), scalar f32 forward (RMSNorm, NeoX RoPE, GQA, SwiGLU) plus a first NEON kernel increment (K01 — fused Q8_0/F16 packed dot with scalar fallback), F32/F16/BF16/Q8_0/Q4_0/Q4_1 | ✅ experimental, uncertified |
+| `run --engine tuckcore` — real-weight dense-Qwen3 execution: bounded block loader (LRU byte budget, pinned/leased buffers, selectable mapped/owned storage over one verified file handle), scalar f32 forward (RMSNorm, NeoX RoPE, GQA, SwiGLU) plus the K01 fused Q8_0/F16 dot with selectable scalar/NEON implementation and a checked shape boundary, F32/F16/BF16/Q8_0/Q4_0/Q4_1 | ✅ experimental, uncertified |
 | `verify` — resident vs forced-streaming with identical token IDs: teacher-forced logits (bit-exact at Stage 0), eviction and footprint evidence, machine-readable record | ✅ |
 | Governor — Normal/Constrained/Paused/Draining/Failed with stability-window resume; driven by real memory-pressure and thermal signals | ✅ |
 | `bench` — standard-v1 records with per-prompt data, cache-state labels, caveats | ✅ |
@@ -162,12 +167,15 @@ scripts/            build.sh, test.sh, demo.sh
 ## Verification and benchmarks
 
 `scripts/test.sh` runs formatting, `clippy -D warnings`, and the full test
-suite (293 tests),
+suite (304 tests),
 including adversarial GGUF/Safetensors fixtures, planner math, governor
 semantics, import/pack fault injection, worker-protocol framing, HTTP
 auth/SSE, CLI end-to-end runs (isolated worker, crash injection, SIGINT
-cancel), and TuckCore equivalence. `scripts/demo.sh` exercises the full flow
-on a generated fixture.
+cancel, truncated/replaced payloads refused), and TuckCore equivalence.
+`rust-toolchain.toml` pins Rust 1.96.0 and CI runs that same pinned
+toolchain — a floating stable once failed the remote gate on lints the local
+toolchain could not reproduce (run 38910541208). `scripts/demo.sh` exercises
+the full flow on a generated fixture.
 
 Performance and quality claims require measuring against llama.cpp, MLX, and
 Splash across memory tiers, with identical artifacts, token IDs, and declared

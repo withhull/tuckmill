@@ -10,8 +10,13 @@ jobs:
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      # Pinned to the repository toolchain (rust-toolchain.toml): the gate
+      # must run exactly the rustc/clippy that local development runs.
+      # Moving stable previously surfaced lints the local toolchain could
+      # not reproduce (run 38910541208). Bump both together.
+      - uses: dtolnay/rust-toolchain@master
         with:
+          toolchain: 1.96.0
           components: rustfmt, clippy
       - name: format
         run: cargo fmt --all --check

@@ -137,6 +137,7 @@ pub fn run_standard_bench(
     let mut samples: Vec<PromptSample> = Vec::new();
     let mut ttfts: Vec<f64> = Vec::new();
     let mut tps_values: Vec<f64> = Vec::new();
+    let mut decode_values: Vec<f64> = Vec::new();
     let mut all_gap_p95: Vec<f64> = Vec::new();
     let mut footprint_peak: u64 = 0;
 
@@ -220,10 +221,15 @@ pub fn run_standard_bench(
             }
         }
         let total_ms = t0.elapsed().as_secs_f64() * 1000.0;
-        let logical_read_bytes = runtime
-            .backend_stats()
+        let final_stats = runtime.backend_stats();
+        let logical_read_bytes = final_stats
+            .as_ref()
             .map(|s| s.logical_read_bytes.saturating_sub(logical_reads_before))
             .unwrap_or(0);
+        let kernel_impl = final_stats.as_ref().and_then(|s| s.kernel_impl.clone());
+        let storage_mode = final_stats
+            .as_ref()
+            .and_then(|s| s.storage.as_ref().map(|st| st.mode.clone()));
         sample_stop.store(true, Ordering::Relaxed);
         let (sampler_handle, peak) = sampler;
         let _ = sampler_handle.join();
@@ -238,6 +244,20 @@ pub fn run_standard_bench(
         } else {
             0.0
         };
+        // Decode-only throughput: post-first-token tokens over the first-to-
+        // last committed-token span. Distinct from `tps` (end-to-end, which
+        // includes the wait before the first token); both are reported.
+        let decode_tps = match (first_token_at, last_token_at) {
+            (Some(first), Some(last)) if committed >= 2 => {
+                let secs = (last - first).as_secs_f64();
+                if secs > 0.0 {
+                    Some((committed - 1) as f64 / secs)
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        };
         let mut gaps_for_p95 = gaps.clone();
         let gap_p95 = percentile(&mut gaps_for_p95, 0.95);
         let gap_max = gaps_for_p95.last().copied().unwrap_or(0.0);
@@ -245,6 +265,9 @@ pub fn run_standard_bench(
         if failure.is_none() {
             ttfts.push(ttft);
             tps_values.push(tps);
+            if let Some(d) = decode_tps {
+                decode_values.push(d);
+            }
             all_gap_p95.push(gap_p95);
         }
         let mut notes = Vec::new();
@@ -263,6 +286,9 @@ pub fn run_standard_bench(
             gap_max_ms: gap_max,
             footprint_peak_bytes: run_peak,
             logical_read_bytes,
+            throughput_decode_tps: decode_tps,
+            kernel_impl,
+            storage_mode,
             notes,
         });
     }
@@ -272,6 +298,11 @@ pub fn run_standard_bench(
     let ttft_median = percentile(&mut ttfts.clone(), 0.5);
     let ttft_p95 = percentile(&mut ttfts.clone(), 0.95);
     let tps_median = percentile(&mut tps_values.clone(), 0.5);
+    let decode_median = if decode_values.is_empty() {
+        None
+    } else {
+        Some(percentile(&mut decode_values.clone(), 0.5))
+    };
     let gap_p95 = percentile(&mut all_gap_p95.clone(), 0.95);
 
     let performance_class = if completed == 0.0 {
@@ -289,6 +320,7 @@ pub fn run_standard_bench(
         ttft_median_ms: ttft_median,
         ttft_p95_ms: ttft_p95,
         throughput_median_tps: tps_median,
+        throughput_decode_median_tps: decode_median,
         gap_p95_ms: gap_p95,
         completion_rate,
         footprint_peak_bytes: footprint_peak,
@@ -303,6 +335,7 @@ pub fn run_standard_bench(
     let synthetic = tuckmill_backend::is_synthetic_engine(&engine.engine);
     let mut caveats = vec![
         format!("suite {} frozen: {}", suite.suite, suite.notes.join("; ")),
+        "throughput_median_tps is end-to-end (committed tokens / total request time, including TTFT); throughput_decode_median_tps is decode-only (first-to-last token) — never compare across the two definitions".into(),
         if synthetic {
             "reference test engine: synthetic output; model weights were not executed".into()
         } else {
@@ -330,7 +363,9 @@ pub fn run_standard_bench(
     }
 
     let run = BenchmarkRun {
-        schema_version: 1,
+        // 2: adds decode-only throughput fields (throughput_decode_tps /
+        //    throughput_decode_median_tps); both are optional, v1 records parse.
+        schema_version: 2,
         run_id: Id::new("0".repeat(64)).expect("zero id"),
         started_unix_ms: started,
         device_id: plan.device_id.clone(),
@@ -427,10 +462,14 @@ pub fn format_summary(run: &BenchmarkRun) -> String {
         run.engine.engine, run.engine.certified, run.engine.backend_abi_version
     ));
     lines.push(format!(
-        "ttft: median {:.0}ms p95 {:.0}ms | throughput: median {:.2} tok/s | gap p95 {:.0}ms",
+        "ttft: median {:.0}ms p95 {:.0}ms | throughput: median {:.2} tok/s end-to-end{} | gap p95 {:.0}ms",
         run.summary.ttft_median_ms,
         run.summary.ttft_p95_ms,
         run.summary.throughput_median_tps,
+        match run.summary.throughput_decode_median_tps {
+            Some(d) => format!(" ({d:.2} tok/s decode-only)"),
+            None => String::new(),
+        },
         run.summary.gap_p95_ms
     ));
     lines.push(format!(

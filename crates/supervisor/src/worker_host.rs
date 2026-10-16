@@ -182,7 +182,7 @@ fn serve(stream: UnixStream, kind: EngineKind) -> Result<()> {
                 engine.shutdown();
                 return Ok(());
             }
-            PollResult::Frame(frame) => match frame {
+            PollResult::Frame(frame) => match *frame {
                 WorkerFrame::Load {
                     plan,
                     artifact,
@@ -220,6 +220,7 @@ fn serve(stream: UnixStream, kind: EngineKind) -> Result<()> {
                                 &WorkerFrame::Loaded {
                                     note,
                                     footprint_bytes: crate::host_footprint_bytes(),
+                                    resolved_kernels: engine.identity().kernels,
                                 },
                             )?;
                         }
@@ -507,17 +508,16 @@ fn drain_control(
 ) -> Result<()> {
     loop {
         match poll_frame(reader, Duration::ZERO)? {
-            PollResult::Frame(WorkerFrame::Cancel { .. }) => {
-                cancel.store(true, Ordering::Relaxed);
-            }
-            PollResult::Frame(WorkerFrame::Shutdown) => {
-                cancel.store(true, Ordering::Relaxed);
-            }
-            PollResult::Frame(WorkerFrame::Control { action }) => {
-                let result = apply_control(&action, trim_epoch, prefetch_enabled);
-                write_frame_best_effort(writer, &WorkerFrame::ControlAck { action, result });
-            }
-            PollResult::Frame(_) => { /* ignore other frames mid-run */ }
+            PollResult::Frame(frame) => match *frame {
+                WorkerFrame::Cancel { .. } | WorkerFrame::Shutdown => {
+                    cancel.store(true, Ordering::Relaxed);
+                }
+                WorkerFrame::Control { action } => {
+                    let result = apply_control(&action, trim_epoch, prefetch_enabled);
+                    write_frame_best_effort(writer, &WorkerFrame::ControlAck { action, result });
+                }
+                _ => { /* ignore other frames mid-run */ }
+            },
             PollResult::Timeout => return Ok(()),
             PollResult::Eof => {
                 cancel.store(true, Ordering::Relaxed);
@@ -528,7 +528,9 @@ fn drain_control(
 }
 
 enum PollResult {
-    Frame(WorkerFrame),
+    // Boxed: control frames got large with record-bearing payloads (stats,
+    // loaded identities) and the timeout path must stay tiny.
+    Frame(Box<WorkerFrame>),
     Timeout,
     Eof,
 }
@@ -565,7 +567,7 @@ fn poll_frame(reader: &RefCell<UnixStream>, timeout: Duration) -> Result<PollRes
         .set_read_timeout(Some(Duration::from_secs(5)))
         .map_err(TuckmillError::from)?;
     match WorkerFrame::read_from(&mut *stream)? {
-        Some(frame) => Ok(PollResult::Frame(frame)),
+        Some(frame) => Ok(PollResult::Frame(Box::new(frame))),
         None => Ok(PollResult::Eof),
     }
 }

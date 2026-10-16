@@ -503,6 +503,9 @@ fn identity_trio(worker: &IsolatedWorker) -> EngineIdentity {
     id.engine = worker.engine.clone();
     id.certified = worker.certified;
     id.build_id = worker.worker_build.clone();
+    if !worker.resolved_kernels.is_empty() {
+        id.kernels = worker.resolved_kernels.clone();
+    }
     id
 }
 

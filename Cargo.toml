@@ -14,7 +14,7 @@ members = [
 [workspace.package]
 version = "0.2.0"
 edition = "2021"
-rust-version = "1.94"
+rust-version = "1.96"
 # Provisional: open-source core is recommended by the PRD (S17); final licensing
 # decision (ADR) is still pending. Do not publish artifacts before clearance.
 license = "Apache-2.0"

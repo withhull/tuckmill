@@ -35,6 +35,9 @@ pub struct IsolatedWorker {
     pub worker_build: String,
     pub engine: String,
     pub certified: bool,
+    /// Kernel ids resolved by the backend at load (empty until loaded or
+    /// for engines without kernel selection).
+    pub resolved_kernels: Vec<String>,
     last_frame: Instant,
     /// Governor commands queued by other threads; the generate/score loops
     /// flush them to the worker as Control frames at read checkpoints.
@@ -99,6 +102,7 @@ impl IsolatedWorker {
             worker_build: String::new(),
             engine: String::new(),
             certified: false,
+            resolved_kernels: Vec::new(),
             last_frame: Instant::now(),
             pending_controls: Arc::new(Mutex::new(VecDeque::new())),
         };
@@ -146,7 +150,14 @@ impl IsolatedWorker {
         }
         .write_to(&mut self.stream)?;
         match self.read_frame_skipping_heartbeats(FRAME_TIMEOUT)? {
-            Some(WorkerFrame::Loaded { note, .. }) => Ok(note),
+            Some(WorkerFrame::Loaded {
+                note,
+                resolved_kernels,
+                ..
+            }) => {
+                self.resolved_kernels = resolved_kernels;
+                Ok(note)
+            }
             Some(WorkerFrame::Error {
                 code,
                 message,
@@ -240,6 +251,10 @@ impl IsolatedWorker {
                     on_state(s);
                 }
                 Some(WorkerFrame::Heartbeat { .. }) => {}
+                // The governor's Control frames are acknowledged at the next
+                // safe checkpoint; that ACK legitimately lands mid-generation
+                // (the scoring loop already tolerates it). Never a violation.
+                Some(WorkerFrame::ControlAck { .. }) => {}
                 Some(WorkerFrame::Done {
                     reason,
                     committed: c,
@@ -305,20 +320,31 @@ impl IsolatedWorker {
     /// Query worker statistics.
     pub fn stats(&mut self) -> Result<(u64, u64, Option<BackendStats>)> {
         WorkerFrame::Stats.write_to(&mut self.stream)?;
-        match self.read_frame_skipping_heartbeats(FRAME_TIMEOUT)? {
-            Some(WorkerFrame::StatsAck {
-                footprint_bytes,
-                uptime_ms,
-                backend,
-            }) => Ok((footprint_bytes, uptime_ms, backend)),
-            Some(other) => Err(TuckmillError::new(
-                ErrorCode::WorkerFailed,
-                format!("expected StatsAck, got {other:?}"),
-            )),
-            None => Err(TuckmillError::new(
-                ErrorCode::WorkerFailed,
-                "worker closed during stats query",
-            )),
+        let deadline = Instant::now() + FRAME_TIMEOUT;
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            match self.read_frame_skipping_heartbeats(remaining)? {
+                Some(WorkerFrame::StatsAck {
+                    footprint_bytes,
+                    uptime_ms,
+                    backend,
+                }) => return Ok((footprint_bytes, uptime_ms, backend)),
+                // A governor ControlAck queued during a run may arrive here;
+                // it is expected traffic, never a protocol violation.
+                Some(WorkerFrame::ControlAck { .. }) => continue,
+                Some(other) => {
+                    return Err(TuckmillError::new(
+                        ErrorCode::WorkerFailed,
+                        format!("expected StatsAck, got {other:?}"),
+                    ))
+                }
+                None => {
+                    return Err(TuckmillError::new(
+                        ErrorCode::WorkerFailed,
+                        "worker closed during stats query",
+                    ))
+                }
+            }
         }
     }
 
@@ -595,6 +621,16 @@ mod tests {
         };
         let note = worker.load(&plan, &artifact, None).unwrap();
         assert!(note.contains("synthetic"));
+
+        // Regression (observed live on the real 0.6B under memory pressure):
+        // a governor `trim-caches` queued before/during generation produces a
+        // ControlAck that lands mid-stream. The read loops must absorb it —
+        // it used to abort the run as "unexpected frame".
+        worker
+            .controls()
+            .lock()
+            .unwrap()
+            .push_back("trim-caches".to_string());
 
         let cancel = Arc::new(AtomicBool::new(false));
         let pause = Arc::new(AtomicBool::new(false));

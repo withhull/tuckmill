@@ -12,7 +12,7 @@ use serde::Deserialize;
 
 use tuckmill_backend::{
     ArtifactRef, BackendCapabilities, BackendId, BackendStats, FinishReason, GenControl,
-    GenOutcome, GenerateRequest, InferenceBackend, RunState,
+    GenOutcome, GenerateRequest, InferenceBackend, RunState, StorageStats,
 };
 use tuckmill_manifest::adapter::AdapterRegistry;
 use tuckmill_manifest::error::{ErrorCode, Result, TuckmillError};
@@ -24,7 +24,8 @@ use crate::completion::CompletionTracker;
 use crate::forward::{
     self, Forward, KvPrecision, KvState, ModelWeights, NumericalProfile, ProfileCounters,
 };
-use crate::loader::{BlockLoader, BlockPolicy};
+use crate::kernels::{KernelSelection, ResolvedKernels};
+use crate::loader::{BlockLoader, BlockPolicy, StorageSelection};
 use crate::model;
 use crate::sampling::{self, Rng, SamplingConfig};
 use crate::tensor;
@@ -52,6 +53,14 @@ struct TuckCoreOptions {
     verify_content_hash: Option<bool>,
     /// Enable phase profiling counters (also via TUCKMILL_TUCKORE_PROFILE=1).
     profile: Option<bool>,
+    /// Kernel implementation: "auto" (default; NEON where the target has
+    /// it), "scalar" (force the portable reference kernels), or "neon"
+    /// (require NEON; refused where unavailable).
+    kernels: Option<KernelSelection>,
+    /// Weight-block storage: "auto" (default; map when possible), "mapped"
+    /// (require the zero-copy mapping), or "owned" (always copy into
+    /// bounded buffers).
+    storage: Option<StorageSelection>,
 }
 
 struct Loaded {
@@ -63,6 +72,7 @@ struct Loaded {
     profile: NumericalProfile,
     kv_precision: KvPrecision,
     counters: ProfileCounters,
+    kernels: ResolvedKernels,
 }
 
 /// The experimental custom native executor.
@@ -116,14 +126,17 @@ impl TuckCore {
     }
 
     /// Engine identity (inherent form so the supervisor can query the
-    /// backend's declared identity before any worker or load exists).
+    /// backend's declared identity before any worker or load exists). After
+    /// a load, `kernels` names the kernel package and the *resolved*
+    /// implementation actually selected; before a load it declares the
+    /// package without claiming an implementation.
     pub fn identity(&self) -> EngineIdentity {
         EngineIdentity {
             engine: BackendId::TuckCore.as_str().to_string(),
             certified: false,
             backend_abi_version: BACKEND_ABI_VERSION,
             worker_protocol_version: WORKER_PROTOCOL_VERSION,
-            kernels: vec!["scalar-f32-reference".to_string()],
+            kernels: kernel_ids(self.loaded.as_ref().map(|l| l.kernels)),
             build_id: crate::format_build_id(),
         }
     }
@@ -202,6 +215,8 @@ impl InferenceBackend for TuckCore {
             enabled: profile_enabled,
             ..Default::default()
         };
+        let kernels = opts.kernels.unwrap_or(KernelSelection::Auto).resolve()?;
+        let storage_selection = opts.storage.unwrap_or(StorageSelection::Auto);
         let load_start = Instant::now();
         let kv_precision = match opts.kv_precision.as_deref() {
             None | Some("f32") => KvPrecision::F32,
@@ -248,15 +263,33 @@ impl InferenceBackend for TuckCore {
                 ));
             }
         }
-        // Full-payload identity: one bounded streaming pass over the file,
-        // compared against the store's recorded canonical digest. Drifted
-        // bytes must never execute; disabling is explicit and recorded.
+        // Open the artifact once. Content verification, the length check,
+        // and the weight mapping all use this exact handle — never a re-open
+        // by path — so the file identity that was verified is the file
+        // identity that executes. Store replacement is atomic (rename or
+        // unlink; see docs), and the length is re-checked after the
+        // verification pass to catch truncation during the window.
+        let artifact_file = std::fs::File::open(path).map_err(TuckmillError::from)?;
+        let opened_len = artifact_file.metadata().map_err(TuckmillError::from)?.len();
+        if opened_len != artifact.file_bytes {
+            return Err(TuckmillError::new(
+                ErrorCode::IntegrityFailure,
+                format!(
+                    "artifact file opened at {opened_len} bytes but the recorded identity says {}; refusing to execute",
+                    artifact.file_bytes
+                ),
+            )
+            .with_action("Re-import the artifact; never execute drifted weights."));
+        }
+        // Full-payload identity: one bounded streaming pass over the open
+        // file, compared against the store's recorded canonical digest.
+        // Drifted bytes must never execute; disabling is explicit and
+        // recorded.
         let verify_start = Instant::now();
         let content_verified = if verify_content_hash {
             match &artifact.content_hash {
                 Some(expected) => {
-                    let mut file = std::fs::File::open(path).map_err(TuckmillError::from)?;
-                    let mut reader = std::io::BufReader::with_capacity(1 << 20, &mut file);
+                    let mut reader = std::io::BufReader::with_capacity(1 << 20, &artifact_file);
                     let (actual, _) = tuckmill_manifest::digest::digest_reader(
                         &mut reader,
                         tuckmill_manifest::digest::DEFAULT_CHUNK_BYTES,
@@ -275,6 +308,15 @@ impl InferenceBackend for TuckCore {
         } else {
             false
         };
+        let post_len = artifact_file.metadata().map_err(TuckmillError::from)?.len();
+        if post_len != artifact.file_bytes {
+            return Err(TuckmillError::new(
+                ErrorCode::IntegrityFailure,
+                format!(
+                    "artifact changed size during verification ({post_len} bytes now); refusing to execute"
+                ),
+            ));
+        }
         ProfileCounters::record(&counters.content_verify_nanos, verify_start);
 
         // ---- configuration and type checks ----
@@ -310,16 +352,25 @@ impl InferenceBackend for TuckCore {
         let tokenizer = Tokenizer::from_gguf(&insp)?;
 
         let entries = forward::tensor_entries(&insp, policy.block_bytes);
-        let loader = Arc::new(BlockLoader::open(path, insp.data_start, entries, policy)?);
+        let loader = Arc::new(BlockLoader::open_file(
+            artifact_file,
+            insp.data_start,
+            entries,
+            policy,
+            storage_selection,
+            Some(artifact.file_bytes),
+        )?);
         let tracker = Arc::new(CompletionTracker::new());
         let weights = forward::prepare(&loader, cfg.clone(), names)?;
         let payload: u64 = insp.tensors.iter().map(|t| t.byte_size).sum();
 
         let mut note = format!(
-            "tuckcore (experimental, uncertified): dense Qwen3, {} layers, vocab {}, byte-level BPE tokenizer, scalar kernels [{}], kv {}; real weights from {} ({} payload), weight cache {}, block {}",
+            "tuckcore (experimental, uncertified): dense Qwen3, {} layers, vocab {}, byte-level BPE tokenizer, kernels {} [{}] (K01 scope: Q8_0/F16 CPU fused dot; Q4 and Metal unbuilt), weights {}; kv {}; real weights from {} ({} payload), weight cache {}, block {}",
             cfg.layers,
             cfg.vocab,
+            kernels.as_str(),
             profile.as_str(),
+            loader.storage_mode().as_str(),
             kv_precision.as_str(),
             artifact.path,
             tuckmill_manifest::units::Bytes(payload),
@@ -348,6 +399,7 @@ impl InferenceBackend for TuckCore {
             profile,
             kv_precision,
             counters,
+            kernels,
         });
         Ok(note)
     }
@@ -403,6 +455,7 @@ impl InferenceBackend for TuckCore {
             tracker: &loaded.tracker,
             weights: &loaded.weights,
             profile: loaded.profile,
+            kernels: loaded.kernels,
             control: &control,
             counters: if loaded.counters.enabled {
                 Some(&loaded.counters)
@@ -529,6 +582,7 @@ impl InferenceBackend for TuckCore {
             tracker: &loaded.tracker,
             weights: &loaded.weights,
             profile: loaded.profile,
+            kernels: loaded.kernels,
             control: &control,
             counters: if loaded.counters.enabled {
                 Some(&loaded.counters)
@@ -562,16 +616,34 @@ impl InferenceBackend for TuckCore {
         match &self.loaded {
             Some(loaded) => {
                 let s = loaded.loader.stats();
+                let residency = loaded.loader.residency();
                 BackendStats {
                     logical_read_bytes: s.logical_read_bytes,
                     blocks_loaded: s.blocks_loaded,
                     cache_hits: s.cache_hits,
                     cache_misses: s.cache_misses,
-                    evictions: s.evictions,
+                    evictions: s.cache_entry_evictions,
                     in_flight_leases: loaded.tracker.in_flight() as u64,
+                    buffer_releases: Some(loaded.tracker.completed()),
+                    released_bytes: Some(loaded.tracker.released_bytes()),
+                    storage: Some(StorageStats {
+                        mode: s.storage_mode.clone(),
+                        owned_cache_bytes: s.owned_cache_bytes,
+                        owned_in_flight_bytes: loaded.tracker.in_flight_owned_bytes(),
+                        mapped_vm_bytes: s.mapped_vm_bytes,
+                        mapped_resident_bytes: residency.as_ref().map(|r| r.resident_bytes),
+                        mapped_resident_sampled: residency
+                            .as_ref()
+                            .map(|r| r.sampled)
+                            .unwrap_or(false),
+                        page_size_bytes: residency.as_ref().map(|r| r.page_size_bytes).unwrap_or(0),
+                        page_advice_bytes: s.page_advice_bytes,
+                    }),
                     footprint_bytes: None,
                     kv_precision: Some(loaded.kv_precision.as_str().to_string()),
                     threads: Some(1), // scalar executor is single-threaded
+                    kernel_impl: Some(loaded.kernels.as_str().to_string()),
+                    numerical_profile: Some(loaded.profile.as_str().to_string()),
                     profile: if loaded.counters.enabled {
                         let c = &loaded.counters;
                         let ns = |a: &std::sync::atomic::AtomicU64| {
@@ -608,6 +680,16 @@ impl InferenceBackend for TuckCore {
             // Leases must have drained; anything left would be a bug.
             debug_assert_eq!(loaded.tracker.in_flight(), 0);
         }
+    }
+}
+
+/// Kernel-package identifiers for identity records: K01 covers Q8_0/F16
+/// CPU fused dot only (Q4 acceleration and Metal are not implemented); the
+/// implementation suffix is the resolved selection, "auto" before a load.
+fn kernel_ids(impl_: Option<ResolvedKernels>) -> Vec<String> {
+    match impl_ {
+        Some(k) => vec![format!("K01:q8_0+f16:{}", k.as_str())],
+        None => vec!["K01:q8_0+f16:auto".to_string()],
     }
 }
 
@@ -719,7 +801,11 @@ mod tests {
             )
             .unwrap();
         assert!(note.contains("uncertified"));
-        assert!(note.contains("scalar kernels [oracle-f32]"));
+        assert!(
+            note.contains("kernels neon [oracle-f32]")
+                || note.contains("kernels scalar [oracle-f32]")
+        );
+        assert!(note.contains("K01 scope: Q8_0/F16 CPU fused dot"));
         let identity = engine.identity();
         assert_eq!(identity.engine, "tuckcore");
         assert!(!identity.certified);

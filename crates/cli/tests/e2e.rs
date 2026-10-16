@@ -427,6 +427,90 @@ fn corrupted_store_payload_is_refused_before_execution() {
 }
 
 #[test]
+fn truncated_payload_is_refused_by_the_isolated_worker() {
+    // Truncation must be caught by the size check on the very file object
+    // the worker opens for execution — never mapped or executed.
+    let env = TestEnv::new();
+    let fixture = env.fixture.display().to_string();
+    let out = env.run_ok(&["import", &fixture, "--alias", "m", "--json"]);
+    let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+    let id = v["artifact"]["artifact_id"].as_str().unwrap().to_string();
+    let payload = env
+        .data_dir
+        .join("artifacts")
+        .join(&id[..16])
+        .join("model.bin");
+    let len = std::fs::metadata(&payload).unwrap().len();
+    let f = std::fs::OpenOptions::new()
+        .write(true)
+        .open(&payload)
+        .unwrap();
+    f.set_len(len - 1).unwrap();
+
+    let (code, _, stderr) = env.run(&[
+        "run",
+        "m",
+        "--prompt",
+        "x",
+        "--engine",
+        "tuckcore",
+        "--max-output",
+        "2",
+    ]);
+    assert_eq!(code, 1, "truncated payload must not execute");
+    // Refused by the typed gates (artifact inspection or the identity/digest
+    // check), with a next action — never executed and never a panic.
+    assert!(
+        stderr.contains("INTEGRITY_FAILURE") || stderr.contains("INVALID_ARTIFACT"),
+        "expected a typed integrity refusal for the truncated file: {stderr}"
+    );
+    assert!(
+        stderr.contains("next:"),
+        "typed errors carry an action: {stderr}"
+    );
+}
+
+#[test]
+fn replaced_payload_is_refused_by_the_isolated_worker() {
+    // Replacing the payload path with different bytes (rename) must be
+    // refused: the recorded identity no longer matches what opens.
+    let env = TestEnv::new();
+    let fixture = env.fixture.display().to_string();
+    let out = env.run_ok(&["import", &fixture, "--alias", "m", "--json"]);
+    let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+    let id = v["artifact"]["artifact_id"].as_str().unwrap().to_string();
+    let payload = env
+        .data_dir
+        .join("artifacts")
+        .join(&id[..16])
+        .join("model.bin");
+    let len = std::fs::metadata(&payload).unwrap().len();
+    let impostor = env._dir.path().join("impostor.bin");
+    std::fs::write(&impostor, vec![0u8; len as usize]).unwrap();
+    std::fs::rename(&impostor, &payload).unwrap();
+
+    let (code, _, stderr) = env.run(&[
+        "run",
+        "m",
+        "--prompt",
+        "x",
+        "--engine",
+        "tuckcore",
+        "--max-output",
+        "2",
+    ]);
+    assert_eq!(code, 1, "replaced payload must not execute");
+    assert!(
+        stderr.contains("INTEGRITY_FAILURE") || stderr.contains("INVALID_ARTIFACT"),
+        "expected a typed integrity refusal for the replaced file: {stderr}"
+    );
+    assert!(
+        stderr.contains("next:"),
+        "typed errors carry an action: {stderr}"
+    );
+}
+
+#[test]
 fn adversarial_metadata_is_bounded() {
     // A GGUF with an absurd tensor count must be rejected without allocation.
     let env = TestEnv::new();

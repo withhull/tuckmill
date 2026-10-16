@@ -21,19 +21,28 @@ pub mod tokenizer;
 
 pub use completion::{CompletionTracker, Lease};
 pub use executor::TuckCore;
-pub use loader::{BlockLoader, BlockPolicy, LoaderSnapshot, TensorEntry, WeightBlock};
+pub use kernels::{KernelSelection, ResolvedKernels};
+pub use loader::{
+    BlockLoader, BlockPolicy, LoaderSnapshot, ResidencySample, ResolvedStorage, StorageSelection,
+    TensorEntry, WeightBlock,
+};
 
 mod executor;
 
-/// Build identity for engine records.
+/// Build identity for engine records: package version, build profile,
+/// target architecture, and source revision. Kernel implementation and
+/// storage choices are runtime-resolved and recorded per load
+/// (stats/identity) — a build id alone never identifies them.
 pub fn format_build_id() -> String {
     format!(
-        "tuckmill-tuckcore {} ({})",
+        "tuckmill-tuckcore {} ({}, {}, rev {})",
         env!("CARGO_PKG_VERSION"),
         if cfg!(debug_assertions) {
             "debug"
         } else {
             "release"
-        }
+        },
+        std::env::consts::ARCH,
+        env!("TUCKMILL_SOURCE_REV")
     )
 }

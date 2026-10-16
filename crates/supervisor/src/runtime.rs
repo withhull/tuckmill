@@ -468,6 +468,9 @@ impl Runtime {
                 id.engine = s.worker.engine.clone();
                 id.certified = s.worker.certified;
                 id.build_id = s.worker.worker_build.clone();
+                if !s.worker.resolved_kernels.is_empty() {
+                    id.kernels = s.worker.resolved_kernels.clone();
+                }
                 return id;
             }
         }

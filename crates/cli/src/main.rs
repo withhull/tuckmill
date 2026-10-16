@@ -136,6 +136,15 @@ enum Cmd {
         /// never for arithmetic diagnostics). Requires --engine llama.
         #[arg(long)]
         gpu_layers: Option<i32>,
+        /// Kernel implementation for tuckcore: auto (default; NEON where
+        /// available), scalar (force the reference kernels), neon.
+        #[arg(long)]
+        kernels: Option<String>,
+        /// Weight-block storage for tuckcore: auto (default; map when
+        /// possible), mapped (require zero-copy views), owned (copied
+        /// bounded buffers).
+        #[arg(long)]
+        storage: Option<String>,
     },
 
     /// Serve the local API on loopback.
@@ -194,6 +203,12 @@ enum Cmd {
         /// qualified, not just calibrated).
         #[arg(long)]
         held_out: bool,
+        /// Kernel implementation to exercise: auto (default), scalar, neon.
+        #[arg(long)]
+        kernels: Option<String>,
+        /// Weight-block storage to exercise: auto (default), mapped, owned.
+        #[arg(long)]
+        storage: Option<String>,
     },
 
     /// Run the standard benchmark suite and write a machine-readable record.
@@ -223,6 +238,15 @@ enum Cmd {
         /// never for arithmetic diagnostics). Requires --engine llama.
         #[arg(long)]
         gpu_layers: Option<i32>,
+        /// Kernel implementation for tuckcore: auto (default; NEON where
+        /// available), scalar (force the reference kernels), neon.
+        #[arg(long)]
+        kernels: Option<String>,
+        /// Weight-block storage for tuckcore: auto (default; map when
+        /// possible), mapped (require zero-copy views), owned (copied
+        /// bounded buffers).
+        #[arg(long)]
+        storage: Option<String>,
     },
 
     /// Show backend statistics and profile counters after a short probe run.
@@ -235,6 +259,12 @@ enum Cmd {
         /// Probe tokens to process before reporting.
         #[arg(long, default_value_t = 3)]
         tokens: u64,
+        /// Kernel implementation to exercise while probing.
+        #[arg(long)]
+        kernels: Option<String>,
+        /// Weight-block storage to exercise while probing.
+        #[arg(long)]
+        storage: Option<String>,
     },
 
     /// Cache inventory and garbage collection.

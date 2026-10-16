@@ -304,6 +304,19 @@ pub struct PromptSample {
     pub gap_max_ms: f64,
     pub footprint_peak_bytes: u64,
     pub logical_read_bytes: u64,
+    /// Decode-only throughput: committed tokens after the first, divided by
+    /// the time from the first committed token to the last. `None` when the
+    /// run produced fewer than two tokens. Never compare this with another
+    /// engine's end-to-end rate without saying which one is meant.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub throughput_decode_tps: Option<f64>,
+    /// Resolved kernel implementation actually used, when the backend
+    /// selects kernels ("scalar"/"neon").
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kernel_impl: Option<String>,
+    /// Resolved weight-storage mode actually used ("mapped"/"owned").
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub storage_mode: Option<String>,
     #[serde(default)]
     pub notes: Vec<String>,
 }
@@ -312,7 +325,13 @@ pub struct PromptSample {
 pub struct SummaryStats {
     pub ttft_median_ms: f64,
     pub ttft_p95_ms: f64,
+    /// End-to-end output throughput (committed tokens / total request time,
+    /// including the wait before the first token).
     pub throughput_median_tps: f64,
+    /// Median decode-only throughput over samples that produced one. See
+    /// `PromptSample::throughput_decode_tps`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub throughput_decode_median_tps: Option<f64>,
     pub gap_p95_ms: f64,
     pub completion_rate: f64,
     pub footprint_peak_bytes: u64,

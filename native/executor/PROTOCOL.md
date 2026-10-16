@@ -1,4 +1,4 @@
-# Worker control protocol (v4)
+# Worker control protocol (v5)
 
 Wire contract between the Tuckmill supervisor and an execution worker. The
 transport is a private Unix domain socket under the store's `tmp/` directory.
@@ -26,6 +26,11 @@ payload := UTF-8 JSON, one message object
   speculative prefetch exists in this build). Workers emit heartbeats from a
   helper thread during long single-step compute, and supervisors skip
   heartbeats when awaiting meaningful frames. Older plans are `PLAN_STALE`.
+- v5: `Loaded` carries `resolved_kernels` — the kernel ids the backend
+  actually resolved at load (e.g. `K01:q8_0+f16:neon`). Supervisors record
+  them into engine identities so benchmark and verification records name the
+  implementation that ran, not a build-time guess. Older workers omit the
+  field (defaults to empty).
 - Clean EOF before the first byte of a frame closes the session. EOF mid-frame
   is `WORKER_FAILED`.
 - All fields are validated before use; unknown message tags are protocol
@@ -46,7 +51,7 @@ Every message is a JSON object with `"t"` as the tag:
 | `Hello` | C→W | `protocol`, `abi`, `client_build` | Must be the first frame. |
 | `HelloAck` | W→C | `protocol`, `abi`, `worker_build`, `engine`, `certified` | Protocol/ABI mismatch fails closed. |
 | `Load` | C→W | `plan` (full ExecutionPlan JSON), `artifact` (`ArtifactRef`: path + identity hashes), optional `options` | The backend must re-verify the artifact hashes before executing; options are validated and unknown keys rejected. |
-| `Loaded` | W→C | `note`, `footprint_bytes` | `note` must disclose synthetic engines and experimental kernels. |
+| `Loaded` | W→C | `note`, `footprint_bytes`, `resolved_kernels` (v5) | `note` must disclose synthetic engines and experimental kernels; `resolved_kernels` names the implementation actually selected. |
 | `Generate` | C→W | `request_id`, `prompt_tokens` (exact IDs), `max_output_tokens`, `stop`, `seed` | Prompt+output must fit the admitted context. |
 | `State` | W→C | `state` ∈ warming/prefilling/generating/throttling/paused | Advisory progress. |
 | `Token` | W→C | `index`, `text` | Committed tokens only. Draft text is forbidden. |

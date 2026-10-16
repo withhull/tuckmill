@@ -14,6 +14,7 @@ use tuckmill_manifest::error::{ErrorCode, Result, TuckmillError};
 use tuckmill_manifest::gguf::GgufInspection;
 
 use crate::completion::CompletionTracker;
+use crate::kernels::ResolvedKernels;
 use crate::loader::{BlockLoader, TensorEntry};
 use crate::model::{Qwen3Config, TensorNames};
 use crate::tensor::{self, f16_to_f32, f32_to_f16_bits, quantize_row_q8_0};
@@ -338,6 +339,9 @@ pub struct Forward<'a> {
     pub tracker: &'a CompletionTracker,
     pub weights: &'a ModelWeights,
     pub profile: NumericalProfile,
+    /// Resolved packed-kernel implementation (K01). Reported in stats and
+    /// records; `Scalar` forces the portable reference kernels.
+    pub kernels: ResolvedKernels,
     /// Called between chunks/layers: services external control (poll hook)
     /// and applies pending cache trims at a safe point. Never releases
     /// in-flight buffers (pinned chunks are protected by the loader).
@@ -700,8 +704,8 @@ impl<'a> Forward<'a> {
             for r in 0..rows_in_block {
                 let row_bytes = &bytes[r * bytes_per_row..(r + 1) * bytes_per_row];
                 let acc = match entry.type_id {
-                    8 => crate::kernels::dot_q8_0_x_f32(row_bytes, x),
-                    1 => crate::kernels::dot_f16_x_f32(row_bytes, x),
+                    8 => crate::kernels::dot_q8_0_x_f32(self.kernels, row_bytes, x)?,
+                    1 => crate::kernels::dot_f16_x_f32(self.kernels, row_bytes, x)?,
                     _ => unreachable!("matvec_fused is entered only for Q8_0/F16"),
                 };
                 out[first_row + r] = acc;
@@ -734,7 +738,7 @@ impl<'a> Forward<'a> {
         let first_row = (chunk * rows_per_chunk) as usize;
         for r in 0..rows_in_block {
             let row_bytes = &bytes[r * bytes_per_row..(r + 1) * bytes_per_row];
-            out[first_row + r] = crate::kernels::dot_q8_0_q8_0(row_bytes, x_qs, x_d);
+            out[first_row + r] = crate::kernels::dot_q8_0_q8_0(self.kernels, row_bytes, x_qs, x_d)?;
         }
         Ok(())
     }
@@ -753,7 +757,7 @@ impl<'a> Forward<'a> {
         let first_row = (chunk * rows_per_chunk) as usize;
         for r in 0..rows_in_block {
             let row_bytes = &bytes[r * bytes_per_row..(r + 1) * bytes_per_row];
-            out[first_row + r] = crate::kernels::dot_f16_x_f32(row_bytes, x16);
+            out[first_row + r] = crate::kernels::dot_f16_x_f32(self.kernels, row_bytes, x16)?;
         }
         Ok(())
     }
@@ -1039,6 +1043,7 @@ mod tests {
             tracker: &f.tracker,
             weights: &f.weights,
             profile: NumericalProfile::OracleF32,
+            kernels: ResolvedKernels::default_for_target(),
             control: &|| {},
             counters: None,
         };
@@ -1069,6 +1074,7 @@ mod tests {
             tracker: &resident.tracker,
             weights: &resident.weights,
             profile: NumericalProfile::OracleF32,
+            kernels: ResolvedKernels::default_for_target(),
             control: &|| {},
             counters: None,
         }
@@ -1079,6 +1085,7 @@ mod tests {
             tracker: &streamed.tracker,
             weights: &streamed.weights,
             profile: NumericalProfile::OracleF32,
+            kernels: ResolvedKernels::default_for_target(),
             control: &|| {},
             counters: None,
         }
@@ -1087,11 +1094,12 @@ mod tests {
         assert_eq!(a, b, "scheduling must not change the numbers");
         let stats = streamed.loader.stats();
         assert!(
-            stats.evictions > 0,
+            stats.cache_entry_evictions > 0,
             "streamed run must exercise eviction: {stats:?}"
         );
         assert!(
-            resident.loader.stats().evictions == 0 || resident.loader.stats().blocks_loaded > 0
+            resident.loader.stats().cache_entry_evictions == 0
+                || resident.loader.stats().blocks_loaded > 0
         );
         assert_eq!(streamed.tracker.in_flight(), 0);
     }
@@ -1107,6 +1115,7 @@ mod tests {
             tracker: &f.tracker,
             weights: &f.weights,
             profile: NumericalProfile::OracleF32,
+            kernels: ResolvedKernels::default_for_target(),
             control: &|| {},
             counters: None,
         };
@@ -1127,6 +1136,7 @@ mod tests {
             tracker: &f.tracker,
             weights: &f.weights,
             profile: NumericalProfile::OracleF32,
+            kernels: ResolvedKernels::default_for_target(),
             control: &|| {},
             counters: None,
         }
@@ -1137,6 +1147,7 @@ mod tests {
             tracker: &f.tracker,
             weights: &f.weights,
             profile: NumericalProfile::LlamaCpu,
+            kernels: ResolvedKernels::default_for_target(),
             control: &|| {},
             counters: None,
         }
@@ -1163,6 +1174,7 @@ mod tests {
             tracker: &f.tracker,
             weights: &f.weights,
             profile: NumericalProfile::OracleF32,
+            kernels: ResolvedKernels::default_for_target(),
             control: &|| {},
             counters: None,
         };
@@ -1178,6 +1190,7 @@ mod tests {
             tracker: &f.tracker,
             weights: &f.weights,
             profile: NumericalProfile::OracleF32,
+            kernels: ResolvedKernels::default_for_target(),
             control: &|| {},
             counters: None,
         };
