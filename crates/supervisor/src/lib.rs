@@ -11,6 +11,7 @@ pub mod bench;
 pub mod engine;
 pub mod governor;
 pub mod log;
+pub mod options;
 pub mod pressure;
 pub mod proto;
 pub mod queue;

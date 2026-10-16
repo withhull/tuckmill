@@ -47,4 +47,4 @@ pub const BACKEND_ABI_VERSION: u32 = 1;
 /// v4: Control/ControlAck frames give the governor a real command contract
 /// (cache trim, prefetch control) applied by engines at safe checkpoints.
 /// Plans recorded against older versions are PLAN_STALE.
-pub const WORKER_PROTOCOL_VERSION: u16 = 5;
+pub const WORKER_PROTOCOL_VERSION: u16 = 6;

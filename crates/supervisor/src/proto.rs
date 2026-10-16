@@ -72,6 +72,10 @@ pub enum WorkerFrame {
     Done {
         reason: String,
         committed: u64,
+        /// Worker-side timing for this request (v6); absent for backends
+        /// that do not measure it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        timing: Option<tuckmill_backend::RequestTiming>,
     },
     Error {
         code: String,
@@ -282,6 +286,12 @@ mod tests {
             WorkerFrame::Done {
                 reason: "stop".into(),
                 committed: 5,
+                timing: Some(tuckmill_backend::RequestTiming {
+                    total_ms: 12.5,
+                    prefill_ms: Some(3.0),
+                    first_token_ms: Some(4.0),
+                    decode_ms: Some(8.5),
+                }),
             },
             WorkerFrame::Error {
                 code: "WORKER_FAILED".into(),

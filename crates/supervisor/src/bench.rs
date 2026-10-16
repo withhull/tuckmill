@@ -148,7 +148,17 @@ pub fn run_standard_bench(
         );
         let prompt = prompt_tokens_for(&prompt_id, options.input_tokens, vocab);
 
+        // Baseline counters are captured while the worker is idle (before
+        // dispatch). The measurement starts before the request is submitted,
+        // and events are consumed immediately: nothing that can block on the
+        // busy worker ever sits between dispatch and the timer or the drain.
+        let logical_reads_before = runtime
+            .backend_stats()
+            .map(|s| s.logical_read_bytes)
+            .unwrap_or(0);
+
         let ticket = runtime.submit()?;
+        let t0 = Instant::now();
         let run = runtime.start_run(
             &ticket,
             plan.clone(),
@@ -159,16 +169,12 @@ pub fn run_standard_bench(
             rep as u64,
         )?;
 
-        let logical_reads_before = runtime
-            .backend_stats()
-            .map(|s| s.logical_read_bytes)
-            .unwrap_or(0);
-        let t0 = Instant::now();
         let mut first_token_at: Option<Instant> = None;
         let mut last_token_at: Option<Instant> = None;
         let mut gaps: Vec<f64> = Vec::new();
         let mut committed: u64 = 0;
         let mut failure: Option<String> = None;
+        let mut worker_timing: Option<tuckmill_backend::RequestTiming> = None;
 
         // Footprint sampling alongside event consumption.
         let sample_stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -209,7 +215,10 @@ pub fn run_standard_bench(
                     // Reuse the token text length guard: reference tokens are
                     // fixed-size; nothing is assumed about content.
                 }
-                Ok(RunEvent::Done { .. }) => break,
+                Ok(RunEvent::Done { timing, .. }) => {
+                    worker_timing = timing;
+                    break;
+                }
                 Ok(RunEvent::Error { code, message, .. }) => {
                     failure = Some(format!("{code}: {message}"));
                     break;
@@ -287,6 +296,9 @@ pub fn run_standard_bench(
             footprint_peak_bytes: run_peak,
             logical_read_bytes,
             throughput_decode_tps: decode_tps,
+            worker_total_ms: worker_timing.as_ref().map(|t| t.total_ms),
+            worker_prefill_ms: worker_timing.as_ref().and_then(|t| t.prefill_ms),
+            worker_decode_ms: worker_timing.as_ref().and_then(|t| t.decode_ms),
             kernel_impl,
             storage_mode,
             notes,
@@ -363,9 +375,10 @@ pub fn run_standard_bench(
     }
 
     let run = BenchmarkRun {
-        // 2: adds decode-only throughput fields (throughput_decode_tps /
-        //    throughput_decode_median_tps); both are optional, v1 records parse.
-        schema_version: 2,
+        // 2: decode-only throughput fields. 3: worker-side component timings
+        //    (worker_total_ms / worker_prefill_ms / worker_decode_ms); all
+        //    optional, older records parse.
+        schema_version: 3,
         run_id: Id::new("0".repeat(64)).expect("zero id"),
         started_unix_ms: started,
         device_id: plan.device_id.clone(),
@@ -492,6 +505,7 @@ pub fn format_summary(run: &BenchmarkRun) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tuckmill_manifest::units::Bytes;
 
     #[test]
     fn suite_definition_is_consistent() {
@@ -521,5 +535,138 @@ mod tests {
         assert_eq!(percentile(&mut v, 0.5), 3.0);
         assert_eq!(percentile(&mut v, 1.0), 5.0);
         assert_eq!(percentile(&mut [], 0.5), 0.0);
+    }
+
+    fn bench_setup() -> (tempfile::TempDir, Arc<Runtime>) {
+        use crate::runtime::{EngineMode, Runtime, RuntimeOptions};
+        use tuckmill_manifest::testing::{write_synthetic, SyntheticConfig};
+        use tuckmill_manifest::units::Bytes;
+        use tuckmill_store::StoreLayout;
+
+        let dir = tempfile::tempdir().unwrap();
+        let layout = StoreLayout::open(dir.path().join("store"));
+        let src = dir.path().join("m.gguf");
+        write_synthetic(&src, &SyntheticConfig::tiny_qwen3()).unwrap();
+        let registry = tuckmill_manifest::adapter::AdapterRegistry::builtin().unwrap();
+        tuckmill_store::import::import_local(
+            &layout,
+            &registry,
+            &src,
+            &tuckmill_store::import::ImportOptions {
+                alias: Some("local".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let signals = Arc::new(crate::pressure::MockSignalSource::new());
+        let runtime = Runtime::open(RuntimeOptions {
+            data_dir: Some(layout.root().to_path_buf()),
+            engine_mode: EngineMode::InProcess,
+            engine_kind: tuckmill_backend::EngineKind::ReferenceTest,
+            worker_exe: None,
+            queue_capacity: 2,
+            execution: crate::options::ExecutionOptions::default(),
+            default_budget: Some(Bytes::parse("2GiB").unwrap()),
+            default_context: 2048,
+            default_max_output: 256,
+            policy: tuckmill_planner::PlannerPolicy::default(),
+            signal_source: Some(signals),
+            governor_poll: Duration::from_millis(30),
+            governor_config: crate::governor::GovernorConfig {
+                stability_interval: Duration::from_millis(150),
+                min_dwell: Duration::from_millis(20),
+            },
+            monitor: true,
+            allow_test_engine: true,
+        })
+        .unwrap();
+        (dir, runtime)
+    }
+
+    /// The delayed test engine's per-token delay must appear in the measured
+    /// elapsed time, regardless of thread scheduling: the timer starts before
+    /// dispatch and events are drained immediately.
+    #[test]
+    fn delayed_engine_delay_is_included_in_the_measurement() {
+        let (_dir, runtime) = bench_setup();
+        // In-process placement pins a 2 ms per-token delay (runtime.rs).
+        let (artifact, adapter) = runtime.resolve_artifact("local").unwrap();
+        let plan = runtime
+            .plan_for(&artifact, &adapter, Bytes::parse("2GiB").unwrap(), 2048, 64)
+            .unwrap();
+        let artifact_ref = tuckmill_backend::ArtifactRef::from_record(
+            &artifact,
+            &runtime.layout.artifact_payload_path(&artifact.artifact_id),
+        );
+        let options = BenchOptions {
+            input_tokens: 8,
+            output_tokens: 24,
+            repetitions: 2,
+            ..Default::default()
+        };
+        let (run, _) = run_standard_bench(&runtime, &plan, &artifact_ref, &options).unwrap();
+        assert_eq!(run.samples.len(), 2, "warm repeated runs complete");
+        for sample in &run.samples {
+            assert_eq!(sample.committed_tokens, 24);
+            // 24 tokens at the 2 ms/token engine delay: the measurement must
+            // include at least the engine-side production time.
+            assert!(
+                sample.total_ms >= 24.0,
+                "measured total {} ms must include the engine delay",
+                sample.total_ms
+            );
+            assert!(
+                sample.ttft_ms >= 0.0 && sample.ttft_ms <= sample.total_ms,
+                "ttft {} within total {}",
+                sample.ttft_ms,
+                sample.total_ms
+            );
+            // Worker-side timing is reported by this engine and can never
+            // exceed the supervisor-side measurement beyond clock granularity.
+            let wt = sample
+                .worker_total_ms
+                .expect("reference engine reports worker timing");
+            assert!(
+                wt <= sample.total_ms + 1.0,
+                "worker total {wt} ms must not exceed supervisor total {} ms",
+                sample.total_ms
+            );
+            assert!(
+                wt >= 24.0,
+                "worker-side timing {wt} ms must include the delay"
+            );
+        }
+        runtime.shutdown();
+    }
+
+    /// A generation producing far more events than the 256-capacity channel
+    /// must complete: the consumer drains continuously, so the executor is
+    /// never blocked behind a statement holding the worker lock.
+    #[test]
+    fn long_generation_drains_events_without_stalling() {
+        let (_dir, runtime) = bench_setup();
+        let (artifact, adapter) = runtime.resolve_artifact("local").unwrap();
+        let plan = runtime
+            .plan_for(
+                &artifact,
+                &adapter,
+                Bytes::parse("2GiB").unwrap(),
+                2048,
+                600,
+            )
+            .unwrap();
+        let artifact_ref = tuckmill_backend::ArtifactRef::from_record(
+            &artifact,
+            &runtime.layout.artifact_payload_path(&artifact.artifact_id),
+        );
+        let options = BenchOptions {
+            input_tokens: 8,
+            output_tokens: 600,
+            repetitions: 1,
+            ..Default::default()
+        };
+        let (run, _) = run_standard_bench(&runtime, &plan, &artifact_ref, &options).unwrap();
+        assert_eq!(run.samples[0].committed_tokens, 600);
+        runtime.shutdown();
     }
 }

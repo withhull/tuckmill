@@ -121,6 +121,41 @@ round trip). (8) **Toolchain:** `rust-toolchain.toml` pins 1.96.0 and CI
 runs the same pin (floating stable failed run 38910541208 on lints not
 reproducible locally); constant-size chunk iteration uses `as_chunks`.
 
+**Update 6 (Gate A: trustworthy verification and measurement, 2026-10-16):**
+the external review of f352a17 found that execution settings stopped at
+module boundaries; this update closes the three Gate A gaps. (1) **One typed
+options resolver** (`supervisor::options::ExecutionOptions`) is shared by
+run, bench, stats, and verify. Verify's `run_side` no longer reconstructs
+its own JSON: both verification modes build the worker load from the typed
+options (kernel, storage, numerical profile, KV precision, cache geometry),
+capture the engine identity **after** load, compare the worker's
+acknowledged resolved settings against the request, and **fail closed** on
+any substitution. `VerifyConfigRecord` now separates requested
+(`tuckcore_kernels_requested`, `tuckcore_storage_requested`) from
+acknowledged (`resolved_tuckcore`) settings, and the configuration hash
+covers both; report schema is v3. Evidence: forced `--kernels scalar
+--storage owned` and `--kernels neon --storage mapped` reference runs each
+PASS on the real 0.6B with their resolved selections recorded and
+bit-identical f16 statistics (the earlier f352a17 claim that both had been
+cross-verified is withdrawn: those runs resolved auto/neon because the
+request never reached the worker; the schema-v2 records are preserved as
+historical only). (2) **One KV contract for generation and scoring**:
+`Forward` carries the session's declared `KvPrecision`; `logits_at` no
+longer hard-codes f32. Rounding and precision-dependent scoring are unit
+tested; f16 and f32 reference runs are separately qualified on held-out
+inputs (max |Δ| 2.7259e-1 and 2.6768e-1 at 5e-1). (3) **Benchmark timing**:
+baseline counters are captured while the worker is idle, the timer starts
+before dispatch, and events are drained immediately — no statement that can
+block on the busy worker sits between dispatch and the timer or the drain.
+Worker-side timing (protocol v6 `Done.timing`) is recorded per sample
+(`worker_total_ms`/`worker_prefill_ms`/`worker_decode_ms`, record schema
+v3), separating compute from queueing/transport; a deliberately delayed
+engine (in-process 2 ms/token and an isolated 50 ms/token option) proves the
+delay lands in the measurement, and a 600-token run proves drain past the
+256-event channel. Repeated 64/64 matrix (median of 3) shows owned-storage
+rows are memory/thermal-sensitive (2-6× spread across sessions) while
+neon+mapped reproduces within ~6% — timing stays provisional until G3.
+
 ## Context and review
 
 The v0.2 engineering build finished the orchestration stack with exactly one

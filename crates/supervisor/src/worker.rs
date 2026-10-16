@@ -258,6 +258,7 @@ impl IsolatedWorker {
                 Some(WorkerFrame::Done {
                     reason,
                     committed: c,
+                    timing,
                 }) => {
                     committed = c;
                     let finish = match reason.as_str() {
@@ -272,10 +273,9 @@ impl IsolatedWorker {
                             ))
                         }
                     };
-                    return Ok(GenOutcome {
-                        finish_reason: finish,
-                        committed,
-                    });
+                    let mut outcome = GenOutcome::new(finish, committed);
+                    outcome.timing = timing;
+                    return Ok(outcome);
                 }
                 Some(WorkerFrame::Error {
                     code,
@@ -706,5 +706,80 @@ mod tests {
         assert_eq!(err.action(), "shorten it");
         let err = map_worker_error("NOT_A_CODE", "x", "y");
         assert_eq!(err.code(), ErrorCode::WorkerFailed);
+    }
+
+    /// A deliberately delayed worker: the per-token delay must appear in
+    /// measured wall time and in the worker-side timing — a regression guard
+    /// that latencies are not measured after production already happened.
+    #[test]
+    fn isolated_worker_delay_option_is_measured() {
+        let Ok(bin) = std::env::var("TUCKMILL_TEST_WORKER_BIN") else {
+            eprintln!("skipping: TUCKMILL_TEST_WORKER_BIN not set");
+            return;
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let mut worker =
+            IsolatedWorker::spawn(Path::new(&bin), dir.path(), EngineKind::ReferenceTest).unwrap();
+
+        let mut plan = ExecutionPlan::new_skeleton(
+            tuckmill_manifest::Id::new("a".repeat(64)).unwrap(),
+            tuckmill_manifest::Id::new("b".repeat(64)).unwrap(),
+            "qwen3".into(),
+        );
+        plan.mode = tuckmill_manifest::plan::ExecutionMode::Resident;
+        plan.context = tuckmill_manifest::plan::PlanContext::new(128, 16);
+        plan.plan_id = plan.compute_id().unwrap();
+        let artifact = ArtifactRef {
+            path: dir.path().join("fixture.bin").display().to_string(),
+            file_bytes: 0,
+            metadata_hash: "0".repeat(64),
+            tensor_index_hash: "0".repeat(64),
+            tokenizer_hash: None,
+            arch_id: Some("qwen3".into()),
+            content_hash: None,
+        };
+        let options = serde_json::json!({ "per_token_delay_ms": 50 });
+        let note = worker.load(&plan, &artifact, Some(&options)).unwrap();
+        assert!(note.contains("synthetic"));
+
+        let cancel = Arc::new(AtomicBool::new(false));
+        let pause = Arc::new(AtomicBool::new(false));
+        let mut on_token = |_i: u64, _t: &str| true;
+        let mut on_state = |_s: RunState| {};
+        let t0 = Instant::now();
+        let outcome = worker
+            .generate(
+                crate::engine::EngineRequest {
+                    request_id: "delayed".into(),
+                    prompt_tokens: vec![1, 2, 3, 4],
+                    max_output_tokens: 12,
+                    stop: vec![],
+                    seed: 7,
+                },
+                &cancel,
+                &pause,
+                &mut on_token,
+                &mut on_state,
+            )
+            .unwrap();
+        let wall_ms = t0.elapsed().as_secs_f64() * 1000.0;
+        assert_eq!(outcome.committed, 12);
+        let timing = outcome.timing.expect("worker reports request timing");
+        assert!(
+            wall_ms >= 500.0,
+            "12 tokens at 50 ms/token must take >= 600 ms of wall time, got {wall_ms}"
+        );
+        assert!(
+            timing.total_ms >= 500.0,
+            "worker-side total {} ms must include the delay",
+            timing.total_ms
+        );
+        assert!(timing.first_token_ms.unwrap_or(0.0) >= 40.0);
+        assert!(timing.decode_ms.unwrap_or(0.0) >= 500.0);
+        assert!(
+            wall_ms + 5.0 >= timing.total_ms,
+            "supervisor wall {wall_ms} ms must not be below worker total {} ms",
+            timing.total_ms
+        );
     }
 }

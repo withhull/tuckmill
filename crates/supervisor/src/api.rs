@@ -860,7 +860,11 @@ fn stream_sse(
                     return;
                 }
             }
-            Ok(RunEvent::Done { reason, committed }) => {
+            Ok(RunEvent::Done {
+                reason,
+                committed,
+                timing: _,
+            }) => {
                 let chunk = serde_json::json!({
                     "id": completion_id,
                     "object": "chat.completion.chunk",

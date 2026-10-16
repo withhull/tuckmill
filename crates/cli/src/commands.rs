@@ -242,14 +242,19 @@ fn open_runtime(
     engine: &str,
     allow_test_engine: bool,
 ) -> Result<Arc<Runtime>> {
-    open_runtime_with_options(data_dir, engine, allow_test_engine, None)
+    open_runtime_with_options(
+        data_dir,
+        engine,
+        allow_test_engine,
+        tuckmill_supervisor::options::ExecutionOptions::default(),
+    )
 }
 
 fn open_runtime_with_options(
     data_dir: Option<&Path>,
     engine: &str,
     allow_test_engine: bool,
-    engine_options: Option<serde_json::Value>,
+    execution: tuckmill_supervisor::options::ExecutionOptions,
 ) -> Result<Arc<Runtime>> {
     let (engine_kind, engine_mode) = parse_engine(engine)?;
     Runtime::open(RuntimeOptions {
@@ -259,96 +264,50 @@ fn open_runtime_with_options(
         worker_exe: std::env::current_exe().ok(),
         queue_capacity: 4,
         allow_test_engine,
-        engine_options,
+        execution,
         ..Default::default()
     })
 }
 
-/// Fold --gpu-layers into backend options; only the llama backend accepts it
-/// (and only for performance baselines, never arithmetic diagnostics).
-/// Build the backend load options for run/bench/stats: llama gets
-/// `gpu_layers`; tuckcore gets the resolved kernel/storage selections.
-fn engine_load_options(
+/// Build the typed execution options for run/bench/stats/verify from CLI
+/// flags. One resolver, validated against the selected engine, shared by
+/// every command; workers are loaded from exactly these options.
+fn execution_options(
     engine: &str,
     gpu_layers: Option<i32>,
     kernels: Option<&str>,
     storage: Option<&str>,
-) -> Result<Option<serde_json::Value>> {
+) -> Result<tuckmill_supervisor::options::ExecutionOptions> {
+    use tuckmill_supervisor::options::ExecutionOptions;
     let (kind, _) = parse_engine(engine)?;
-    match kind {
-        tuckmill_backend::EngineKind::LlamaCpp => {
-            if kernels.is_some() || storage.is_some() {
-                return Err(TuckmillError::new(
+    let kernels = match kernels {
+        Some(k) => Some(tuckmill_tuckcore::KernelSelection::parse(k).ok_or_else(|| {
+            TuckmillError::new(
+                ErrorCode::InvalidRequest,
+                format!("unknown --kernels {k:?}; use auto, scalar, or neon"),
+            )
+        })?),
+        None => None,
+    };
+    let storage = match storage {
+        Some(st) => Some(
+            tuckmill_tuckcore::StorageSelection::parse(st).ok_or_else(|| {
+                TuckmillError::new(
                     ErrorCode::InvalidRequest,
-                    "--kernels/--storage apply to the tuckcore engine; llama.cpp selects its own kernels",
-                ));
-            }
-            llama_gpu_options(engine, gpu_layers)
-        }
-        tuckmill_backend::EngineKind::TuckCore => {
-            if gpu_layers.is_some() {
-                return Err(TuckmillError::new(
-                    ErrorCode::InvalidRequest,
-                    "--gpu-layers applies only to --engine llama (the Metal performance baseline)",
-                ));
-            }
-            let mut obj = serde_json::Map::new();
-            if let Some(k) = kernels {
-                if tuckmill_tuckcore::KernelSelection::parse(k).is_none() {
-                    return Err(TuckmillError::new(
-                        ErrorCode::InvalidRequest,
-                        format!("unknown --kernels {k:?}; use auto, scalar, or neon"),
-                    ));
-                }
-                obj.insert("kernels".into(), serde_json::json!(k));
-            }
-            if let Some(st) = storage {
-                if tuckmill_tuckcore::StorageSelection::parse(st).is_none() {
-                    return Err(TuckmillError::new(
-                        ErrorCode::InvalidRequest,
-                        format!("unknown --storage {st:?}; use auto, mapped, or owned"),
-                    ));
-                }
-                obj.insert("storage".into(), serde_json::json!(st));
-            }
-            if obj.is_empty() {
-                Ok(None)
-            } else {
-                Ok(Some(serde_json::Value::Object(obj)))
-            }
-        }
-        _ => {
-            if kernels.is_some() || storage.is_some() || gpu_layers.is_some() {
-                return Err(TuckmillError::new(
-                    ErrorCode::InvalidRequest,
-                    "--kernels/--storage/--gpu-layers require an engine that selects them (tuckcore or llama)",
-                ));
-            }
-            Ok(None)
-        }
-    }
-}
-
-fn llama_gpu_options(engine: &str, gpu_layers: Option<i32>) -> Result<Option<serde_json::Value>> {
-    match gpu_layers {
-        None => Ok(None),
-        Some(n) => {
-            let (kind, _) = parse_engine(engine)?;
-            if kind != tuckmill_backend::EngineKind::LlamaCpp {
-                return Err(TuckmillError::new(
-                    ErrorCode::InvalidRequest,
-                    "--gpu-layers applies only to --engine llama (the Metal performance baseline); arithmetic diagnostics stay CPU",
-                ));
-            }
-            if n < 0 {
-                return Err(TuckmillError::new(
-                    ErrorCode::InvalidRequest,
-                    "--gpu-layers must be >= 0",
-                ));
-            }
-            Ok(Some(serde_json::json!({ "gpu_layers": n })))
-        }
-    }
+                    format!("unknown --storage {st:?}; use auto, mapped, or owned"),
+                )
+            })?,
+        ),
+        None => None,
+    };
+    let options = ExecutionOptions {
+        kernels,
+        storage,
+        gpu_layers,
+        ..Default::default()
+    };
+    options.validate(kind)?;
+    Ok(options)
 }
 
 // ---------------- doctor ----------------
@@ -892,7 +851,7 @@ fn run(
         data_dir,
         engine,
         allow_test_engine,
-        engine_load_options(engine, gpu_layers, kernels, storage)?,
+        execution_options(engine, gpu_layers, kernels, storage)?,
     )?;
     let budget = resolve_budget(&runtime, memory_budget)?;
     let (artifact, adapter) = runtime.resolve_artifact(model)?;
@@ -996,6 +955,7 @@ fn run(
             Ok(RunEvent::Done {
                 reason,
                 committed: c,
+                timing: _,
             }) => {
                 committed = c;
                 outcome_reason = reason;
@@ -1192,7 +1152,7 @@ fn bench(
         data_dir,
         engine,
         allow_test_engine,
-        engine_load_options(engine, gpu_layers, kernels, storage)?,
+        execution_options(engine, gpu_layers, kernels, storage)?,
     )?;
     let budget = resolve_budget(&runtime, memory_budget)?;
     let (artifact, adapter) = runtime.resolve_artifact(model)?;
@@ -1264,12 +1224,8 @@ fn verify(
     json: bool,
     data_dir: Option<&Path>,
 ) -> Result<ExitCode> {
-    let runtime = open_runtime_with_options(
-        data_dir,
-        "tuckcore",
-        false,
-        engine_load_options("tuckcore", None, kernels, storage)?,
-    )?;
+    let selection = execution_options("tuckcore", None, kernels, storage)?;
+    let runtime = open_runtime_with_options(data_dir, "tuckcore", false, selection.clone())?;
     let budget = resolve_budget(&runtime, memory_budget)?;
     let (artifact, adapter) = runtime.resolve_artifact(model)?;
     let plan = runtime.plan_for(&artifact, &adapter, budget, context, generate.max(1))?;
@@ -1299,6 +1255,8 @@ fn verify(
             tuckcore_profile: profile,
             kv_precision: kv_precision.to_string(),
             held_out,
+            tuckcore_kernels: selection.kernels,
+            tuckcore_storage: selection.storage,
             ..Default::default()
         };
         runtime.run_reference_comparison(&plan, &artifact_ref, &options)?
@@ -1306,6 +1264,8 @@ fn verify(
         let options = tuckmill_supervisor::verify::VerifyOptions {
             max_score_positions: positions,
             generate_tokens: generate,
+            kernels: selection.kernels,
+            storage: selection.storage,
             ..Default::default()
         };
         runtime.run_equivalence(&plan, &artifact_ref, &options)?
@@ -1348,13 +1308,14 @@ fn stats(
     json: bool,
     data_dir: Option<&Path>,
 ) -> Result<ExitCode> {
-    let mut options = engine_load_options(engine, None, kernels, storage)?
-        .unwrap_or_else(|| serde_json::json!({}));
-    options["profile"] = serde_json::json!(true);
+    let mut execution = execution_options(engine, None, kernels, storage)?;
+    if !engine.starts_with("llama") {
+        execution.profile = Some(true);
+    }
     let runtime = if engine.starts_with("llama") {
-        open_runtime_with_options(data_dir, engine, false, Some(options))?
+        open_runtime_with_options(data_dir, engine, false, execution)?
     } else {
-        open_runtime_with_options(data_dir, engine, true, Some(options))?
+        open_runtime_with_options(data_dir, engine, true, execution)?
     };
     let budget = runtime.default_budget;
     let (artifact, adapter) = runtime.resolve_artifact(model)?;
@@ -1389,6 +1350,7 @@ fn stats(
             Ok(tuckmill_supervisor::runtime::RunEvent::Done {
                 reason,
                 committed: c,
+                timing: _,
             }) => {
                 committed = c;
                 break reason;

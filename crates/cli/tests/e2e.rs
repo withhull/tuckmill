@@ -692,7 +692,7 @@ fn verify_proves_streaming_equivalence_bit_exact() {
         .unwrap();
     assert!(reads > 0, "streaming must read weights from storage");
     assert_eq!(v["resident"]["stats"]["in_flight_leases"], 0);
-    assert_eq!(v["schema_version"], 2);
+    assert_eq!(v["schema_version"], 3);
     assert_eq!(v["config"]["qualification"], "calibration");
     assert_eq!(v["config"]["policy_version"], "calibration-2026-10-16.1");
     assert!(v["config_id"].as_str().unwrap().len() == 64);
@@ -780,4 +780,107 @@ fn worker_and_adapter_consistency() {
     .unwrap();
     adapter.validate_metadata(&insp).unwrap();
     adapter.kv_geometry(&insp).unwrap();
+}
+
+#[test]
+fn verify_records_requested_and_resolved_selection() {
+    let env = TestEnv::new();
+    let fixture = env.fixture.display().to_string();
+    env.run_ok(&["import", &fixture, "--alias", "m"]);
+
+    // Forced scalar + owned must actually execute scalar/owned on both sides
+    // of the equivalence run, and the report must say so.
+    let out = env.run_ok(&[
+        "verify",
+        "m",
+        "--kernels",
+        "scalar",
+        "--storage",
+        "owned",
+        "--json",
+    ]);
+    let v: serde_json::Value = serde_json::from_str(&out).expect("verify json");
+    assert_eq!(v["passed"], true, "verify must pass: {v}");
+    assert_eq!(v["config"]["tuckcore_kernels_requested"], "scalar");
+    assert_eq!(v["config"]["tuckcore_storage_requested"], "owned");
+    let resolved = &v["config"]["resolved_tuckcore"];
+    assert_eq!(resolved["kernel_impl"], "scalar");
+    assert_eq!(resolved["storage_mode"], "owned");
+    assert_eq!(v["resident"]["stats"]["kernel_impl"], "scalar");
+    assert_eq!(v["resident"]["stats"]["storage"]["mode"], "owned");
+    assert_eq!(v["streamed"]["stats"]["kernel_impl"], "scalar");
+    assert_eq!(v["streamed"]["stats"]["storage"]["mode"], "owned");
+
+    // Configuration-equivalent rerun: same configuration identity, distinct
+    // execution identity.
+    let out2 = env.run_ok(&[
+        "verify",
+        "m",
+        "--kernels",
+        "scalar",
+        "--storage",
+        "owned",
+        "--json",
+    ]);
+    let v2: serde_json::Value = serde_json::from_str(&out2).unwrap();
+    assert_eq!(
+        v2["config_id"], v["config_id"],
+        "same requested+resolved config"
+    );
+    assert_ne!(v2["run_id"], v["run_id"], "distinct execution id");
+
+    // A different forced selection is a different configuration and must
+    // resolve to the different implementation.
+    let out3 = env.run_ok(&[
+        "verify",
+        "m",
+        "--kernels",
+        "neon",
+        "--storage",
+        "mapped",
+        "--json",
+    ]);
+    let v3: serde_json::Value = serde_json::from_str(&out3).unwrap();
+    assert_eq!(v3["passed"], true, "verify must pass: {v3}");
+    assert_ne!(v3["config_id"], v["config_id"]);
+    assert_eq!(v3["config"]["resolved_tuckcore"]["kernel_impl"], "neon");
+    assert_eq!(v3["config"]["resolved_tuckcore"]["storage_mode"], "mapped");
+    assert_eq!(v3["resident"]["stats"]["storage"]["mode"], "mapped");
+}
+
+#[test]
+fn bench_warm_repetitions_and_long_output_drain() {
+    let env = TestEnv::new();
+    let fixture = env.fixture.display().to_string();
+    env.run_ok(&["import", &fixture, "--alias", "m"]);
+
+    // 600 tokens is far beyond the 256-event channel capacity of an isolated
+    // worker run: it must complete (continuous draining), warm reps included.
+    let out = env.run_ok(&[
+        "bench",
+        "m",
+        "--input",
+        "8",
+        "--output",
+        "600",
+        "--repetitions",
+        "3",
+        "--allow-test-engine",
+        "--json",
+    ]);
+    let v: serde_json::Value = serde_json::from_str(&out).expect("bench json");
+    let samples = v["samples"].as_array().unwrap();
+    assert_eq!(samples.len(), 3);
+    for s in samples {
+        assert_eq!(s["committed_tokens"], 600);
+        let total = s["total_ms"].as_f64().unwrap();
+        assert!(total > 0.0);
+        if let Some(worker_total) = s["worker_total_ms"].as_f64() {
+            assert!(
+                worker_total <= total + 1.0,
+                "worker-side total {worker_total} must not exceed supervisor total {total}"
+            );
+        }
+    }
+    assert_eq!(v["schema_version"], 3);
 }

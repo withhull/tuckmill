@@ -310,6 +310,14 @@ pub struct PromptSample {
     /// engine's end-to-end rate without saying which one is meant.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub throughput_decode_tps: Option<f64>,
+    /// Worker-side (backend-measured) request durations. The gap to the
+    /// supervisor-side values is queueing and transport, never compute.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worker_total_ms: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worker_prefill_ms: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worker_decode_ms: Option<f64>,
     /// Resolved kernel implementation actually used, when the backend
     /// selects kernels ("scalar"/"neon").
     #[serde(default, skip_serializing_if = "Option::is_none")]

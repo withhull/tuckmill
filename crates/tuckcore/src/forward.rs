@@ -342,6 +342,10 @@ pub struct Forward<'a> {
     /// Resolved packed-kernel implementation (K01). Reported in stats and
     /// records; `Scalar` forces the portable reference kernels.
     pub kernels: ResolvedKernels,
+    /// KV precision in effect for this session. Generation and scoring use
+    /// this same declared precision — a report labeled f16 must execute
+    /// scoring with f16 numerical semantics.
+    pub kv_precision: KvPrecision,
     /// Called between chunks/layers: services external control (poll hook)
     /// and applies pending cache trims at a safe point. Never releases
     /// in-flight buffers (pinned chunks are protected by the loader).
@@ -868,7 +872,7 @@ impl<'a> Forward<'a> {
                 "scoring position is outside the token sequence",
             ));
         }
-        let mut kv = KvState::new(&self.weights.cfg, (position + 1) as u64, KvPrecision::F32)?;
+        let mut kv = KvState::new(&self.weights.cfg, (position + 1) as u64, self.kv_precision)?;
         let mut logits = Vec::new();
         for (pos, token) in tokens[..=position].iter().enumerate() {
             logits = self.forward_token(&mut kv, *token, pos, cancelled)?;
@@ -1044,6 +1048,7 @@ mod tests {
             weights: &f.weights,
             profile: NumericalProfile::OracleF32,
             kernels: ResolvedKernels::default_for_target(),
+            kv_precision: KvPrecision::F32,
             control: &|| {},
             counters: None,
         };
@@ -1056,6 +1061,69 @@ mod tests {
         // KV state was populated and leases were released.
         assert_eq!(f.tracker.in_flight(), 0);
         assert_eq!(f.loader.stats().pinned_blocks, 0);
+    }
+
+    #[test]
+    fn kv_precision_rounds_stored_values() {
+        let f = fixture(BlockPolicy {
+            block_bytes: 64 * 1024,
+            cache_bytes: 4 << 20,
+        });
+        let cfg = f.weights.cfg.clone();
+        let mut f32_state = KvState::new(&cfg, 4, KvPrecision::F32).unwrap();
+        let mut f16_state = KvState::new(&cfg, 4, KvPrecision::F16).unwrap();
+        // 1.0 + 2^-13 is not representable in f16; rounding must be visible.
+        let raw = 1.0f32 + 2.0f32.powi(-13);
+        let k_row = [raw, -raw];
+        let v_row = [raw * 0.5, raw];
+        f32_state.store(0, 0, 0, &k_row, &v_row);
+        f16_state.store(0, 0, 0, &k_row, &v_row);
+        let f32_k0 = f32_state.k_row(0, 0, 0)[0];
+        let f16_k0 = f16_state.k_row(0, 0, 0)[0];
+        assert_eq!(f32_k0, raw, "f32 state stores exact values");
+        assert_eq!(
+            f16_k0,
+            f16_to_f32(f32_to_f16_bits(raw)),
+            "f16 state stores f16-rounded values"
+        );
+        assert_ne!(f16_k0, raw, "the probe value must not be f16-representable");
+    }
+
+    #[test]
+    fn scoring_uses_the_declared_kv_precision() {
+        let f = fixture(BlockPolicy {
+            block_bytes: 64 * 1024,
+            cache_bytes: 4 << 20,
+        });
+        let make = |kv_precision: KvPrecision| Forward {
+            loader: &f.loader,
+            tracker: &f.tracker,
+            weights: &f.weights,
+            profile: NumericalProfile::OracleF32,
+            kernels: ResolvedKernels::default_for_target(),
+            kv_precision,
+            control: &|| {},
+            counters: None,
+        };
+        let tokens = [11u32, 7, 3, 19];
+        let f32_logits = make(KvPrecision::F32)
+            .logits_at(&tokens, 3, &|| false)
+            .unwrap();
+        let f16_logits = make(KvPrecision::F16)
+            .logits_at(&tokens, 3, &|| false)
+            .unwrap();
+        assert_eq!(f32_logits.len(), f16_logits.len());
+        // Storage rounding must change at least one stored state and therefore
+        // the scored logits; the difference is bounded but measurable.
+        let max_diff = f32_logits
+            .iter()
+            .zip(f16_logits.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            max_diff > 0.0 && max_diff < 1.0,
+            "f16 vs f32 KV must differ measurably on this fixture (max |Δ| {max_diff})"
+        );
     }
 
     #[test]
@@ -1075,6 +1143,7 @@ mod tests {
             weights: &resident.weights,
             profile: NumericalProfile::OracleF32,
             kernels: ResolvedKernels::default_for_target(),
+            kv_precision: KvPrecision::F32,
             control: &|| {},
             counters: None,
         }
@@ -1086,6 +1155,7 @@ mod tests {
             weights: &streamed.weights,
             profile: NumericalProfile::OracleF32,
             kernels: ResolvedKernels::default_for_target(),
+            kv_precision: KvPrecision::F32,
             control: &|| {},
             counters: None,
         }
@@ -1116,6 +1186,7 @@ mod tests {
             weights: &f.weights,
             profile: NumericalProfile::OracleF32,
             kernels: ResolvedKernels::default_for_target(),
+            kv_precision: KvPrecision::F32,
             control: &|| {},
             counters: None,
         };
@@ -1137,6 +1208,7 @@ mod tests {
             weights: &f.weights,
             profile: NumericalProfile::OracleF32,
             kernels: ResolvedKernels::default_for_target(),
+            kv_precision: KvPrecision::F32,
             control: &|| {},
             counters: None,
         }
@@ -1148,6 +1220,7 @@ mod tests {
             weights: &f.weights,
             profile: NumericalProfile::LlamaCpu,
             kernels: ResolvedKernels::default_for_target(),
+            kv_precision: KvPrecision::F32,
             control: &|| {},
             counters: None,
         }
@@ -1175,6 +1248,7 @@ mod tests {
             weights: &f.weights,
             profile: NumericalProfile::OracleF32,
             kernels: ResolvedKernels::default_for_target(),
+            kv_precision: KvPrecision::F32,
             control: &|| {},
             counters: None,
         };
@@ -1191,6 +1265,7 @@ mod tests {
             weights: &f.weights,
             profile: NumericalProfile::OracleF32,
             kernels: ResolvedKernels::default_for_target(),
+            kv_precision: KvPrecision::F32,
             control: &|| {},
             counters: None,
         };

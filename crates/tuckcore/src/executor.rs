@@ -12,7 +12,7 @@ use serde::Deserialize;
 
 use tuckmill_backend::{
     ArtifactRef, BackendCapabilities, BackendId, BackendStats, FinishReason, GenControl,
-    GenOutcome, GenerateRequest, InferenceBackend, RunState, StorageStats,
+    GenOutcome, GenerateRequest, InferenceBackend, RequestTiming, RunState, StorageStats,
 };
 use tuckmill_manifest::adapter::AdapterRegistry;
 use tuckmill_manifest::error::{ErrorCode, Result, TuckmillError};
@@ -456,6 +456,7 @@ impl InferenceBackend for TuckCore {
             weights: &loaded.weights,
             profile: loaded.profile,
             kernels: loaded.kernels,
+            kv_precision: loaded.kv_precision,
             control: &control,
             counters: if loaded.counters.enabled {
                 Some(&loaded.counters)
@@ -464,13 +465,20 @@ impl InferenceBackend for TuckCore {
             },
         };
 
+        // Worker-side timing: measured inside the request, so supervisor
+        // wall time minus this is queueing/transport, never compute.
+        let t0 = Instant::now();
+        let empty_timing = |t0: Instant| RequestTiming {
+            total_ms: t0.elapsed().as_secs_f64() * 1000.0,
+            prefill_ms: None,
+            first_token_ms: None,
+            decode_ms: None,
+        };
+
         (ctl.on_state)(RunState::Warming);
         pause_loop(ctl, Duration::from_millis(1))?;
         if ctl.cancel.load(Ordering::Relaxed) {
-            return Ok(GenOutcome {
-                finish_reason: FinishReason::Cancelled,
-                committed: 0,
-            });
+            return Ok(GenOutcome::new(FinishReason::Cancelled, 0).with_timing(empty_timing(t0)));
         }
 
         (ctl.on_state)(RunState::Prefilling);
@@ -480,88 +488,90 @@ impl InferenceBackend for TuckCore {
             match fwd.forward_token(&mut kv, *token, pos, &cancelled) {
                 Ok(l) => logits = l,
                 Err(e) if e.code() == ErrorCode::Cancelled => {
-                    return Ok(GenOutcome {
-                        finish_reason: FinishReason::Cancelled,
-                        committed: 0,
-                    })
+                    return Ok(
+                        GenOutcome::new(FinishReason::Cancelled, 0).with_timing(empty_timing(t0))
+                    )
                 }
                 Err(e) => return Err(e),
             }
         }
+        let prefill_ms = t0.elapsed().as_secs_f64() * 1000.0;
 
         (ctl.on_state)(RunState::Generating);
         let mut rng = Rng::new(req.seed);
         let sampling_cfg = SamplingConfig::default(); // greedy in Stage 0
         let mut committed: u64 = 0;
         let mut generated = String::new();
+        let mut first_committed_at: Option<Instant> = None;
+        let mut last_committed_at: Option<Instant> = None;
         // Incremental UTF-8 assembly: multibyte characters split across
         // tokens are held until complete, never replacement-mangled mid-char.
         let mut decoder = Utf8StreamDecoder::new();
-        for i in 0..req.max_output_tokens {
-            if ctl.cancel.load(Ordering::Relaxed) {
-                return Ok(GenOutcome {
-                    finish_reason: FinishReason::Cancelled,
-                    committed,
-                });
-            }
-            pause_loop(ctl, self.per_token_delay)?;
+        let outcome = 'decode: {
+            for i in 0..req.max_output_tokens {
+                if ctl.cancel.load(Ordering::Relaxed) {
+                    break 'decode GenOutcome::new(FinishReason::Cancelled, committed);
+                }
+                pause_loop(ctl, self.per_token_delay)?;
 
-            let Some(token) = sampling::sample(&logits, &sampling_cfg, &mut rng) else {
-                return Err(TuckmillError::new(
-                    ErrorCode::WorkerFailed,
-                    "sampling produced no token: every logit was non-finite",
-                ));
-            };
-            let text = match loaded.tokenizer.token_text(token) {
-                Some(_) => decoder.push(&loaded.tokenizer.token_bytes(token)),
-                None => {
-                    let placeholder = format!("<tok {token}>");
-                    decoder.push(placeholder.as_bytes())
-                }
-            };
-            generated.push_str(&text);
-            committed += 1;
-            if !(ctl.on_token)(i, &text) {
-                return Ok(GenOutcome {
-                    finish_reason: FinishReason::Stop,
-                    committed,
-                });
-            }
-            if req
-                .stop
-                .iter()
-                .any(|s| !s.is_empty() && generated.ends_with(s.as_str()))
-            {
-                return Ok(GenOutcome {
-                    finish_reason: FinishReason::Stop,
-                    committed,
-                });
-            }
-            if Some(token) == loaded.weights.cfg.eos_token_id {
-                return Ok(GenOutcome {
-                    finish_reason: FinishReason::Eos,
-                    committed,
-                });
-            }
-            if i + 1 < req.max_output_tokens {
-                // The generated token i occupies position prompt_len + i.
-                let pos = (prompt_len + i) as usize;
-                match fwd.forward_token(&mut kv, token, pos, &cancelled) {
-                    Ok(l) => logits = l,
-                    Err(e) if e.code() == ErrorCode::Cancelled => {
-                        return Ok(GenOutcome {
-                            finish_reason: FinishReason::Cancelled,
-                            committed,
-                        })
+                let Some(token) = sampling::sample(&logits, &sampling_cfg, &mut rng) else {
+                    return Err(TuckmillError::new(
+                        ErrorCode::WorkerFailed,
+                        "sampling produced no token: every logit was non-finite",
+                    ));
+                };
+                let text = match loaded.tokenizer.token_text(token) {
+                    Some(_) => decoder.push(&loaded.tokenizer.token_bytes(token)),
+                    None => {
+                        let placeholder = format!("<tok {token}>");
+                        decoder.push(placeholder.as_bytes())
                     }
-                    Err(e) => return Err(e),
+                };
+                let now = Instant::now();
+                if first_committed_at.is_none() {
+                    first_committed_at = Some(now);
+                }
+                last_committed_at = Some(now);
+                generated.push_str(&text);
+                committed += 1;
+                if !(ctl.on_token)(i, &text) {
+                    break 'decode GenOutcome::new(FinishReason::Stop, committed);
+                }
+                if req
+                    .stop
+                    .iter()
+                    .any(|s| !s.is_empty() && generated.ends_with(s.as_str()))
+                {
+                    break 'decode GenOutcome::new(FinishReason::Stop, committed);
+                }
+                if Some(token) == loaded.weights.cfg.eos_token_id {
+                    break 'decode GenOutcome::new(FinishReason::Eos, committed);
+                }
+                if i + 1 < req.max_output_tokens {
+                    // The generated token i occupies position prompt_len + i.
+                    let pos = (prompt_len + i) as usize;
+                    match fwd.forward_token(&mut kv, token, pos, &cancelled) {
+                        Ok(l) => logits = l,
+                        Err(e) if e.code() == ErrorCode::Cancelled => {
+                            break 'decode GenOutcome::new(FinishReason::Cancelled, committed)
+                        }
+                        Err(e) => return Err(e),
+                    }
                 }
             }
-        }
-        Ok(GenOutcome {
-            finish_reason: FinishReason::Length,
-            committed,
-        })
+            GenOutcome::new(FinishReason::Length, committed)
+        };
+        let ms = |from: Instant, to: Instant| (to - from).as_secs_f64() * 1000.0;
+        let timing = RequestTiming {
+            total_ms: ms(t0, Instant::now()),
+            prefill_ms: Some(prefill_ms),
+            first_token_ms: first_committed_at.map(|f| ms(t0, f)),
+            decode_ms: match (first_committed_at, last_committed_at) {
+                (Some(f), Some(l)) if l > f => Some(ms(f, l)),
+                _ => None,
+            },
+        };
+        Ok(outcome.with_timing(timing))
     }
 
     fn score(
@@ -583,6 +593,7 @@ impl InferenceBackend for TuckCore {
             weights: &loaded.weights,
             profile: loaded.profile,
             kernels: loaded.kernels,
+            kv_precision: loaded.kv_precision,
             control: &control,
             counters: if loaded.counters.enabled {
                 Some(&loaded.counters)

@@ -277,6 +277,7 @@ fn serve(stream: UnixStream, kind: EngineKind) -> Result<()> {
                                 &WorkerFrame::Done {
                                     reason: outcome.finish_reason.as_str().to_string(),
                                     committed: outcome.committed,
+                                    timing: outcome.timing,
                                 },
                             )?;
                         }
@@ -719,7 +720,9 @@ mod tests {
                         sent_cancel = true;
                     }
                 }
-                WorkerFrame::Done { reason, committed } => {
+                WorkerFrame::Done {
+                    reason, committed, ..
+                } => {
                     assert_eq!(reason, "cancelled");
                     assert_eq!(committed, tokens);
                     assert!(tokens < 50, "cancel must stop before the full run");

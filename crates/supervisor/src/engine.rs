@@ -10,7 +10,7 @@
 //! `tuckmill-backend` (ADR-005) and are re-exported here for compatibility.
 
 use std::sync::atomic::Ordering;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use tuckmill_manifest::error::{ErrorCode, Result, TuckmillError};
 use tuckmill_manifest::plan::ExecutionPlan;
@@ -156,6 +156,26 @@ impl ReferenceTestEngine {
             ));
         }
 
+        let t0 = Instant::now();
+        let mut first_committed_at: Option<Instant> = None;
+        let mut last_committed_at: Option<Instant> = None;
+        let finish_with_timing = |outcome: GenOutcome,
+                                  t0: Instant,
+                                  prefill_ms: Option<f64>,
+                                  first: Option<Instant>,
+                                  last: Option<Instant>| {
+            let ms = |a: Instant, b: Instant| (b - a).as_secs_f64() * 1000.0;
+            outcome.with_timing(tuckmill_backend::RequestTiming {
+                total_ms: ms(t0, Instant::now()),
+                prefill_ms,
+                first_token_ms: first.map(|f| ms(t0, f)),
+                decode_ms: match (first, last) {
+                    (Some(f), Some(l)) if l > f => Some(ms(f, l)),
+                    _ => None,
+                },
+            })
+        };
+
         (ctl.on_state)(RunState::Warming);
         // Simulated warm-up; visibly short and deterministic.
         pause_loop(ctl, Duration::from_millis(5))?;
@@ -165,33 +185,48 @@ impl ReferenceTestEngine {
         let prefill = Duration::from_millis(prompt_len.max(1));
         pause_loop(ctl, prefill.min(Duration::from_secs(5)))?;
         if ctl.cancel.load(Ordering::Relaxed) {
-            return Ok(GenOutcome {
-                finish_reason: FinishReason::Cancelled,
-                committed: 0,
-            });
+            return Ok(finish_with_timing(
+                GenOutcome::new(FinishReason::Cancelled, 0),
+                t0,
+                None,
+                None,
+                None,
+            ));
         }
+        let prefill_ms = t0.elapsed().as_secs_f64() * 1000.0;
 
         (ctl.on_state)(RunState::Generating);
         let mut committed: u64 = 0;
         let mut generated = String::new();
         for i in 0..req.max_output_tokens {
             if ctl.cancel.load(Ordering::Relaxed) {
-                return Ok(GenOutcome {
-                    finish_reason: FinishReason::Cancelled,
-                    committed,
-                });
+                return Ok(finish_with_timing(
+                    GenOutcome::new(FinishReason::Cancelled, committed),
+                    t0,
+                    Some(prefill_ms),
+                    first_committed_at,
+                    last_committed_at,
+                ));
             }
             // Safe-boundary pause between committed tokens.
             pause_loop(ctl, self.per_token_delay)?;
 
             let text = format!("[ref:{i}]");
+            let now = Instant::now();
+            if first_committed_at.is_none() {
+                first_committed_at = Some(now);
+            }
+            last_committed_at = Some(now);
             generated.push_str(&text);
             committed += 1;
             if !(ctl.on_token)(i, &text) {
-                return Ok(GenOutcome {
-                    finish_reason: FinishReason::Stop,
-                    committed,
-                });
+                return Ok(finish_with_timing(
+                    GenOutcome::new(FinishReason::Stop, committed),
+                    t0,
+                    Some(prefill_ms),
+                    first_committed_at,
+                    last_committed_at,
+                ));
             }
             // Stop sequences are checked on the committed text stream.
             if req
@@ -199,16 +234,22 @@ impl ReferenceTestEngine {
                 .iter()
                 .any(|s| !s.is_empty() && generated.ends_with(s.as_str()))
             {
-                return Ok(GenOutcome {
-                    finish_reason: FinishReason::Stop,
-                    committed,
-                });
+                return Ok(finish_with_timing(
+                    GenOutcome::new(FinishReason::Stop, committed),
+                    t0,
+                    Some(prefill_ms),
+                    first_committed_at,
+                    last_committed_at,
+                ));
             }
         }
-        Ok(GenOutcome {
-            finish_reason: FinishReason::Length,
-            committed,
-        })
+        Ok(finish_with_timing(
+            GenOutcome::new(FinishReason::Length, committed),
+            t0,
+            Some(prefill_ms),
+            first_committed_at,
+            last_committed_at,
+        ))
     }
 }
 
@@ -241,8 +282,19 @@ impl tuckmill_backend::InferenceBackend for ReferenceTestEngine {
         &mut self,
         plan: &ExecutionPlan,
         _artifact: &tuckmill_backend::ArtifactRef,
-        _options: Option<&serde_json::Value>,
+        options: Option<&serde_json::Value>,
     ) -> Result<String> {
+        // Benchmark/test aid only: an explicit per-token production delay so
+        // measured latency can be proven to include worker-side pacing.
+        if let Some(value) = options.and_then(|o| o.get("per_token_delay_ms")) {
+            let ms = value.as_u64().ok_or_else(|| {
+                TuckmillError::new(
+                    ErrorCode::InvalidRequest,
+                    "per_token_delay_ms must be a non-negative integer",
+                )
+            })?;
+            self.per_token_delay = Duration::from_millis(ms);
+        }
         self.load(plan)
     }
 

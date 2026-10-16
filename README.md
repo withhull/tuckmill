@@ -55,6 +55,7 @@ tuckmill run my-model --engine tuckcore --kernels scalar --storage owned   # for
 tuckmill verify my-model                         # residency/streaming equivalence
 tuckmill verify my-model --reference             # llama.cpp vs TuckCore logits (needs TUCKMILL_LLAMA_LIB);
                                                  # registered per-dtype tolerances
+tuckmill verify my-model --reference --kernels scalar --storage owned   # forced, recorded, fail-closed selection
 tuckmill run my-model --allow-test-engine        # synthetic pipeline run
 tuckmill bench my-model --engine tuckcore        # record: e2e + decode-only throughput, resolved selections
 tuckmill bench my-model --engine llama --gpu-layers 99   # Metal baseline (performance only)
@@ -167,7 +168,7 @@ scripts/            build.sh, test.sh, demo.sh
 ## Verification and benchmarks
 
 `scripts/test.sh` runs formatting, `clippy -D warnings`, and the full test
-suite (304 tests),
+suite (311 tests),
 including adversarial GGUF/Safetensors fixtures, planner math, governor
 semantics, import/pack fault injection, worker-protocol framing, HTTP
 auth/SSE, CLI end-to-end runs (isolated worker, crash injection, SIGINT

@@ -72,10 +72,11 @@ pub struct RuntimeOptions {
     /// Never enabled implicitly: without it, non-certified profiles are
     /// refused with a typed error (PRD claim policy).
     pub allow_test_engine: bool,
-    /// Backend load options passed through to the worker (e.g. llama
-    /// `gpu_layers` for the Metal performance baseline). Recorded in worker
-    /// notes; validated and rejected by backends that do not know a key.
-    pub engine_options: Option<serde_json::Value>,
+    /// Typed execution options, resolved once by the caller and validated
+    /// against the engine at open; the worker's acknowledged settings are
+    /// compared against this request after every load, and a substitution
+    /// fails closed.
+    pub execution: crate::options::ExecutionOptions,
 }
 
 impl Default for RuntimeOptions {
@@ -95,7 +96,7 @@ impl Default for RuntimeOptions {
             governor_config: GovernorConfig::default(),
             monitor: true,
             allow_test_engine: false,
-            engine_options: None,
+            execution: crate::options::ExecutionOptions::default(),
         }
     }
 }
@@ -111,6 +112,8 @@ pub enum RunEvent {
     Done {
         reason: String,
         committed: u64,
+        /// Worker-side timing of the request, when the backend reports it.
+        timing: Option<tuckmill_backend::RequestTiming>,
     },
     Error {
         code: String,
@@ -197,7 +200,7 @@ pub struct Runtime {
     monitor_thread: Mutex<Option<std::thread::JoinHandle<()>>>,
     monitor_stop: Arc<AtomicBool>,
     allow_test_engine: bool,
-    engine_options: Option<serde_json::Value>,
+    execution: crate::options::ExecutionOptions,
     /// Worker PID for lock-free monitoring (0 = no worker).
     worker_pid: AtomicU32,
     /// Consecutive footprint-overrun samples (enforcement escalates at 3).
@@ -223,6 +226,7 @@ impl Runtime {
                 ),
             ));
         }
+        options.execution.validate(options.engine_kind)?;
         let layout = match options.data_dir {
             Some(dir) => StoreLayout::open(dir),
             None => StoreLayout::resolve()?,
@@ -276,7 +280,7 @@ impl Runtime {
             monitor_thread: Mutex::new(None),
             monitor_stop: Arc::new(AtomicBool::new(false)),
             allow_test_engine: options.allow_test_engine,
-            engine_options: options.engine_options,
+            execution: options.execution,
             worker_pid: AtomicU32::new(0),
             overrun_streak: AtomicU64::new(0),
         });
@@ -765,7 +769,36 @@ impl Runtime {
                         &self.layout.tmp_dir(),
                         self.engine_kind,
                     )?;
-                    let note = worker.load(plan, artifact, self.engine_options.as_ref())?;
+                    let load_options = self.execution.load_json(self.engine_kind);
+                    let note = worker.load(plan, artifact, load_options.as_ref())?;
+                    // Resolved settings, acknowledged by the worker right
+                    // after load (the worker is idle here): an explicit
+                    // request must match exactly or the run is refused.
+                    let (_, _, ack_stats) = worker.stats()?;
+                    let acknowledged = self.execution.acknowledged(
+                        self.engine_kind,
+                        &worker.resolved_kernels,
+                        ack_stats.as_ref().unwrap_or(&BackendStats::default()),
+                    )?;
+                    self.logger.info(
+                        "WORKER_RESOLVED",
+                        [
+                            (
+                                "kernels".to_string(),
+                                serde_json::json!(acknowledged.kernel_impl),
+                            ),
+                            (
+                                "storage".to_string(),
+                                serde_json::json!(acknowledged.storage_mode),
+                            ),
+                            (
+                                "numerical_profile".to_string(),
+                                serde_json::json!(acknowledged.numerical_profile),
+                            ),
+                        ]
+                        .into_iter()
+                        .collect(),
+                    );
                     self.logger.info(
                         "WORKER_LOADED",
                         [("note".to_string(), serde_json::json!(note))]
@@ -901,6 +934,7 @@ impl Runtime {
         let _ = tx.send(RunEvent::Done {
             reason: outcome.finish_reason.as_str().to_string(),
             committed: outcome.committed,
+            timing: outcome.timing,
         });
         Ok(())
     }
@@ -1087,9 +1121,11 @@ pub fn collect_run(run: &ActiveRun, mut on_token: impl FnMut(u64, &str)) -> (Fin
         match run.events.recv() {
             Ok(RunEvent::State(_)) => {}
             Ok(RunEvent::Token { index, text }) => on_token(index, &text),
-            Ok(RunEvent::Done { reason, committed }) => {
-                return (reason_from_str(&reason), committed)
-            }
+            Ok(RunEvent::Done {
+                reason,
+                committed,
+                timing: _,
+            }) => return (reason_from_str(&reason), committed),
             Ok(RunEvent::Error { .. }) | Err(_) => {
                 return (
                     FinishReason::Cancelled,
@@ -1131,6 +1167,7 @@ mod tests {
             engine_kind: EngineKind::ReferenceTest,
             worker_exe: None,
             queue_capacity: 2,
+            execution: crate::options::ExecutionOptions::default(),
             default_budget: Some(Bytes::parse("2GiB").unwrap()),
             default_context: 2048,
             default_max_output: 256,
@@ -1143,7 +1180,6 @@ mod tests {
             },
             monitor: true,
             allow_test_engine: true,
-            engine_options: None,
         })
         .unwrap();
         (dir, runtime, signals)

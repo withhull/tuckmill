@@ -855,10 +855,7 @@ impl InferenceBackend for LlamaRef {
         (ctl.on_state)(RunState::Prefilling);
         self.decode_chunked_with_poll(&req.prompt_tokens, ctl.poll)?;
         if ctl.cancel.load(std::sync::atomic::Ordering::Relaxed) {
-            return Ok(GenOutcome {
-                finish_reason: FinishReason::Cancelled,
-                committed: 0,
-            });
+            return Ok(GenOutcome::new(FinishReason::Cancelled, 0));
         }
 
         (ctl.on_state)(RunState::Generating);
@@ -868,10 +865,7 @@ impl InferenceBackend for LlamaRef {
         let mut decoder = tuckmill_manifest::utf8::Utf8StreamDecoder::new();
         for i in 0..req.max_output_tokens {
             if ctl.cancel.load(std::sync::atomic::Ordering::Relaxed) {
-                return Ok(GenOutcome {
-                    finish_reason: FinishReason::Cancelled,
-                    committed,
-                });
+                return Ok(GenOutcome::new(FinishReason::Cancelled, committed));
             }
             let h = self.h()?;
             let mut token: i32 = -1;
@@ -887,35 +881,23 @@ impl InferenceBackend for LlamaRef {
             generated.push_str(&text);
             committed += 1;
             if !(ctl.on_token)(i, &text) {
-                return Ok(GenOutcome {
-                    finish_reason: FinishReason::Stop,
-                    committed,
-                });
+                return Ok(GenOutcome::new(FinishReason::Stop, committed));
             }
             if req
                 .stop
                 .iter()
                 .any(|s| !s.is_empty() && generated.ends_with(s.as_str()))
             {
-                return Ok(GenOutcome {
-                    finish_reason: FinishReason::Stop,
-                    committed,
-                });
+                return Ok(GenOutcome::new(FinishReason::Stop, committed));
             }
             if token == self.eos {
-                return Ok(GenOutcome {
-                    finish_reason: FinishReason::Eos,
-                    committed,
-                });
+                return Ok(GenOutcome::new(FinishReason::Eos, committed));
             }
             if i + 1 < req.max_output_tokens {
                 self.decode_chunked_with_poll(&[token as u32], ctl.poll)?;
             }
         }
-        Ok(GenOutcome {
-            finish_reason: FinishReason::Length,
-            committed,
-        })
+        Ok(GenOutcome::new(FinishReason::Length, committed))
     }
 
     fn score(

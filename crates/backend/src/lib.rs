@@ -199,10 +199,50 @@ impl<'a> GenControl<'a> {
     }
 }
 
+/// Worker-side timings for one generation request, measured inside the
+/// backend (not by the supervisor). Supervisor wall time must be >= these:
+/// the difference is queueing and transport, which are deliberately kept
+/// separate from compute.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct RequestTiming {
+    /// Request entry to the final outcome.
+    pub total_ms: f64,
+    /// Request entry to prefill completion; `None` when the request ended
+    /// during prefill (for example, cancellation).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prefill_ms: Option<f64>,
+    /// Request entry to the first committed token; `None` when no token was
+    /// produced.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub first_token_ms: Option<f64>,
+    /// First committed token to the last; `None` with fewer than two tokens.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub decode_ms: Option<f64>,
+}
+
+/// Why a generation finished, with committed-token accounting and optional
+/// worker-side timing.
 #[derive(Debug, Clone)]
 pub struct GenOutcome {
     pub finish_reason: FinishReason,
     pub committed: u64,
+    /// Worker-side timing of the request, when the backend measures it.
+    pub timing: Option<RequestTiming>,
+}
+
+impl GenOutcome {
+    pub fn new(finish_reason: FinishReason, committed: u64) -> Self {
+        Self {
+            finish_reason,
+            committed,
+            timing: None,
+        }
+    }
+
+    pub fn with_timing(mut self, timing: RequestTiming) -> Self {
+        self.timing = Some(timing);
+        self
+    }
 }
 
 /// Storage accounting reported by backends that manage weight storage.

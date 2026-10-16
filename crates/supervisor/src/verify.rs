@@ -95,6 +95,10 @@ pub struct ReferenceCompareOptions {
     /// Held-out qualification run: frozen inputs are derived with a different
     /// seed and a larger, disjoint workload from the calibration set.
     pub held_out: bool,
+    /// Requested kernel selection for the TuckCore side (None = default).
+    pub tuckcore_kernels: Option<tuckmill_tuckcore::KernelSelection>,
+    /// Requested weight-storage selection for the TuckCore side.
+    pub tuckcore_storage: Option<tuckmill_tuckcore::StorageSelection>,
     pub score_deadline: Duration,
 }
 
@@ -109,6 +113,8 @@ impl Default for ReferenceCompareOptions {
             kv_precision: "f16".to_string(),
             max_abs_tolerance: None,
             held_out: false,
+            tuckcore_kernels: None,
+            tuckcore_storage: None,
             score_deadline: DEFAULT_SCORE_DEADLINE,
         }
     }
@@ -124,6 +130,10 @@ pub struct VerifyOptions {
     pub streamed_cache_bytes: u64,
     pub max_abs_tolerance: f64,
     pub require_exact: bool,
+    /// Requested kernel selection for both sides (None = engine default).
+    pub kernels: Option<tuckmill_tuckcore::KernelSelection>,
+    /// Requested weight-storage selection for both sides.
+    pub storage: Option<tuckmill_tuckcore::StorageSelection>,
     pub score_deadline: Duration,
 }
 
@@ -137,6 +147,8 @@ impl Default for VerifyOptions {
             streamed_cache_bytes: 64 * 1024,
             max_abs_tolerance: 0.0,
             require_exact: true,
+            kernels: None,
+            storage: None,
             score_deadline: DEFAULT_SCORE_DEADLINE,
         }
     }
@@ -206,6 +218,18 @@ pub struct VerifyConfigRecord {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub llama_revision: Option<String>,
     pub kv_precision_requested: String,
+    /// Requested kernel selection for the TuckCore side ("scalar"/"neon"/
+    /// "auto"; absent = engine default).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tuckcore_kernels_requested: Option<String>,
+    /// Requested weight-storage selection for the TuckCore side.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tuckcore_storage_requested: Option<String>,
+    /// What the TuckCore side actually acknowledged at load (resolved).
+    /// Part of the configuration hash: a run that resolved differently is a
+    /// different configuration, never silently folded into the request.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolved_tuckcore: Option<crate::options::AcknowledgedExecution>,
     pub tolerance: f64,
     pub tolerance_source: String,
 }
@@ -249,10 +273,6 @@ pub struct VerifyErrorInfo {
 /// Scored logits as `(position, logits)` pairs (kept internal so the public
 /// record never carries a full logit matrix).
 type ScoredLogits = Vec<(u64, Vec<f32>)>;
-/// Both sides with their scored rows: (tuckcore side, llama side, tuckcore
-/// logits, llama logits).
-type ComparedSides = (RunSide, RunSide, ScoredLogits, ScoredLogits);
-
 fn percentile_sorted(values: &mut [f64], p: f64) -> f64 {
     if values.is_empty() {
         return 0.0;
@@ -532,7 +552,12 @@ impl Runtime {
             false,
         )?;
 
-        let (resident, resident_logits) = self.run_side(
+        let equivalence_side = crate::options::ExecutionOptions {
+            kernels: options.kernels,
+            storage: options.storage,
+            ..Default::default()
+        };
+        let (resident, resident_logits, resident_ack) = self.run_side(
             EngineKind::TuckCore,
             "resident",
             plan,
@@ -540,12 +565,11 @@ impl Runtime {
             &tokens,
             &positions,
             options.generate_tokens,
+            &equivalence_side,
             Some(options.resident_cache_bytes),
-            None,
-            None,
             options.score_deadline,
         )?;
-        let (streamed, streamed_logits) = self.run_side(
+        let (streamed, streamed_logits, _) = self.run_side(
             EngineKind::TuckCore,
             "forced-streaming",
             plan,
@@ -553,9 +577,8 @@ impl Runtime {
             &tokens,
             &positions,
             options.generate_tokens,
+            &equivalence_side,
             Some(options.streamed_cache_bytes),
-            None,
-            None,
             options.score_deadline,
         )?;
 
@@ -622,6 +645,9 @@ impl Runtime {
             streamed_cache_bytes: Some(options.streamed_cache_bytes),
             llama_revision: None,
             kv_precision_requested: "f32".into(),
+            tuckcore_kernels_requested: options.kernels.map(|k| format!("{k:?}").to_lowercase()),
+            tuckcore_storage_requested: options.storage.map(|st| format!("{st:?}").to_lowercase()),
+            resolved_tuckcore: Some(resident_ack),
             tolerance: options.max_abs_tolerance,
             tolerance_source: "scheduling bit-equality".into(),
         };
@@ -629,7 +655,7 @@ impl Runtime {
         let run_id = new_run_id(&config_id)?;
 
         let report = VerifyReport {
-            schema_version: 2,
+            schema_version: 3,
             mode: "scheduling-equivalence".into(),
             config_id,
             run_id,
@@ -709,34 +735,55 @@ impl Runtime {
             }
         };
 
-        let config = VerifyConfigRecord {
-            artifact_id: plan.artifact_id.clone(),
-            artifact_metadata_hash: artifact.metadata_hash.clone(),
-            artifact_tensor_index_hash: artifact.tensor_index_hash.clone(),
-            mode: "reference-comparison".into(),
-            qualification: qualification.as_str().into(),
-            policy_version: TOLERANCE_POLICY.into(),
-            context_total: plan.context.total_context,
-            workload_prompt_tokens: plan.context.max_input_tokens,
-            token_ids: tokens.clone(),
-            positions: positions.clone(),
-            generate_tokens: options.generate_tokens,
-            tuckcore_profile: Some(options.tuckcore_profile.as_str().into()),
-            tuckcore_cache_bytes: options.tuckcore_cache_bytes,
-            tuckcore_block_bytes: options
-                .tuckcore_cache_bytes
-                .clamp(64 * 1024, 4 * 1024 * 1024),
-            streamed_cache_bytes: None,
-            llama_revision: Some(tuckmill_llamaref::LLAMA_REVISION.into()),
-            kv_precision_requested: options.kv_precision.clone(),
-            tolerance,
-            tolerance_source: tolerance_source.clone(),
-        };
-        let config_id = hash_of(&config)?;
-        let run_id = new_run_id(&config_id)?;
+        // The configuration record separates the request from the resolved
+        // acknowledgement; the hash covers both, so a run that resolved
+        // differently is a different configuration.
+        let build_config =
+            |resolved: Option<crate::options::AcknowledgedExecution>| VerifyConfigRecord {
+                artifact_id: plan.artifact_id.clone(),
+                artifact_metadata_hash: artifact.metadata_hash.clone(),
+                artifact_tensor_index_hash: artifact.tensor_index_hash.clone(),
+                mode: "reference-comparison".into(),
+                qualification: qualification.as_str().into(),
+                policy_version: TOLERANCE_POLICY.into(),
+                context_total: plan.context.total_context,
+                workload_prompt_tokens: plan.context.max_input_tokens,
+                token_ids: tokens.clone(),
+                positions: positions.clone(),
+                generate_tokens: options.generate_tokens,
+                tuckcore_profile: Some(options.tuckcore_profile.as_str().into()),
+                tuckcore_cache_bytes: options.tuckcore_cache_bytes,
+                tuckcore_block_bytes: options
+                    .tuckcore_cache_bytes
+                    .clamp(64 * 1024, 4 * 1024 * 1024),
+                streamed_cache_bytes: None,
+                llama_revision: Some(tuckmill_llamaref::LLAMA_REVISION.into()),
+                kv_precision_requested: options.kv_precision.clone(),
+                tuckcore_kernels_requested: options
+                    .tuckcore_kernels
+                    .map(|k| format!("{k:?}").to_lowercase()),
+                tuckcore_storage_requested: options
+                    .tuckcore_storage
+                    .map(|st| format!("{st:?}").to_lowercase()),
+                resolved_tuckcore: resolved,
+                tolerance,
+                tolerance_source: tolerance_source.clone(),
+            };
 
-        let result = (|| -> Result<ComparedSides> {
-            let (tuckcore, tuckcore_logits) = self.run_side(
+        let tuckcore_side = crate::options::ExecutionOptions {
+            kernels: options.tuckcore_kernels,
+            storage: options.tuckcore_storage,
+            numerical_profile: Some(options.tuckcore_profile.as_str().to_string()),
+            kv_precision: Some(options.kv_precision.clone()),
+            ..Default::default()
+        };
+        let llama_side = crate::options::ExecutionOptions {
+            kv_precision: Some(options.kv_precision.clone()),
+            ..Default::default()
+        };
+
+        let result = (|| -> Result<(RunSide, RunSide, ScoredLogits, ScoredLogits, crate::options::AcknowledgedExecution)> {
+            let (tuckcore, tuckcore_logits, ack) = self.run_side(
                 EngineKind::TuckCore,
                 "tuckcore",
                 plan,
@@ -744,12 +791,11 @@ impl Runtime {
                 &tokens,
                 &positions,
                 options.generate_tokens,
+                &tuckcore_side,
                 Some(options.tuckcore_cache_bytes),
-                Some(options.tuckcore_profile),
-                Some(&options.kv_precision),
                 options.score_deadline,
             )?;
-            let (llama, llamaref_logits) = self.run_side(
+            let (llama, llamaref_logits, _) = self.run_side(
                 EngineKind::LlamaCpp,
                 "llama.cpp",
                 plan,
@@ -757,19 +803,21 @@ impl Runtime {
                 &tokens,
                 &positions,
                 options.generate_tokens,
+                &llama_side,
                 None,
-                None,
-                Some(&options.kv_precision),
                 options.score_deadline,
             )?;
-            Ok((tuckcore, llama, tuckcore_logits, llamaref_logits))
+            Ok((tuckcore, llama, tuckcore_logits, llamaref_logits, ack))
         })();
 
-        let (tuckcore, llama, tuckcore_logits, llamaref_logits) = match result {
+        let (tuckcore, llama, tuckcore_logits, llamaref_logits, ack) = match result {
             Ok(v) => v,
             Err(e) => {
+                let config = build_config(None);
+                let config_id = hash_of(&config)?;
+                let run_id = new_run_id(&config_id)?;
                 let interrupted = VerifyReport {
-                    schema_version: 2,
+                    schema_version: 3,
                     mode: "reference-comparison".into(),
                     config_id,
                     run_id,
@@ -798,6 +846,9 @@ impl Runtime {
                 return Err(e);
             }
         };
+        let config = build_config(Some(ack));
+        let config_id = hash_of(&config)?;
+        let run_id = new_run_id(&config_id)?;
 
         let vocab_usize = vocab as usize;
         validate_scored_rows(&positions, &tuckcore_logits, vocab_usize)?;
@@ -874,7 +925,7 @@ impl Runtime {
 
         let passed = within_tolerance;
         let report = VerifyReport {
-            schema_version: 2,
+            schema_version: 3,
             mode: "reference-comparison".into(),
             config_id,
             run_id,
@@ -925,43 +976,51 @@ impl Runtime {
         tokens: &[u32],
         positions: &[u64],
         generate_tokens: u64,
+        side: &crate::options::ExecutionOptions,
         cache_bytes: Option<u64>,
-        profile: Option<NumericalProfile>,
-        kv_precision: Option<&str>,
         score_deadline: Duration,
-    ) -> Result<(RunSide, ScoredLogits)> {
+    ) -> Result<(RunSide, ScoredLogits, crate::options::AcknowledgedExecution)> {
+        side.validate(kind)?;
         let mut worker = IsolatedWorker::spawn(&self.worker_exe, &self.layout.tmp_dir(), kind)?;
-        let identity = identity_trio(&worker);
 
         // Footprint sampling covers model load and the measured run.
         let sampler = FootprintSampler::start(self.signals.clone(), worker.pid() as i32);
 
-        let mut load_options = cache_bytes.map(|cache_bytes| {
-            let block_bytes = cache_bytes.clamp(64 * 1024, 4 * 1024 * 1024);
-            let mut value = serde_json::json!({
-                "weight_cache_bytes": cache_bytes,
-                "block_bytes": block_bytes,
-            });
-            if let Some(profile) = profile {
-                value["numerical_profile"] = serde_json::json!(profile.as_str());
-            }
-            value
-        });
-        if kind == EngineKind::LlamaCpp {
-            if let Some(kv) = kv_precision {
-                load_options = Some(serde_json::json!({ "kv_precision": kv }));
-            }
-        } else if let Some(value) = load_options.as_mut() {
-            if let Some(kv) = kv_precision {
-                value["kv_precision"] = serde_json::json!(kv);
-            }
-        }
+        let load_options = side.side_load_json(kind, cache_bytes);
         let note = worker.load(plan, artifact, load_options.as_ref())?;
         self.logger.info(
             "VERIFY_LOAD",
             [
                 ("label".to_string(), serde_json::json!(label)),
                 ("note".to_string(), serde_json::json!(note)),
+            ]
+            .into_iter()
+            .collect(),
+        );
+        // Resolved settings are only knowable after the load: capture the
+        // identity here (never before), compare the acknowledgement against
+        // the request, and fail closed on any substitution.
+        let identity = identity_trio(&worker);
+        let (_, _, ack_stats) = worker.stats()?;
+        let acknowledged = side.acknowledged(
+            kind,
+            &worker.resolved_kernels,
+            ack_stats
+                .as_ref()
+                .unwrap_or(&tuckmill_backend::BackendStats::default()),
+        )?;
+        self.logger.info(
+            "VERIFY_RESOLVED",
+            [
+                ("label".to_string(), serde_json::json!(label)),
+                (
+                    "kernels".to_string(),
+                    serde_json::json!(acknowledged.kernel_impl),
+                ),
+                (
+                    "storage".to_string(),
+                    serde_json::json!(acknowledged.storage_mode),
+                ),
             ]
             .into_iter()
             .collect(),
@@ -1014,7 +1073,7 @@ impl Runtime {
             footprint_load_peak_bytes: (load_peak > 0).then_some(load_peak),
             footprint_run_peak_bytes: (run_peak > 0).then_some(run_peak),
         };
-        Ok((side, scored))
+        Ok((side, scored, acknowledged))
     }
 }
 

@@ -1,4 +1,4 @@
-# Worker control protocol (v5)
+# Worker control protocol (v6)
 
 Wire contract between the Tuckmill supervisor and an execution worker. The
 transport is a private Unix domain socket under the store's `tmp/` directory.
@@ -31,6 +31,10 @@ payload := UTF-8 JSON, one message object
   them into engine identities so benchmark and verification records name the
   implementation that ran, not a build-time guess. Older workers omit the
   field (defaults to empty).
+- v6: `Done` carries optional worker-side `timing` (`total_ms`, `prefill_ms`,
+  `first_token_ms`, `decode_ms`) measured inside the backend. Supervisors
+  record it separately from their own wall time so queueing and transport
+  are never confused with compute; older workers omit the field.
 - Clean EOF before the first byte of a frame closes the session. EOF mid-frame
   is `WORKER_FAILED`.
 - All fields are validated before use; unknown message tags are protocol
