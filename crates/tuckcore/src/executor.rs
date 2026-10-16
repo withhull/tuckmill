@@ -6,7 +6,7 @@
 
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde::Deserialize;
 
@@ -21,7 +21,9 @@ use tuckmill_manifest::records::EngineIdentity;
 use tuckmill_manifest::{BACKEND_ABI_VERSION, WORKER_PROTOCOL_VERSION};
 
 use crate::completion::CompletionTracker;
-use crate::forward::{self, Forward, KvPrecision, KvState, ModelWeights, NumericalProfile};
+use crate::forward::{
+    self, Forward, KvPrecision, KvState, ModelWeights, NumericalProfile, ProfileCounters,
+};
 use crate::loader::{BlockLoader, BlockPolicy};
 use crate::model;
 use crate::sampling::{self, Rng, SamplingConfig};
@@ -48,6 +50,8 @@ struct TuckCoreOptions {
     /// (default true; a bounded single streaming pass). Disabling is an
     /// explicit, recorded choice.
     verify_content_hash: Option<bool>,
+    /// Enable phase profiling counters (also via TUCKMILL_TUCKORE_PROFILE=1).
+    profile: Option<bool>,
 }
 
 struct Loaded {
@@ -58,6 +62,7 @@ struct Loaded {
     context_total: u64,
     profile: NumericalProfile,
     kv_precision: KvPrecision,
+    counters: ProfileCounters,
 }
 
 /// The experimental custom native executor.
@@ -189,6 +194,15 @@ impl InferenceBackend for TuckCore {
             }
         };
         let verify_content_hash = opts.verify_content_hash.unwrap_or(true);
+        let profile_enabled = opts.profile.unwrap_or(false)
+            || std::env::var("TUCKMILL_TUCKORE_PROFILE")
+                .map(|v| v == "1")
+                .unwrap_or(false);
+        let counters = ProfileCounters {
+            enabled: profile_enabled,
+            ..Default::default()
+        };
+        let load_start = Instant::now();
         let kv_precision = match opts.kv_precision.as_deref() {
             None | Some("f32") => KvPrecision::F32,
             Some("f16") => KvPrecision::F16,
@@ -237,6 +251,7 @@ impl InferenceBackend for TuckCore {
         // Full-payload identity: one bounded streaming pass over the file,
         // compared against the store's recorded canonical digest. Drifted
         // bytes must never execute; disabling is explicit and recorded.
+        let verify_start = Instant::now();
         let content_verified = if verify_content_hash {
             match &artifact.content_hash {
                 Some(expected) => {
@@ -260,6 +275,7 @@ impl InferenceBackend for TuckCore {
         } else {
             false
         };
+        ProfileCounters::record(&counters.content_verify_nanos, verify_start);
 
         // ---- configuration and type checks ----
         let registry = AdapterRegistry::builtin()?;
@@ -322,6 +338,7 @@ impl InferenceBackend for TuckCore {
             note.push_str("; ");
             note.push_str(&extra);
         }
+        ProfileCounters::record(&counters.load_nanos, load_start);
         self.loaded = Some(Loaded {
             loader,
             tracker,
@@ -330,6 +347,7 @@ impl InferenceBackend for TuckCore {
             context_total: plan.context.total_context,
             profile,
             kv_precision,
+            counters,
         });
         Ok(note)
     }
@@ -386,6 +404,11 @@ impl InferenceBackend for TuckCore {
             weights: &loaded.weights,
             profile: loaded.profile,
             control: &control,
+            counters: if loaded.counters.enabled {
+                Some(&loaded.counters)
+            } else {
+                None
+            },
         };
 
         (ctl.on_state)(RunState::Warming);
@@ -507,6 +530,11 @@ impl InferenceBackend for TuckCore {
             weights: &loaded.weights,
             profile: loaded.profile,
             control: &control,
+            counters: if loaded.counters.enabled {
+                Some(&loaded.counters)
+            } else {
+                None
+            },
         };
         let mut scored = 0u64;
         for position in positions {
@@ -544,6 +572,30 @@ impl InferenceBackend for TuckCore {
                     footprint_bytes: None,
                     kv_precision: Some(loaded.kv_precision.as_str().to_string()),
                     threads: Some(1), // scalar executor is single-threaded
+                    profile: if loaded.counters.enabled {
+                        let c = &loaded.counters;
+                        let ns = |a: &std::sync::atomic::AtomicU64| {
+                            a.load(Ordering::Relaxed) as f64 / 1e9
+                        };
+                        Some(serde_json::json!({
+                            "enabled": true,
+                            "load_seconds": ns(&c.load_nanos),
+                            "content_verify_seconds": ns(&c.content_verify_nanos),
+                            "forward_seconds": ns(&c.forward_nanos),
+                            "matvec_seconds": ns(&c.matvec_nanos),
+                            "matvec_fetch_seconds": ns(&c.matvec_fetch_nanos),
+                            "matvec_compute_seconds": ns(&c.matvec_compute_nanos),
+                            "embed_seconds": ns(&c.embed_nanos),
+                            "attention_seconds": ns(&c.attention_nanos),
+                            "norm_rope_seconds": ns(&c.norm_rope_nanos),
+                            "ffn_seconds": ns(&c.ffn_nanos),
+                            "tokens_processed": c.tokens.load(Ordering::Relaxed),
+                            "profile": loaded.profile.as_str(),
+                            "kv_precision": loaded.kv_precision.as_str(),
+                        }))
+                    } else {
+                        None
+                    },
                 }
             }
             None => BackendStats::default(),

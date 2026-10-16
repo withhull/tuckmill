@@ -66,6 +66,7 @@ pub fn dispatch(cmd: &Cmd, json: bool, data_dir: Option<&Path>) -> Result<ExitCo
             allow_test_engine,
             engine,
             quiet,
+            gpu_layers,
         } => run(
             model,
             prompt.clone(),
@@ -75,6 +76,7 @@ pub fn dispatch(cmd: &Cmd, json: bool, data_dir: Option<&Path>) -> Result<ExitCo
             *allow_test_engine,
             engine,
             *quiet,
+            *gpu_layers,
             json,
             data_dir,
         ),
@@ -126,6 +128,7 @@ pub fn dispatch(cmd: &Cmd, json: bool, data_dir: Option<&Path>) -> Result<ExitCo
             context,
             allow_test_engine,
             engine,
+            gpu_layers,
         } => bench(
             model,
             suite,
@@ -136,9 +139,15 @@ pub fn dispatch(cmd: &Cmd, json: bool, data_dir: Option<&Path>) -> Result<ExitCo
             *context,
             *allow_test_engine,
             engine,
+            *gpu_layers,
             json,
             data_dir,
         ),
+        Cmd::Stats {
+            model,
+            engine,
+            tokens,
+        } => stats(model, engine, *tokens, json, data_dir),
         Cmd::Cache { cmd } => match cmd {
             CacheCmd::List => cache_list(json, data_dir),
             CacheCmd::Prune { dry_run } => cache_prune(*dry_run, json, data_dir),
@@ -211,6 +220,15 @@ fn open_runtime(
     engine: &str,
     allow_test_engine: bool,
 ) -> Result<Arc<Runtime>> {
+    open_runtime_with_options(data_dir, engine, allow_test_engine, None)
+}
+
+fn open_runtime_with_options(
+    data_dir: Option<&Path>,
+    engine: &str,
+    allow_test_engine: bool,
+    engine_options: Option<serde_json::Value>,
+) -> Result<Arc<Runtime>> {
     let (engine_kind, engine_mode) = parse_engine(engine)?;
     Runtime::open(RuntimeOptions {
         data_dir: data_dir.map(|d| d.to_path_buf()),
@@ -219,8 +237,33 @@ fn open_runtime(
         worker_exe: std::env::current_exe().ok(),
         queue_capacity: 4,
         allow_test_engine,
+        engine_options,
         ..Default::default()
     })
+}
+
+/// Fold --gpu-layers into backend options; only the llama backend accepts it
+/// (and only for performance baselines, never arithmetic diagnostics).
+fn llama_gpu_options(engine: &str, gpu_layers: Option<i32>) -> Result<Option<serde_json::Value>> {
+    match gpu_layers {
+        None => Ok(None),
+        Some(n) => {
+            let (kind, _) = parse_engine(engine)?;
+            if kind != tuckmill_backend::EngineKind::LlamaCpp {
+                return Err(TuckmillError::new(
+                    ErrorCode::InvalidRequest,
+                    "--gpu-layers applies only to --engine llama (the Metal performance baseline); arithmetic diagnostics stay CPU",
+                ));
+            }
+            if n < 0 {
+                return Err(TuckmillError::new(
+                    ErrorCode::InvalidRequest,
+                    "--gpu-layers must be >= 0",
+                ));
+            }
+            Ok(Some(serde_json::json!({ "gpu_layers": n })))
+        }
+    }
 }
 
 // ---------------- doctor ----------------
@@ -754,10 +797,16 @@ fn run(
     allow_test_engine: bool,
     engine: &str,
     quiet: bool,
+    gpu_layers: Option<i32>,
     json: bool,
     data_dir: Option<&Path>,
 ) -> Result<ExitCode> {
-    let runtime = open_runtime(data_dir, engine, allow_test_engine)?;
+    let runtime = open_runtime_with_options(
+        data_dir,
+        engine,
+        allow_test_engine,
+        llama_gpu_options(engine, gpu_layers)?,
+    )?;
     let budget = resolve_budget(&runtime, memory_budget)?;
     let (artifact, adapter) = runtime.resolve_artifact(model)?;
     let plan = runtime.plan_for(&artifact, &adapter, budget, context, max_output)?;
@@ -1040,6 +1089,7 @@ fn bench(
     context: u64,
     allow_test_engine: bool,
     engine: &str,
+    gpu_layers: Option<i32>,
     json: bool,
     data_dir: Option<&Path>,
 ) -> Result<ExitCode> {
@@ -1049,7 +1099,12 @@ fn bench(
             format!("unknown suite {suite:?}; this build provides standard-v1"),
         ));
     }
-    let runtime = open_runtime(data_dir, engine, allow_test_engine)?;
+    let runtime = open_runtime_with_options(
+        data_dir,
+        engine,
+        allow_test_engine,
+        llama_gpu_options(engine, gpu_layers)?,
+    )?;
     let budget = resolve_budget(&runtime, memory_budget)?;
     let (artifact, adapter) = runtime.resolve_artifact(model)?;
     let plan = runtime.plan_for(&artifact, &adapter, budget, context, output as u64)?;
@@ -1183,6 +1238,148 @@ fn verify(
     if !passed {
         return Ok(ExitCode::from(1));
     }
+    Ok(ExitCode::SUCCESS)
+}
+
+// ---------------- stats ----------------
+
+fn stats(
+    model: &str,
+    engine: &str,
+    tokens: u64,
+    json: bool,
+    data_dir: Option<&Path>,
+) -> Result<ExitCode> {
+    let runtime = if engine.starts_with("llama") {
+        open_runtime_with_options(
+            data_dir,
+            engine,
+            false,
+            Some(serde_json::json!({ "profile": true })),
+        )?
+    } else {
+        open_runtime_with_options(
+            data_dir,
+            engine,
+            true,
+            Some(serde_json::json!({ "profile": true })),
+        )?
+    };
+    let budget = runtime.default_budget;
+    let (artifact, adapter) = runtime.resolve_artifact(model)?;
+    let plan = runtime.plan_for(&artifact, &adapter, budget, 512, tokens.max(1))?;
+    runtime.plan_admitted(&plan)?;
+    runtime.admit_engine(&plan)?;
+
+    // Probe with exact in-vocabulary ids (tokenizer-independent).
+    let payload = runtime.layout.artifact_payload_path(&artifact.artifact_id);
+    let insp = gguf::inspect(&payload, &gguf::Limits::default())?;
+    let vocab = insp.vocabulary_len().unwrap_or(16).max(16);
+    let prompt: Vec<u32> = (0..tokens.max(1))
+        .map(|i| ((i * 37 + 5) % vocab) as u32)
+        .collect();
+
+    let artifact_ref = tuckmill_backend::ArtifactRef::from_record(&artifact, &payload);
+    let ticket = runtime.submit()?;
+    let run = runtime.start_run(
+        &ticket,
+        plan.clone(),
+        artifact_ref,
+        prompt,
+        tokens.max(1),
+        Vec::new(),
+        0,
+    )?;
+    let committed;
+    let reason = loop {
+        match run.events.recv_timeout(std::time::Duration::from_secs(900)) {
+            Ok(tuckmill_supervisor::runtime::RunEvent::Token { .. }) => {}
+            Ok(tuckmill_supervisor::runtime::RunEvent::State(_)) => {}
+            Ok(tuckmill_supervisor::runtime::RunEvent::Done {
+                reason,
+                committed: c,
+            }) => {
+                committed = c;
+                break reason;
+            }
+            Ok(tuckmill_supervisor::runtime::RunEvent::Error {
+                code,
+                message,
+                action,
+            }) => {
+                runtime.shutdown();
+                return Err(TuckmillError::new(
+                    serde_json::from_value::<ErrorCode>(serde_json::Value::String(code))
+                        .unwrap_or(ErrorCode::WorkerFailed),
+                    message,
+                )
+                .with_action(action));
+            }
+            Err(e) => {
+                runtime.shutdown();
+                return Err(TuckmillError::new(
+                    ErrorCode::WorkerFailed,
+                    format!("probe run ended without Done: {e}"),
+                ));
+            }
+        }
+    };
+    let backend_stats = runtime.backend_stats();
+    let identity = runtime.engine_identity();
+
+    let mut value = serde_json::json!({
+        "engine": identity.engine,
+        "build_id": identity.build_id,
+        "reason": reason.as_str(),
+        "committed_tokens": committed,
+        "stats": backend_stats,
+    });
+    let profile = value
+        .get("stats")
+        .and_then(|s| s.get("profile"))
+        .filter(|p| !p.is_null())
+        .cloned();
+    if let Some(profile) = profile {
+        if let Some(obj) = value.as_object_mut() {
+            obj.insert("profile".into(), profile);
+        }
+    }
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&value).map_err(|e| {
+                tuckmill_manifest::error::json_error(e, ErrorCode::Internal, "json")
+            })?
+        );
+    } else {
+        println!(
+            "backend {} ({}) — {} committed tokens in the probe",
+            identity.engine, identity.build_id, committed
+        );
+        if let Some(stats) = value.get("stats").and_then(|s| s.as_object()) {
+            for key in [
+                "logical_read_bytes",
+                "blocks_loaded",
+                "cache_hits",
+                "cache_misses",
+                "evictions",
+                "in_flight_leases",
+                "kv_precision",
+                "threads",
+            ] {
+                if let Some(v) = stats.get(key) {
+                    println!("  {key}: {v}");
+                }
+            }
+        }
+        if let Some(profile) = value.get("profile").and_then(|p| p.as_object()) {
+            println!("  profile:");
+            for (k, v) in profile {
+                println!("    {k}: {v}");
+            }
+        }
+    }
+    runtime.shutdown();
     Ok(ExitCode::SUCCESS)
 }
 

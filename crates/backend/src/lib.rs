@@ -229,6 +229,10 @@ pub struct BackendStats {
     /// Thread count in use for compute, when the backend is threaded.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub threads: Option<u32>,
+    /// Optional backend profile counters (phase attribution); present only
+    /// when profiling was explicitly enabled for the run.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile: Option<serde_json::Value>,
 }
 
 /// The versioned backend contract.

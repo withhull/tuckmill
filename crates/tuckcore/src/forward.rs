@@ -6,7 +6,9 @@
 //! storage and accumulation, RMSNorm/RoPE/SwiGLU/GQA exactly as declared by
 //! the artifact's adapter, no approximations.
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::Instant;
 
 use tuckmill_manifest::error::{ErrorCode, Result, TuckmillError};
 use tuckmill_manifest::gguf::GgufInspection;
@@ -300,6 +302,36 @@ impl NumericalProfile {
     }
 }
 
+/// Phase counters for attributing wall-clock time (explicitly enabled per
+/// run; disabled counters are never touched by the hot path except one
+/// `if let Some` branch).
+#[derive(Debug, Default)]
+pub struct ProfileCounters {
+    pub enabled: bool,
+    pub forward_nanos: AtomicU64,
+    pub matvec_nanos: AtomicU64,
+    pub matvec_fetch_nanos: AtomicU64,
+    pub matvec_compute_nanos: AtomicU64,
+    pub embed_nanos: AtomicU64,
+    pub attention_nanos: AtomicU64,
+    pub norm_rope_nanos: AtomicU64,
+    pub ffn_nanos: AtomicU64,
+    pub load_nanos: AtomicU64,
+    pub content_verify_nanos: AtomicU64,
+    pub tokens: AtomicU64,
+}
+
+impl ProfileCounters {
+    fn add(counter: &AtomicU64, start: Instant) {
+        counter.fetch_add(start.elapsed().as_nanos() as u64, Ordering::Relaxed);
+    }
+
+    /// Public single-timer helper (executor phases).
+    pub fn record(counter: &AtomicU64, start: Instant) {
+        Self::add(counter, start);
+    }
+}
+
 /// The forward executor: streams weights, computes one token at a time.
 pub struct Forward<'a> {
     pub loader: &'a BlockLoader,
@@ -310,6 +342,9 @@ pub struct Forward<'a> {
     /// and applies pending cache trims at a safe point. Never releases
     /// in-flight buffers (pinned chunks are protected by the loader).
     pub control: &'a dyn Fn(),
+    /// Optional phase counters (None = not profiling; zero overhead beyond
+    /// the branch).
+    pub counters: Option<&'a ProfileCounters>,
 }
 
 /// Cancellation hook checked between layers and chunks.
@@ -319,6 +354,22 @@ impl<'a> Forward<'a> {
     /// Process one token at `pos` (0-based), appending to `kv`, producing
     /// logits for the next token. Returns the logits vector (vocab sized).
     pub fn forward_token(
+        &self,
+        kv: &mut KvState,
+        token: u32,
+        pos: usize,
+        cancelled: CancelledFn<'_>,
+    ) -> Result<Vec<f32>> {
+        let _total = self.counters.map(|_| Instant::now());
+        let result = self.forward_token_inner(kv, token, pos, cancelled);
+        if let (Some(counters), Some(start)) = (self.counters, _total) {
+            ProfileCounters::add(&counters.forward_nanos, start);
+            counters.tokens.fetch_add(1, Ordering::Relaxed);
+        }
+        result
+    }
+
+    fn forward_token_inner(
         &self,
         kv: &mut KvState,
         token: u32,
@@ -348,7 +399,11 @@ impl<'a> Forward<'a> {
         let head_dim = key_len;
         let group = heads / kv_heads;
 
+        let embed_start = self.counters.map(|_| Instant::now());
         let mut x = self.embed_row(self.weights.ids.token_embd, token)?;
+        if let (Some(counters), Some(start)) = (self.counters, embed_start) {
+            ProfileCounters::add(&counters.embed_nanos, start);
+        }
         debug_assert_eq!(x.len(), hidden);
 
         let mut logits: Vec<f32> = Vec::new();
@@ -358,6 +413,7 @@ impl<'a> Forward<'a> {
             }
             (self.control)();
             // ---- attention block ----
+            let attn_start = self.counters.map(|_| Instant::now());
             let normed = rmsnorm(&x, &self.weights.norms.attn_norm[layer], cfg.rms_eps);
             let mut q = vec![0.0f32; heads * head_dim];
             self.matvec(self.weights.ids.attn_q[layer], &normed, &mut q, cancelled)?;
@@ -366,6 +422,7 @@ impl<'a> Forward<'a> {
             let mut v = vec![0.0f32; kv_heads * cfg.value_length as usize];
             self.matvec(self.weights.ids.attn_v[layer], &normed, &mut v, cancelled)?;
 
+            let nr_start = self.counters.map(|_| Instant::now());
             for h in 0..heads {
                 let qh = &mut q[h * head_dim..(h + 1) * head_dim];
                 rmsnorm_in_place(qh, &self.weights.norms.q_norm[layer], cfg.rms_eps);
@@ -375,6 +432,9 @@ impl<'a> Forward<'a> {
                 let kh = &mut k[h * key_len..(h + 1) * key_len];
                 rmsnorm_in_place(kh, &self.weights.norms.k_norm[layer], cfg.rms_eps);
                 rope_apply(kh, pos, &self.weights.rope_inv_freq);
+            }
+            if let (Some(counters), Some(start)) = (self.counters, nr_start) {
+                ProfileCounters::add(&counters.norm_rope_nanos, start);
             }
 
             for h in 0..kv_heads {
@@ -427,8 +487,12 @@ impl<'a> Forward<'a> {
             for i in 0..hidden {
                 x[i] += proj[i];
             }
+            if let (Some(counters), Some(start)) = (self.counters, attn_start) {
+                ProfileCounters::add(&counters.attention_nanos, start);
+            }
 
             // ---- FFN block (SwiGLU) ----
+            let ffn_start = self.counters.map(|_| Instant::now());
             let normed = rmsnorm(&x, &self.weights.norms.ffn_norm[layer], cfg.rms_eps);
             let mut gate = vec![0.0f32; cfg.ffn as usize];
             self.matvec(
@@ -452,6 +516,9 @@ impl<'a> Forward<'a> {
             for i in 0..hidden {
                 x[i] += down[i];
             }
+            if let (Some(counters), Some(start)) = (self.counters, ffn_start) {
+                ProfileCounters::add(&counters.ffn_nanos, start);
+            }
         }
         if cancelled() {
             return Err(cancelled_error());
@@ -474,6 +541,21 @@ impl<'a> Forward<'a> {
     /// Streaming, block-bounded matrix-vector product. Each chunk is pinned
     /// and leased until its work completes.
     pub fn matvec(
+        &self,
+        tensor: usize,
+        x: &[f32],
+        out: &mut Vec<f32>,
+        cancelled: CancelledFn<'_>,
+    ) -> Result<()> {
+        let total_start = self.counters.map(|_| Instant::now());
+        let result = self.matvec_inner(tensor, x, out, cancelled);
+        if let (Some(counters), Some(start)) = (self.counters, total_start) {
+            ProfileCounters::add(&counters.matvec_nanos, start);
+        }
+        result
+    }
+
+    fn matvec_inner(
         &self,
         tensor: usize,
         x: &[f32],
@@ -529,18 +611,36 @@ impl<'a> Forward<'a> {
                 _ => {}
             }
         }
+        // K01 fused kernels (oracle profile): no f32 scratch materialization
+        // for the dominant types; everything else keeps dequant+dot.
+        if matches!(entry.type_id, 8 | 1) {
+            return self.matvec_fused(
+                tensor,
+                x,
+                out,
+                row.elems_per_row as usize,
+                row.bytes_per_row as usize,
+                row.rows_per_chunk,
+                cancelled,
+            );
+        }
         let mut scratch: Vec<f32> = Vec::new();
         for chunk in 0..entry.chunks {
             if cancelled() {
                 return Err(cancelled_error());
             }
             (self.control)();
+            let fetch_start = self.counters.map(|_| Instant::now());
             let block = self.loader.block(tensor, chunk as u32)?;
             self.loader.pin(tensor, chunk as u32);
             let fence = self.tracker.submit(vec![block.clone()]);
+            if let (Some(counters), Some(start)) = (self.counters, fetch_start) {
+                ProfileCounters::add(&counters.matvec_fetch_nanos, start);
+            }
+            let compute_start = self.counters.map(|_| Instant::now());
             let result = (|| -> Result<()> {
                 scratch.clear();
-                tensor::dequant_into(entry.type_id, &block.bytes, &mut scratch)?;
+                tensor::dequant_into(entry.type_id, block.bytes(), &mut scratch)?;
                 let elems = row.elems_per_row as usize;
                 let rows_in_block = scratch.len() / elems;
                 let first_row = (chunk * row.rows_per_chunk) as usize;
@@ -554,11 +654,65 @@ impl<'a> Forward<'a> {
                 }
                 Ok(())
             })();
+            if let (Some(counters), Some(start)) = (self.counters, compute_start) {
+                ProfileCounters::add(&counters.matvec_compute_nanos, start);
+            }
             // Completion fence: release the lease (and unpin) only now.
             let released = self.tracker.complete(fence);
             debug_assert!(released.is_some());
             self.loader.unpin(tensor, chunk as u32);
             result?;
+        }
+        Ok(())
+    }
+
+    /// Fused packed dot path: Q8_0 rows use int8→f32 lanes; F16 rows use
+    /// conversion + fma. Blocks are pinned and leased per chunk exactly like
+    /// every other path.
+    #[allow(clippy::too_many_arguments)]
+    fn matvec_fused(
+        &self,
+        tensor: usize,
+        x: &[f32],
+        out: &mut [f32],
+        elems_per_row: usize,
+        bytes_per_row: usize,
+        rows_per_chunk: u64,
+        cancelled: CancelledFn<'_>,
+    ) -> Result<()> {
+        let entry = self.loader.entry(tensor);
+        for chunk in 0..entry.chunks {
+            if cancelled() {
+                return Err(cancelled_error());
+            }
+            (self.control)();
+            let fetch_start = self.counters.map(|_| Instant::now());
+            let block = self.loader.block(tensor, chunk as u32)?;
+            self.loader.pin(tensor, chunk as u32);
+            let fence = self.tracker.submit(vec![block.clone()]);
+            if let (Some(counters), Some(start)) = (self.counters, fetch_start) {
+                ProfileCounters::add(&counters.matvec_fetch_nanos, start);
+            }
+            let compute_start = self.counters.map(|_| Instant::now());
+            let bytes = block.bytes();
+            let rows_in_block = bytes.len() / bytes_per_row;
+            let first_row = (chunk * rows_per_chunk) as usize;
+            for r in 0..rows_in_block {
+                let row_bytes = &bytes[r * bytes_per_row..(r + 1) * bytes_per_row];
+                let acc = match entry.type_id {
+                    8 => crate::kernels::dot_q8_0_x_f32(row_bytes, x),
+                    1 => crate::kernels::dot_f16_x_f32(row_bytes, x),
+                    _ => unreachable!("matvec_fused is entered only for Q8_0/F16"),
+                };
+                out[first_row + r] = acc;
+            }
+            let _ = elems_per_row;
+            if let (Some(counters), Some(start)) = (self.counters, compute_start) {
+                ProfileCounters::add(&counters.matvec_compute_nanos, start);
+            }
+            let released = self.tracker.complete(fence);
+            debug_assert!(released.is_some());
+            self.loader.unpin(tensor, chunk as u32);
         }
         Ok(())
     }
@@ -580,18 +734,7 @@ impl<'a> Forward<'a> {
         let first_row = (chunk * rows_per_chunk) as usize;
         for r in 0..rows_in_block {
             let row_bytes = &bytes[r * bytes_per_row..(r + 1) * bytes_per_row];
-            let mut acc = 0.0f32;
-            for (blk, b) in row_bytes.chunks_exact(34).enumerate() {
-                let d_w = f16_to_f32(u16::from_le_bytes([b[0], b[1]]));
-                let qx = &x_qs[blk];
-                let mut sumi: i32 = 0;
-                for i in 0..32 {
-                    sumi += (b[2 + i] as i8 as i32) * (qx[i] as i32);
-                }
-                let d = d_w * x_d[blk];
-                acc += d * (sumi as f32);
-            }
-            out[first_row + r] = acc;
+            out[first_row + r] = crate::kernels::dot_q8_0_q8_0(row_bytes, x_qs, x_d);
         }
         Ok(())
     }
@@ -610,12 +753,7 @@ impl<'a> Forward<'a> {
         let first_row = (chunk * rows_per_chunk) as usize;
         for r in 0..rows_in_block {
             let row_bytes = &bytes[r * bytes_per_row..(r + 1) * bytes_per_row];
-            let mut acc = 0.0f32;
-            for (i, pair) in row_bytes.chunks_exact(2).enumerate() {
-                let w = f16_to_f32(u16::from_le_bytes([pair[0], pair[1]]));
-                acc += w * x16[i];
-            }
-            out[first_row + r] = acc;
+            out[first_row + r] = crate::kernels::dot_f16_x_f32(row_bytes, x16);
         }
         Ok(())
     }
@@ -646,7 +784,7 @@ impl<'a> Forward<'a> {
             self.loader.pin(tensor, chunk as u32);
             let fence = self.tracker.submit(vec![block.clone()]);
             let result = self.q8_block_dot(
-                &block.bytes,
+                block.bytes(),
                 bytes_per_row,
                 rows_per_chunk,
                 chunk,
@@ -684,17 +822,25 @@ impl<'a> Forward<'a> {
                 return Err(cancelled_error());
             }
             (self.control)();
+            let fetch_start = self.counters.map(|_| Instant::now());
             let block = self.loader.block(tensor, chunk as u32)?;
             self.loader.pin(tensor, chunk as u32);
             let fence = self.tracker.submit(vec![block.clone()]);
+            if let (Some(counters), Some(start)) = (self.counters, fetch_start) {
+                ProfileCounters::add(&counters.matvec_fetch_nanos, start);
+            }
+            let compute_start = self.counters.map(|_| Instant::now());
             let result = self.f16_block_dot(
-                &block.bytes,
+                block.bytes(),
                 bytes_per_row,
                 rows_per_chunk,
                 chunk,
                 &x16,
                 out,
             );
+            if let (Some(counters), Some(start)) = (self.counters, compute_start) {
+                ProfileCounters::add(&counters.matvec_compute_nanos, start);
+            }
             let released = self.tracker.complete(fence);
             debug_assert!(released.is_some());
             self.loader.unpin(tensor, chunk as u32);
@@ -894,6 +1040,7 @@ mod tests {
             weights: &f.weights,
             profile: NumericalProfile::OracleF32,
             control: &|| {},
+            counters: None,
         };
         let tokens = [1u32, 2, 3];
         let a = fwd.logits_at(&tokens, 2, &|| false).unwrap();
@@ -923,6 +1070,7 @@ mod tests {
             weights: &resident.weights,
             profile: NumericalProfile::OracleF32,
             control: &|| {},
+            counters: None,
         }
         .logits_at(&tokens, 3, &|| false)
         .unwrap();
@@ -932,6 +1080,7 @@ mod tests {
             weights: &streamed.weights,
             profile: NumericalProfile::OracleF32,
             control: &|| {},
+            counters: None,
         }
         .logits_at(&tokens, 3, &|| false)
         .unwrap();
@@ -959,6 +1108,7 @@ mod tests {
             weights: &f.weights,
             profile: NumericalProfile::OracleF32,
             control: &|| {},
+            counters: None,
         };
         let err = fwd.logits_at(&[1, 2, 3], 2, &|| true).unwrap_err();
         assert_eq!(err.code(), ErrorCode::Cancelled);
@@ -978,6 +1128,7 @@ mod tests {
             weights: &f.weights,
             profile: NumericalProfile::OracleF32,
             control: &|| {},
+            counters: None,
         }
         .logits_at(&tokens, 2, &|| false)
         .unwrap();
@@ -987,6 +1138,7 @@ mod tests {
             weights: &f.weights,
             profile: NumericalProfile::LlamaCpu,
             control: &|| {},
+            counters: None,
         }
         .logits_at(&tokens, 2, &|| false)
         .unwrap();
@@ -1012,6 +1164,7 @@ mod tests {
             weights: &f.weights,
             profile: NumericalProfile::OracleF32,
             control: &|| {},
+            counters: None,
         };
         let err = fwd.logits_at(&[999_999], 0, &|| false).unwrap_err();
         assert_eq!(err.code(), ErrorCode::InvalidRequest);
@@ -1026,6 +1179,7 @@ mod tests {
             weights: &f.weights,
             profile: NumericalProfile::OracleF32,
             control: &|| {},
+            counters: None,
         };
         assert!(fwd.logits_at(&[1, 2], 5, &|| false).is_err());
         assert!(fwd.logits_at(&[], 0, &|| false).is_err());

@@ -72,6 +72,10 @@ pub struct RuntimeOptions {
     /// Never enabled implicitly: without it, non-certified profiles are
     /// refused with a typed error (PRD claim policy).
     pub allow_test_engine: bool,
+    /// Backend load options passed through to the worker (e.g. llama
+    /// `gpu_layers` for the Metal performance baseline). Recorded in worker
+    /// notes; validated and rejected by backends that do not know a key.
+    pub engine_options: Option<serde_json::Value>,
 }
 
 impl Default for RuntimeOptions {
@@ -91,6 +95,7 @@ impl Default for RuntimeOptions {
             governor_config: GovernorConfig::default(),
             monitor: true,
             allow_test_engine: false,
+            engine_options: None,
         }
     }
 }
@@ -192,6 +197,7 @@ pub struct Runtime {
     monitor_thread: Mutex<Option<std::thread::JoinHandle<()>>>,
     monitor_stop: Arc<AtomicBool>,
     allow_test_engine: bool,
+    engine_options: Option<serde_json::Value>,
     /// Worker PID for lock-free monitoring (0 = no worker).
     worker_pid: AtomicU32,
     /// Consecutive footprint-overrun samples (enforcement escalates at 3).
@@ -270,6 +276,7 @@ impl Runtime {
             monitor_thread: Mutex::new(None),
             monitor_stop: Arc::new(AtomicBool::new(false)),
             allow_test_engine: options.allow_test_engine,
+            engine_options: options.engine_options,
             worker_pid: AtomicU32::new(0),
             overrun_streak: AtomicU64::new(0),
         });
@@ -755,7 +762,7 @@ impl Runtime {
                         &self.layout.tmp_dir(),
                         self.engine_kind,
                     )?;
-                    let note = worker.load(plan, artifact, None)?;
+                    let note = worker.load(plan, artifact, self.engine_options.as_ref())?;
                     self.logger.info(
                         "WORKER_LOADED",
                         [("note".to_string(), serde_json::json!(note))]
@@ -1133,6 +1140,7 @@ mod tests {
             },
             monitor: true,
             allow_test_engine: true,
+            engine_options: None,
         })
         .unwrap();
         (dir, runtime, signals)

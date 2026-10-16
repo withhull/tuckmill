@@ -19,9 +19,11 @@ quality.
 > tokenization), and the **pinned llama.cpp reference** (`--engine llama`,
 > runtime-loaded, never vendored). Stage A is underway: Qwen3-0.6B executes
 > end-to-end on real weights, `verify --reference` records teacher-forced
-> logits under registered per-dtype tolerances, and the scalar oracle's gap
-> to llama.cpp CPU is measured (that gap, not vibes, names the kernel work).
-> Nothing is certified; no Metal kernels exist (K01–K09 specified); no
+> logits under registered per-dtype tolerances, and the measured gap to
+> llama.cpp named the kernel work: K01's first CPU increment (NEON fused
+> packed dot, zero-copy mapped weight blocks) is implemented and re-validated
+> — scheduling stays bit-exact and the registered envelopes are unchanged.
+> Nothing is certified; no Metal kernel exists (K02–K09 specified); no
 > performance comparative claim is made. Stage A verification is hardened:
 > malformed scoring fails closed, verification records are immutable with
 > held-out qualification, the governor drives real backend commands
@@ -50,6 +52,8 @@ tuckmill verify my-model --reference             # llama.cpp vs TuckCore logits 
                                                  # registered per-dtype tolerances
 tuckmill run my-model --allow-test-engine        # synthetic pipeline run
 tuckmill bench my-model --engine tuckcore        # machine-readable record
+tuckmill bench my-model --engine llama --gpu-layers 99   # Metal baseline (performance only)
+tuckmill stats my-model --engine tuckcore        # backend stats + phase profile counters
 tuckmill serve --allow-test-engine               # loopback API (127.0.0.1:8378)
 tuckmill cache list && tuckmill cache prune --dry-run
 ```
@@ -96,12 +100,13 @@ architecture.
 | `import` / `pack` — resumable chunked-digest imports, atomic publish, bounded lossless packer with per-tile checksums and verify | ✅ |
 | `plan` — `R + U + H ≤ B` admission, KV math, resident / streamed-MoE / streamed-dense selection, typed infeasibility, deterministic cost model with recorded assumptions | ✅ |
 | `run` / `serve` — isolated worker process, versioned framed protocol, streaming, cancellation, pause/resume, bounded queue, typed errors, loopback HTTP with bearer auth + SSE | ✅ |
-| `run --engine tuckcore` — real-weight dense-Qwen3 execution: bounded block loader (LRU byte budget, pinned/leased buffers), scalar f32 forward (RMSNorm, NeoX RoPE, GQA, SwiGLU), F32/F16/BF16/Q8_0/Q4_0/Q4_1 | ✅ experimental, uncertified |
+| `run --engine tuckcore` — real-weight dense-Qwen3 execution: bounded block loader (LRU byte budget, pinned/leased buffers, zero-copy mapped views with owned-read fallback), scalar f32 forward (RMSNorm, NeoX RoPE, GQA, SwiGLU) plus a first NEON kernel increment (K01 — fused Q8_0/F16 packed dot with scalar fallback), F32/F16/BF16/Q8_0/Q4_0/Q4_1 | ✅ experimental, uncertified |
 | `verify` — resident vs forced-streaming with identical token IDs: teacher-forced logits (bit-exact at Stage 0), eviction and footprint evidence, machine-readable record | ✅ |
 | Governor — Normal/Constrained/Paused/Draining/Failed with stability-window resume; driven by real memory-pressure and thermal signals | ✅ |
 | `bench` — standard-v1 records with per-prompt data, cache-state labels, caveats | ✅ |
 | llama.cpp/ggml reference backend (`--engine llama`) — pinned revision via a header-checked C shim, loaded at runtime (never vendored); `verify --reference` compares it against TuckCore on identical token IDs | ✅ integrated (wrapper uncertified) |
-| Custom Metal kernels (K01–K09) | ⛔ specified only; TuckCore Stage 0 is the scalar oracle they will be validated against |
+| Custom CPU kernels | 🟡 K01's first increment — aarch64 NEON fused Q8_0/F16 dot with zero-copy mapped blocks — implemented and numerically validated; K02–K09 specified |
+| Custom Metal kernels | ⛔ none implemented; the scalar CPU path remains the arithmetic oracle |
 | MoE streaming, hybrid/compressed (Bonsai) execution | ⛔ gated milestones |
 
 ## Architecture
@@ -115,8 +120,8 @@ planner  ->  versioned ExecutionPlan (mode, budget, assumptions, confidence)
         |
 InferenceBackend interface (versioned, ADR-005)
    ├── reference-test   synthetic pipeline engine (disclosed)
-   ├── tuckcore         experimental custom executor, scalar f32 reference kernels
-   └── reference        pinned llama.cpp/ggml (planned: compatibility + oracle)
+   ├── tuckcore         experimental custom executor: scalar f32 reference kernels + first NEON increment (K01)
+   └── reference        pinned llama.cpp/ggml (compatibility + oracle; wrapper uncertified)
         |
 resident | partially streamed | storage-backed execution, chosen by the planner
 ```
@@ -140,13 +145,13 @@ crates/manifest     schemas, GGUF/Safetensors inspection, adapters, fixtures
 crates/backend      versioned inference-backend interface
 crates/planner      device profiler, admission/KV math, cost model, calibration, kernel registry
 crates/store        imports, downloads, packing, cache/GC
-crates/tuckcore     experimental executor: block loader, completion fences, scalar Qwen3 forward, tokenizer
+crates/tuckcore     experimental executor: zero-copy block loader, completion fences, Qwen3 forward (scalar oracle + K01 NEON kernels), tokenizer
 crates/llamaref     pinned llama.cpp reference backend (dlopen of the checked tm shim)
 crates/supervisor   queue, ledger, governor, worker protocol/process, API, bench, verify
 crates/cli          the tuckmill binary (incl. hidden __worker-reference)
-native/executor     C ABI header + protocol spec (PROTOCOL.md, v2)
+native/executor     C ABI header + protocol spec (PROTOCOL.md, v4)
 native/llamaref     tm_llama_shim.c: narrow C surface over pinned llama.cpp
-kernels/            K01–K09 work-package registry (all "specified")
+kernels/            K01–K09 work-package registry (K01 implemented increment; K02–K09 specified)
 adapters/           qwen3, qwen3moe, qwen3.5-hybrid, bonsai2-hybrid specs
 benchmarks/         standard-v1 frozen workload; comparator program (llama.cpp, MLX, Splash)
 docs/adr/           ADR-001..006
@@ -157,7 +162,7 @@ scripts/            build.sh, test.sh, demo.sh
 ## Verification and benchmarks
 
 `scripts/test.sh` runs formatting, `clippy -D warnings`, and the full test
-suite (288 tests),
+suite (293 tests),
 including adversarial GGUF/Safetensors fixtures, planner math, governor
 semantics, import/pack fault injection, worker-protocol framing, HTTP
 auth/SSE, CLI end-to-end runs (isolated worker, crash injection, SIGINT

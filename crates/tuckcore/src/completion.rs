@@ -22,7 +22,7 @@ pub struct Lease {
 
 impl Lease {
     pub fn bytes(&self) -> u64 {
-        self.blocks.iter().map(|b| b.bytes.len() as u64).sum()
+        self.blocks.iter().map(|b| b.bytes().len() as u64).sum()
     }
 }
 
@@ -134,14 +134,14 @@ mod tests {
         loader.pin(block.tensor, block.chunk);
         let fence = tracker.submit(vec![block.clone()]);
         assert_eq!(tracker.in_flight(), 1);
-        assert_eq!(tracker.in_flight_bytes(), block.bytes.len() as u64);
+        assert_eq!(tracker.in_flight_bytes(), block.bytes().len() as u64);
 
         // Forced eviction while leased: the pinned/leased block survives.
         assert_eq!(loader.evict_all(), 0);
 
         // Fence completes: release, then eviction succeeds.
         let lease = tracker.complete(fence).expect("lease released");
-        assert_eq!(lease.bytes(), block.bytes.len() as u64);
+        assert_eq!(lease.bytes(), block.bytes().len() as u64);
         for (t, c) in &lease.keys {
             loader.unpin(*t, *c);
         }
@@ -150,7 +150,7 @@ mod tests {
         assert!(loader.evict_all() >= 1);
         // The Arc still owns valid bytes after cache eviction and release.
         assert_eq!(block.generation, original_generation);
-        assert!(!block.bytes.is_empty());
+        assert!(!block.bytes().is_empty());
     }
 
     #[test]

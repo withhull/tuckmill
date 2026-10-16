@@ -26,7 +26,7 @@
 #include <string.h>
 #include <stdlib.h>
 
-#define TM_SHIM_VERSION 3
+#define TM_SHIM_VERSION 4
 
 typedef struct tm_llama {
     struct llama_model   *model;
@@ -62,8 +62,8 @@ const char *tm_llama_build_info(void) {
     return "llama.cpp pinned revision (see scripts/fetch-llama.sh)";
 }
 
-tm_llama *tm_load(const char *path, int n_ctx, int n_threads, int kv_f16,
-                  int vocab_only, char *err, int err_cap) {
+tm_llama *tm_load(const char *path, int n_ctx, int n_threads, int gpu_layers,
+                  int kv_f16, int vocab_only, char *err, int err_cap) {
     if (path == NULL) {
         tm_set_err(err, err_cap, "null model path");
         return NULL;
@@ -79,7 +79,7 @@ tm_llama *tm_load(const char *path, int n_ctx, int n_threads, int kv_f16,
     llama_backend_init();
 
     struct llama_model_params mparams = llama_model_default_params();
-    mparams.n_gpu_layers = 0; /* CPU reference path (see header comment) */
+    mparams.n_gpu_layers = gpu_layers; /* 0 = CPU reference; >0 = Metal baseline */
     mparams.vocab_only   = vocab_only != 0; /* tokenizer reference loads vocab only */
     /* Pin to the CPU device: this prevents GPU backend initialization (Metal
      * shader compilation, device probing) for a CPU reference path, keeping
@@ -87,7 +87,9 @@ tm_llama *tm_load(const char *path, int n_ctx, int n_threads, int kv_f16,
      * separately measured milestone. */
     ggml_backend_dev_t cpu_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
     ggml_backend_dev_t cpu_devs[2] = { cpu_dev, NULL };
-    if (cpu_dev != NULL) {
+    if (gpu_layers <= 0 && cpu_dev != NULL) {
+        /* CPU-only reference/diagnostic path: pin the device list so no GPU
+         * backend work happens. GPU offload (gpu_layers > 0) uses defaults. */
         mparams.devices = cpu_devs;
     }
 

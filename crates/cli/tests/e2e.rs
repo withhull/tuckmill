@@ -73,8 +73,20 @@ fn doctor_reports_the_real_machine_and_never_guesses() {
         .map(|k| k["status"].as_str().unwrap())
         .collect();
     assert!(
-        statuses.iter().all(|s| *s == "specified"),
-        "nothing implemented yet"
+        statuses
+            .iter()
+            .all(|s| *s == "specified" || *s == "implemented"),
+        "kernel statuses are specified/implemented only"
+    );
+    let k01 = v["kernels"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|k| k["id"] == "K01")
+        .expect("K01 present in the registry");
+    assert_eq!(
+        k01["status"], "implemented",
+        "K01's first increment has landed"
     );
     // Human output too.
     let out = env.run_ok(&["doctor"]);

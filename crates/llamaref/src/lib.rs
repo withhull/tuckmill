@@ -29,7 +29,7 @@ use tuckmill_manifest::{BACKEND_ABI_VERSION, WORKER_PROTOCOL_VERSION};
 
 /// llama.cpp revision this shim is compiled against (scripts/fetch-llama.sh).
 pub const LLAMA_REVISION: &str = "b11695";
-pub const SHIM_VERSION: c_int = 3;
+pub const SHIM_VERSION: c_int = 4;
 const LIB_FILE_NAME: &str = "libtm_llama.dylib";
 
 #[repr(C)]
@@ -40,6 +40,7 @@ struct TmHandle {
 type FnShimVersion = unsafe extern "C" fn() -> c_int;
 type FnLoad = unsafe extern "C" fn(
     *const c_char,
+    c_int,
     c_int,
     c_int,
     c_int,
@@ -249,6 +250,7 @@ impl ReferenceTokenizer {
                 0,
                 0,
                 0,
+                0,
                 /*vocab_only=*/ 1,
                 err_buf.as_mut_ptr() as *mut c_char,
                 err_buf.len() as c_int,
@@ -394,6 +396,10 @@ struct LlamaRefOptions {
     /// "f16" (llama.cpp default) or "f32"; explicit so comparisons never
     /// leave cache precision uncontrolled.
     kv_precision: Option<String>,
+    /// GPU offload layers for the Metal baseline (0 = CPU reference, the
+    /// default; greater values are for performance comparison only, never
+    /// for arithmetic diagnostics).
+    gpu_layers: Option<i32>,
 }
 
 pub struct LlamaRef {
@@ -606,6 +612,7 @@ unsafe extern "C" fn unreachable_load(
     _: c_int,
     _: c_int,
     _: c_int,
+    _: c_int,
     _: *mut c_char,
     _: c_int,
 ) -> *mut TmHandle {
@@ -734,11 +741,13 @@ impl InferenceBackend for LlamaRef {
         })?;
         let mut err_buf = vec![0u8; 512];
         // SAFETY: shim was version-checked; path and error buffer are valid.
+        let gpu_layers = opts.gpu_layers.unwrap_or(0).max(0);
         let handle = unsafe {
             (shim.load)(
                 c_path.as_ptr(),
                 plan.context.total_context as c_int,
                 threads,
+                gpu_layers,
                 kv_f16 as c_int,
                 0, // full context
                 err_buf.as_mut_ptr() as *mut c_char,
@@ -810,7 +819,7 @@ impl InferenceBackend for LlamaRef {
         };
         self.shim = shim;
         self.note = format!(
-            "llama.cpp reference backend ({LLAMA_REVISION}, CPU): {desc} [arch {arch}], {vocab} vocab, {} context, kv {}, {} threads, {} model bytes; wrapper uncertified",
+            "llama.cpp reference backend ({LLAMA_REVISION}, gpu_layers {gpu_layers}): {desc} [arch {arch}], {vocab} vocab, {} context, kv {}, {} threads, {} model bytes; wrapper uncertified",
             self.ctx_tokens,
             self.kv_precision,
             self.threads,

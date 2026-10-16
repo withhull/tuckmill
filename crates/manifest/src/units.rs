@@ -62,7 +62,7 @@ impl Bytes {
     }
 
     pub fn is_multiple_of(self, unit: u64) -> bool {
-        unit != 0 && self.0 % unit == 0
+        unit != 0 && self.0.is_multiple_of(unit)
     }
 
     /// Parse a user budget string. Accepts `"3GiB"`, `"2gib"`, `"1.5GiB"`,

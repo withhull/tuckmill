@@ -3,8 +3,11 @@
 Statuses live in [`registry.json`](registry.json) and are enforced by
 `tuckmill_planner::kernel_registry`: a kernel must never be selected before
 its correctness gate passes, and every selection keeps a validated reference
-fallback decision. **This build implements none of them** — every plan lists
-the kernels its profile requires so the gap is explicit rather than implied.
+fallback decision. **K01 has its first implemented increment** (aarch64 NEON
+fused Q8_0/F16 packed dot with zero-copy mapped blocks; Q4_0/Q4_1 and the
+Metal path remain on the scalar/reference path). All other packages are
+specified only — every plan lists the kernels its profile requires so the gap
+is explicit rather than implied.
 
 | Package | Function | Gate summary |
 | --- | --- | --- |

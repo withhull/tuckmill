@@ -46,6 +46,7 @@ model output.
   surface a real executor must implement; the protocol document is the wire
   contract. Replacing the reference engine means implementing that ABI, not
   changing the supervisor.
-- Kernel work packages K01–K09 remain unimplemented; every plan lists the
-  kernels its profile would require, and certification stays `unmeasured`
-  until physical-Mac gates (G1/G2) pass.
+- Kernel work packages K01–K09 are not certified; K01's first CPU increment
+  is implemented and validated (ADR-005 update 4), K02–K09 remain specified.
+  Every plan lists the kernels its profile would require, and certification
+  stays `unmeasured` until physical-Mac gates (G1/G2) pass.

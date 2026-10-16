@@ -96,7 +96,7 @@ pub fn tensor_bytes(type_id: u32, elems: u64) -> Result<u64> {
             format!("unknown GGML tensor type id {type_id}"),
         )
     })?;
-    if elems % info.block_elems != 0 {
+    if !elems.is_multiple_of(info.block_elems) {
         return Err(TuckmillError::new(
             ErrorCode::InvalidArtifact,
             format!(

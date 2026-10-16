@@ -132,6 +132,10 @@ enum Cmd {
         /// Suppress state messages on stderr.
         #[arg(long)]
         quiet: bool,
+        /// llama.cpp GPU offload layers (Metal performance baseline ONLY;
+        /// never for arithmetic diagnostics). Requires --engine llama.
+        #[arg(long)]
+        gpu_layers: Option<i32>,
     },
 
     /// Serve the local API on loopback.
@@ -215,6 +219,22 @@ enum Cmd {
         /// Backend selection: reference-test (default) or tuckcore.
         #[arg(long, default_value = "isolated")]
         engine: String,
+        /// llama.cpp GPU offload layers (Metal performance baseline ONLY;
+        /// never for arithmetic diagnostics). Requires --engine llama.
+        #[arg(long)]
+        gpu_layers: Option<i32>,
+    },
+
+    /// Show backend statistics and profile counters after a short probe run.
+    Stats {
+        /// Alias or artifact id.
+        model: String,
+        /// Backend: tuckcore (default) or llama.
+        #[arg(long, default_value = "tuckcore")]
+        engine: String,
+        /// Probe tokens to process before reporting.
+        #[arg(long, default_value_t = 3)]
+        tokens: u64,
     },
 
     /// Cache inventory and garbage collection.

@@ -83,17 +83,140 @@ pub struct TensorEntry {
     pub chunks: u64,
 }
 
-/// A loaded, owned weight block. Ownership is explicit: eviction only drops
-/// cache references; anything holding an `Arc` keeps its bytes alive.
+/// Read-only memory map of the artifact file. Opens once per loader; blocks
+/// are zero-copy slices of it (the file was content-verified before any
+/// block is served). Dropping all clones unmaps.
+pub struct MappedFile {
+    ptr: *const u8,
+    len: usize,
+}
+
+// SAFETY: the mapping is read-only and immutable for its lifetime; the file
+// is store-managed (imported atomically, content-verified at load) and no
+// code writes through this map.
+unsafe impl Send for MappedFile {}
+unsafe impl Sync for MappedFile {}
+
+impl MappedFile {
+    pub fn open(path: &Path) -> std::io::Result<Arc<Self>> {
+        use std::os::unix::io::AsRawFd;
+        let file = File::open(path)?;
+        let len = file.metadata()?.len() as usize;
+        if len == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "empty file cannot be mapped",
+            ));
+        }
+        // SAFETY: standard read-only mmap of an open file; the pointer is
+        // checked for MAP_FAILED and the mapping is unmapped exactly once in
+        // Drop.
+        let ptr = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                len,
+                libc::PROT_READ,
+                libc::MAP_PRIVATE,
+                file.as_raw_fd(),
+                0,
+            )
+        };
+        if ptr == libc::MAP_FAILED {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(Arc::new(MappedFile {
+            ptr: ptr as *const u8,
+            len,
+        }))
+    }
+
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    /// Borrowed slice; None when the requested range is out of bounds.
+    pub fn slice(&self, offset: u64, len: usize) -> Option<&[u8]> {
+        let start = usize::try_from(offset).ok()?;
+        let end = start.checked_add(len)?;
+        if end > self.len {
+            return None;
+        }
+        // SAFETY: range checked against the mapping length; read-only access.
+        Some(unsafe { std::slice::from_raw_parts(self.ptr.add(start), len) })
+    }
+}
+
+impl Drop for MappedFile {
+    fn drop(&mut self) {
+        // SAFETY: unmapping the exact region created in open().
+        unsafe {
+            libc::munmap(self.ptr as *mut libc::c_void, self.len);
+        }
+    }
+}
+
+impl std::fmt::Debug for MappedFile {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "MappedFile {{ len: {} }}", self.len)
+    }
+}
+
+enum BlockStorage {
+    Owned(Vec<u8>),
+    Mapped {
+        map: Arc<MappedFile>,
+        offset: usize,
+        len: usize,
+    },
+}
+
+impl std::fmt::Debug for BlockStorage {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            BlockStorage::Owned(bytes) => write!(f, "Owned({})", bytes.len()),
+            BlockStorage::Mapped { offset, len, .. } => {
+                write!(f, "Mapped {{ offset: {offset}, len: {len} }}")
+            }
+        }
+    }
+}
+
+/// A loaded weight block. Ownership is explicit: eviction only drops cache
+/// references; anything holding an `Arc` keeps its bytes alive. With zero-copy
+/// mapping enabled the bytes are a read-only slice of the artifact mmap (the
+/// loader copies only when mapping is unavailable).
 #[derive(Debug)]
 pub struct WeightBlock {
     pub tensor: usize,
     pub chunk: u32,
     /// Byte range relative to the tensor start.
     pub rel_start: u64,
-    pub bytes: Vec<u8>,
+    storage: BlockStorage,
     /// Monotonic load generation; lets tests prove reloads happened.
     pub generation: u64,
+}
+
+impl WeightBlock {
+    pub fn bytes(&self) -> &[u8] {
+        match &self.storage {
+            BlockStorage::Owned(bytes) => bytes,
+            BlockStorage::Mapped { map, offset, len } => map
+                .slice(*offset as u64, *len)
+                .expect("block range validated when the block was created"),
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        self.bytes().len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
@@ -127,6 +250,7 @@ struct Cache {
 /// The bounded loader. One process-wide instance per loaded artifact.
 pub struct BlockLoader {
     file: File,
+    mapped: Option<Arc<MappedFile>>,
     data_start: u64,
     tensors: Vec<TensorEntry>,
     by_name: HashMap<String, usize>,
@@ -156,8 +280,12 @@ impl BlockLoader {
             .enumerate()
             .map(|(i, t)| (t.name.clone(), i))
             .collect();
+        // Zero-copy block views when the file can be mapped; the owned-read
+        // path remains as a fallback (and for platforms without mmap).
+        let mapped = MappedFile::open(path).ok();
         Ok(Self {
             file,
+            mapped,
             data_start,
             tensors,
             by_name,
@@ -228,16 +356,29 @@ impl BlockLoader {
 
         let (start, end) = self.chunk_range(entry, chunk);
         let len = (end - start) as usize;
-        let mut bytes = vec![0u8; len];
-        self.file
-            .read_exact_at(&mut bytes, self.data_start + entry.rel_offset + start)
-            .map_err(|e| {
-                TuckmillError::new(
-                    ErrorCode::StorageLost,
-                    format!("artifact read failed for tensor {:?}: {e}", entry.name),
-                )
-                .with_source(e)
-            })?;
+        let file_offset = self.data_start + entry.rel_offset + start;
+        let storage = match &self.mapped {
+            Some(map) => BlockStorage::Mapped {
+                map: map.clone(),
+                offset: usize::try_from(file_offset).map_err(|_| {
+                    TuckmillError::new(ErrorCode::Internal, "block offset does not fit memory")
+                })?,
+                len,
+            },
+            None => {
+                let mut bytes = vec![0u8; len];
+                self.file
+                    .read_exact_at(&mut bytes, file_offset)
+                    .map_err(|e| {
+                        TuckmillError::new(
+                            ErrorCode::StorageLost,
+                            format!("artifact read failed for tensor {:?}: {e}", entry.name),
+                        )
+                        .with_source(e)
+                    })?;
+                BlockStorage::Owned(bytes)
+            }
+        };
         self.stats
             .logical_read_bytes
             .fetch_add(len as u64, Ordering::Relaxed);
@@ -247,7 +388,7 @@ impl BlockLoader {
             tensor,
             chunk,
             rel_start: start,
-            bytes,
+            storage,
             generation,
         });
 
@@ -328,7 +469,7 @@ impl BlockLoader {
             .collect();
         for key in keys {
             if let Some(block) = cache.map.remove(&key) {
-                cache.used_bytes = cache.used_bytes.saturating_sub(block.bytes.len() as u64);
+                cache.used_bytes = cache.used_bytes.saturating_sub(block.len() as u64);
                 cache.order.retain(|k| *k != key);
             }
         }
@@ -350,8 +491,7 @@ impl BlockLoader {
             match victim {
                 Some(key) => {
                     if let Some(block) = cache.map.remove(&key) {
-                        cache.used_bytes =
-                            cache.used_bytes.saturating_sub(block.bytes.len() as u64);
+                        cache.used_bytes = cache.used_bytes.saturating_sub(block.len() as u64);
                     }
                     cache.order.retain(|k| *k != key);
                     self.stats.evictions.fetch_add(1, Ordering::Relaxed);
@@ -359,6 +499,11 @@ impl BlockLoader {
                 None => break, // everything pinned: stay over budget briefly
             }
         }
+    }
+
+    /// True when blocks are zero-copy views over the artifact mapping.
+    pub fn has_zero_copy(&self) -> bool {
+        self.mapped.is_some()
     }
 
     pub fn stats(&self) -> LoaderSnapshot {
@@ -388,7 +533,7 @@ impl BlockLoader {
         let mut out = Vec::with_capacity(elems as usize);
         for chunk in 0..entry.chunks {
             let block = self.block(index, chunk as u32)?;
-            tensor::dequant_into(entry.type_id, &block.bytes, &mut out)?;
+            tensor::dequant_into(entry.type_id, block.bytes(), &mut out)?;
         }
         if out.len() as u64 != elems {
             return Err(TuckmillError::new(
@@ -455,7 +600,7 @@ mod tests {
         let stats = loader.stats();
         assert_eq!(stats.blocks_loaded, 1);
         assert_eq!(stats.cache_hits, 1);
-        assert!(b0.bytes.len() <= policy.block_bytes as usize);
+        assert!(b0.bytes().len() <= policy.block_bytes as usize);
     }
 
     #[test]
@@ -470,10 +615,10 @@ mod tests {
         // Walk all chunks twice; with a one-block cache the second pass must
         // reload everything (evictions > 0, same bytes).
         let first: Vec<Vec<u8>> = (0..chunks)
-            .map(|c| loader.block(idx, c as u32).unwrap().bytes.clone())
+            .map(|c| loader.block(idx, c as u32).unwrap().bytes().to_vec())
             .collect();
         let second: Vec<Vec<u8>> = (0..chunks)
-            .map(|c| loader.block(idx, c as u32).unwrap().bytes.clone())
+            .map(|c| loader.block(idx, c as u32).unwrap().bytes().to_vec())
             .collect();
         assert_eq!(first, second, "reloads must return identical bytes");
         let stats = loader.stats();
@@ -517,7 +662,7 @@ mod tests {
         let block = loader.block(idx, chunk_containing as u32).unwrap();
         let rel = 3 * row_bytes as u64 - block.rel_start;
         assert_eq!(
-            &block.bytes[rel as usize..rel as usize + rows.len()],
+            &block.bytes()[rel as usize..rel as usize + rows.len()],
             &rows[..]
         );
     }
@@ -587,6 +732,52 @@ mod tests {
         assert!(
             worst < 1e-2,
             "Q8_0 decode diverges from llama.cpp's own decode: worst |Δ| = {worst}"
+        );
+    }
+
+    #[test]
+    fn zero_copy_blocks_match_the_file_bytes_exactly() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("f.gguf");
+        write_synthetic(&path, &SyntheticConfig::tiny_qwen3()).unwrap();
+        let raw = std::fs::read(&path).unwrap();
+        let insp =
+            tuckmill_manifest::gguf::inspect(&path, &tuckmill_manifest::gguf::Limits::default())
+                .unwrap();
+        let policy = BlockPolicy {
+            block_bytes: 64 * 1024,
+            cache_bytes: 256 * 1024,
+        };
+        let tensors: Vec<TensorEntry> = insp
+            .tensors
+            .iter()
+            .map(|t| {
+                let row = tensor::row_geometry(t.type_id, &t.dims, policy.block_bytes);
+                let chunks = match &row {
+                    Some(r) => r.rows.div_ceil(r.rows_per_chunk),
+                    None => t.byte_size.div_ceil(policy.block_bytes),
+                };
+                TensorEntry {
+                    name: t.name.clone(),
+                    type_id: t.type_id,
+                    dims: t.dims.clone(),
+                    rel_offset: t.offset,
+                    byte_size: t.byte_size,
+                    row,
+                    chunks,
+                }
+            })
+            .collect();
+        let loader = BlockLoader::open(path.as_path(), insp.data_start, tensors, policy).unwrap();
+        assert!(loader.has_zero_copy(), "mmap should be available on macOS");
+        let idx = loader.tensor_index("token_embd.weight").unwrap();
+        let entry = loader.entry(idx);
+        let block = loader.block(idx, 0).unwrap();
+        let file_start = (insp.data_start + entry.rel_offset) as usize;
+        assert_eq!(
+            block.bytes(),
+            &raw[file_start..file_start + block.bytes().len()],
+            "mapped block must be byte-identical to the file"
         );
     }
 

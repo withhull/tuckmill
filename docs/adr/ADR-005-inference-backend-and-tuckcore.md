@@ -60,6 +60,29 @@ uses an incremental UTF-8 decoder. (8) TuckCore verifies the artifact's full
 canonical content digest before executing (drifted payloads are refused
 before any compute; disabling is an explicit recorded option).
 
+**Update 4 (K01 + zero-copy, 2026-10-16):** the measured ~20x gap (update 2)
+named the first optimization, and profiling named the order. K01's first
+increment: an aarch64 NEON fused packed-dot kernel for Q8_0/F16 (scalar
+fallback retained per the kernel-registry gate), plus **zero-copy read-only
+`mmap` weight-block views** (the owned-read path stays as fallback). On the
+real 0.6B, TuckCore moved 0.3 → 1.5 tok/s with fusion, → 2.4 tok/s (16/8) and
+5.7 tok/s (64/64) with zero-copy; footprint halved to 512 MiB; measured
+attribution after the work: weight fetch 0.49 s → ~0 ms (mmap removed the
+copy) and matvec compute 3.43 s → 0.39 s, leaving scalar decode compute
+(~78 ms/token) and unbatched prefill as the named next bottlenecks.
+Re-validation: scheduling stays **bit-exact**
+and the registered Q8/F16 envelopes are unchanged — smoke numbers only
+(`benchmarks/README.md`), no claim. The shim gains `gpu_layers` (shim v4):
+the default remains CPU (`gpu_layers = 0`) for arithmetic diagnostics, while
+llama.cpp **Metal** offload is available as a labeled performance baseline
+(`run`/`bench --engine llama --gpu-layers N`) and is never used for
+numerical comparison. This supersedes update 1's "GPU offload is a
+separately measured milestone": the Metal baseline is now measurable; the
+next targets named by the measurements are K02 (microbatched prefill) and
+further K01 lane work or a Metal kernel, gated per the kernel registry.
+`tuckmill stats` exposes the phase counters and loader statistics behind
+these numbers.
+
 ## Context and review
 
 The v0.2 engineering build finished the orchestration stack with exactly one

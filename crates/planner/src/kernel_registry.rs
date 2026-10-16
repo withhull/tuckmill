@@ -91,21 +91,34 @@ mod tests {
         let r = KernelRegistry::builtin().unwrap();
         assert_eq!(r.kernels.len(), 9);
         for k in &r.kernels {
-            assert_eq!(k.status, "specified");
+            assert!(
+                k.status == "specified" || k.status == "implemented",
+                "{}: unexpected status {:?}",
+                k.id,
+                k.status
+            );
             assert!(
                 k.reference_fallback,
                 "memory: every kernel keeps a reference fallback"
             );
             assert!(!k.gates.is_empty());
         }
+        // K01's first increment has landed; the remaining packages are
+        // still specification-only.
+        assert_eq!(r.find("K01").unwrap().status, "implemented");
     }
 
     #[test]
-    fn nothing_is_available_yet() {
+    fn availability_tracks_registry_status() {
         let r = KernelRegistry::builtin().unwrap();
+        // K01's first increment is available; K03 is not implemented yet,
+        // so a profile requiring it still falls back to the reference path.
         let ids = vec!["K01".to_string(), "K03".to_string()];
-        assert!(!r.all_available(&ids));
-        assert_eq!(r.missing(&ids), ids);
+        assert!(r.find("K01").unwrap().is_available());
+        assert!(!r.all_available(&ids), "K03 is not implemented");
+        assert_eq!(r.missing(&ids), vec!["K03".to_string()]);
+        assert!(!r.all_available(&["K02".to_string()]));
+        assert_eq!(r.missing(&["K02".to_string()]), vec!["K02".to_string()]);
     }
 
     #[test]

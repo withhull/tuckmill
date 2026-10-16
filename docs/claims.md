@@ -6,7 +6,7 @@ the code, output, or documentation.
 
 | Claim or hypothesis | Current evidence | Allowed statement in this build |
 | --- | --- | --- |
-| Custom kernels are in the development scope | K01–K09 specified in `kernels/registry.json` | "Specified" — never "implemented" or "fast" |
+| Custom kernels are in the development scope | K01's first increment implemented (aarch64 NEON fused Q8_0/F16 packed dot + zero-copy mapped weight blocks) and validated against the scalar reference and the llama.cpp envelopes; K02–K09 specified in `kernels/registry.json` | K01 increment: "implemented and numerically validated (CPU)"; K02–K09: "Specified" — never "fast"; no Metal kernels are implemented |
 | A compact 9B can be useful on 8 GB | Published weight file sizes (publisher-reported) | "Candidate awaiting physical-Mac qualification" |
 | A 27B model retains nearly all quality | Publisher's aggregates with per-task losses | Report the named suite and limitations, never universal equivalence |
 | Tuckmill is better than any other engine | No matched benchmark exists | Unproven; do not compare |
@@ -23,8 +23,8 @@ the code, output, or documentation.
 | Governor actions reach the engine | Protocol v4 Control frames + shared trim epoch; mid-generation `trim-caches` evicts expendable caches (tested, in-flight blocks untouched); monitor/cancel/status are lock-free vs the generation lock; footprint overruns trim then pause after 3 sustained samples | Pressure soak on physical hardware (deliberate memory pressure during real generation) is the remaining evidence |
 | Benchmarks measure model performance | This build benches the pipeline | Records carry `engine: reference-test`, `certified: false` and caveats |
 | TuckCore "runs" a model | Real Qwen3-0.6B Q8_0 executes end-to-end: correct completions on real weights (e.g. "The capital of France is" → " Paris. The capital of France"), token IDs within registered llama.cpp envelopes, records persisted | "Experimental, uncertified executor; real-model execution demonstrated; quality and performance unmeasured" |
-| TuckCore has a tokenizer | It does not; prompts map deterministically into the artifact vocabulary and the limitation is labeled in run output and API extensions | Always: "no text tokenizer in this build" |
-| TuckCore is fast | One smoke number on a 0.8 MiB fixture (debug build) is not evidence | No performance statement; scalar kernels are the numeric oracle |
+| TuckCore tokenizes text | Built-in byte-level BPE derived from the artifact's own GGUF vocabulary (exact byte roundtrip, GPT-2-style pre-tokenizers only — others refused, never approximated); with the pinned llama.cpp shim configured, prompts encode through llama.cpp itself (reference-first) | "Byte-level BPE for GPT-2-style vocabularies; reference tokenizer when configured; unsupported pre-tokenizers are refused" |
+| TuckCore is fast | Only single-run, cache-uncontrolled smoke numbers exist (fixture: 314 tok/s; real 0.6B Q8_0: pre-K01 0.3 → K01 1.5 → + zero-copy 2.4 (16/8) and 5.7 tok/s (64/64), vs llama.cpp CPU 37.0 and Metal 52.3) — labeled smoke in `benchmarks/README.md`; no controlled comparison, no sustained-thermal data | Smoke numbers only as labeled, with the recorded configuration; no comparative performance claim; the scalar path remains the arithmetic oracle |
 | Streaming equivalence in fixture tests proves real-model behavior | Fixtures prove execution paths, not model behavior | Equivalence speaks to scheduling/streaming fidelity only |
 
 ## Build status statement (canonical)
@@ -34,8 +34,9 @@ the code, output, or documentation.
 > tier upward (ADR-006). The orchestration stack (inspection, planning,
 > admission, storage, packing, worker isolation, local API, benchmark
 > harness) is implemented and tested. TuckCore, the experimental custom
-> executor, runs real dense-Qwen3 weights through scalar f32 reference
-> kernels with bit-exact residency/streaming equivalence demonstrated; no
-> Metal kernel is implemented; no configuration is certified; no performance
-> comparison against llama.cpp / MLX / Splash is claimed before it is
-> measured.
+> executor, runs real dense-Qwen3 weights through a scalar f32 reference path
+> plus a first validated CPU kernel increment (K01: NEON fused packed dot
+> with zero-copy mapped blocks — scheduling stays bit-exact and the
+> registered envelopes are unchanged); no Metal kernel is implemented; no
+> configuration is certified; no performance comparison against
+> llama.cpp / MLX / Splash is claimed before it is measured.

@@ -301,6 +301,7 @@ mod tests {
                     footprint_bytes: Some(999),
                     kv_precision: Some("f16".into()),
                     threads: Some(4),
+                    profile: None,
                 }),
             },
             WorkerFrame::Control {

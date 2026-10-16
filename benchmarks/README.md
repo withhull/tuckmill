@@ -62,24 +62,39 @@ fixture weights, context 2048:
 | TuckCore (scalar f32 oracle) | 72 ms | 314 tok/s | 7.2 MiB |
 | llama.cpp b11695 (CPU via tm shim) | 1.6 ms | 6412 tok/s | 86.8 MiB |
 
-Real-model Stage A smoke (same machine, release, Qwen3-0.6B Q8_0, 16 in /
-8 out, ctx 2048):
+## Real-model Stage A measurements (not claims)
 
-| Engine | ttft | throughput | footprint peak |
-| --- | --- | --- | --- |
-| TuckCore (scalar oracle, llama-cpu profile) | 18.4 s | 0.3 tok/s | 1.1 GiB |
-| llama.cpp b11695 (CPU via tm shim) | 1.2 s | 6.5 tok/s | 964 MiB |
+Qwen3-0.6B Q8_0, M3 8 GiB, 64 in / 64 out, warm, release build, single run;
+cache state uncontrolled; NOT a controlled comparison:
 
-The ~13.9 GiB of logical weight reads reported for the 604 MiB model is the
-expected consequence of a 32 MiB cache during streaming: prefill plus
-generation processed ~24 forward passes at one full weight sweep each. It is
-logical read traffic, not physical SSD traffic (page cache serves most of it);
-raising the cache allowance reduces sweeps at the cost of resident memory.
+| Engine | tps | ttft | footprint peak | gap p95 |
+| --- | --- | --- | --- | --- |
+| TuckCore (K01 NEON + zero-copy, scalar oracle retained) | 5.7 (decode-only ~12.6) | 6.4 s | 512 MiB | 79 ms |
+| llama.cpp b11695 CPU | 37.0 | 1.0 s | 970 MiB | 12 ms |
+| llama.cpp b11695 Metal (gpu_layers 99) | 52.3 | 0.55 s | 369 MiB | 12 ms |
 
-These exercise the harness and measure the kernel gap that K01–K03 must close;
-they are single-run smoke numbers, not controlled comparisons (no ABBA, no
-warm/cold controls, no foreground matching). Fixture numbers say nothing about
-real-model behavior (untrained tiny weights).
-Repetition 1 includes worker spawn and model load, which shows up in the p95
-values; `serve` keeps workers warm. Kernel work (K01–K09) is accepted only
-against measured gaps on real models, not against these numbers.
+TuckCore optimization trail on the same shapes: pre-K01 0.3 tps → K01 fused
+kernels 1.5 tps → + zero-copy mapped blocks 2.4 tps (16/8) and 5.7 tps
+(64/64) — an 8-19× improvement, footprint 1113 → 512 MiB. Measured
+attribution after the work: weight fetch 0.49 s → ~0 ms (mmap), matvec
+compute 3.43 s → 0.39 s; the remaining decode cost is scalar compute (~78 ms/
+token) and prefill is unbatched. Those two named bottlenecks — K02
+(microbatched prefill) and further K01 lane work or a Metal kernel — are the
+measured next targets. Metal is the performance reference; CPU remains the
+arithmetic diagnostic oracle.
+
+Logical read totals in records count every cache-miss block load, including
+zero-copy mapped views (the pre-K01 run reported ~13.9 GiB of logical reads
+for the 604 MiB model with a 32 MiB cache: one full weight sweep per forward
+pass). That is logical read traffic, not physical SSD traffic — the page
+cache serves most of it; raising the cache allowance reduces sweeps at the
+cost of resident memory.
+
+These exercise the harness and measured the kernel gap that named K01's first
+increment; they are single-run smoke numbers, not controlled comparisons (no
+ABBA, no warm/cold controls, no foreground matching). Fixture numbers say
+nothing about real-model behavior (untrained tiny weights). Repetition 1
+includes worker spawn and model load, which shows up in the p95 values;
+`serve` keeps workers warm. Further kernel work — K02 onward — is accepted
+only against measured gaps on real models and the numerical gates, never
+against these numbers.

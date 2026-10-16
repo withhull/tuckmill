@@ -1,11 +1,11 @@
 {
   "schema_version": 1,
-  "revision_note": "Work packages K01-K09 from PRD v0.2 section 11.3. Statuses reflect this build: nothing is implemented yet. A kernel must never be selected before its correctness gate passes; every selection retains a validated reference fallback decision.",
+  "revision_note": "Work packages K01-K09 from PRD v0.2 section 11.3. K01 has its first implemented increment (aarch64 NEON fused packed dot for Q8_0/F16 + zero-copy mapped weight blocks, validated against scalar references and the llama.cpp envelope); the remaining packages are specified. A kernel must never be selected before its correctness gate passes; every selection retains a validated reference fallback decision. This is a CPU kernel increment; the Metal kernel path remains unbuilt.",
   "kernels": [
     {
       "id": "K01",
       "name": "Q8/Q4 packed matrix-vector decode",
-      "status": "specified",
+      "status": "implemented",
       "reference_fallback": true,
       "gates": [
         "exact format/scale decoding",
