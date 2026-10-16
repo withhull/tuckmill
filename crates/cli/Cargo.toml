@@ -13,6 +13,7 @@ path = "src/main.rs"
 [dependencies]
 tuckmill-manifest.workspace = true
 tuckmill-backend.workspace = true
+tuckmill-tuckcore.workspace = true
 tuckmill-planner.workspace = true
 tuckmill-store.workspace = true
 tuckmill-supervisor.workspace = true

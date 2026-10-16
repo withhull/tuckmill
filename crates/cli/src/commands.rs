@@ -766,16 +766,14 @@ fn run(
     let prompt_tokens = if synthetic {
         tuckmill_supervisor::engine::synthetic_prompt_tokens(&prompt, 4096)
     } else {
-        // The execution backend requires exact in-vocabulary token ids; until
-        // a text tokenizer milestone lands, the prompt maps deterministically
-        // into the artifact's vocabulary. Disclosed, never silent.
-        let vocab = artifact_vocabulary(&runtime, &artifact)?;
-        if !quiet {
-            eprintln!(
-                "note: no text tokenizer in this build; the prompt maps to deterministic in-vocabulary token ids (vocab {vocab})"
-            );
+        // Real tokenization from the artifact's own tokenizer tables.
+        let tokenizer = artifact_tokenizer(&runtime, &artifact)?;
+        if let Some(note) = tokenizer.pretokenizer_note() {
+            if !quiet {
+                eprintln!("note: {note}");
+            }
         }
-        tuckmill_supervisor::engine::bounded_prompt_tokens(&prompt, vocab, 4096)
+        tokenizer.encode(&prompt, false)?
     };
 
     if !quiet {
@@ -1073,19 +1071,14 @@ fn bench(
     Ok(ExitCode::SUCCESS)
 }
 
-/// Vocabulary length for an imported artifact (bounded header read).
-fn artifact_vocabulary(
+/// Load the artifact's own tokenizer (bounded header read, no weights).
+fn artifact_tokenizer(
     runtime: &Arc<Runtime>,
     artifact: &tuckmill_manifest::records::ModelArtifact,
-) -> Result<u64> {
+) -> Result<tuckmill_tuckcore::tokenizer::Tokenizer> {
     let path = runtime.layout.artifact_payload_path(&artifact.artifact_id);
     let insp = gguf::inspect(&path, &gguf::Limits::default())?;
-    insp.vocabulary_len().ok_or_else(|| {
-        TuckmillError::new(
-            ErrorCode::UnsupportedArchitecture,
-            "artifact exposes no vocabulary (neither token_embd.weight nor tokenizer.ggml.tokens)",
-        )
-    })
+    tuckmill_tuckcore::tokenizer::Tokenizer::from_gguf(&insp)
 }
 
 // ---------------- verify ----------------

@@ -216,23 +216,61 @@ fn build(cfg: &SyntheticConfig) -> Result<Vec<u8>> {
         kvs.push((format!("{arch}.expert_used_count"), KV::U32(eu)));
     }
     kvs.push(("tokenizer.ggml.model".into(), KV::Str("gpt2".to_string())));
-    let tokens: Vec<KV> = (0..cfg.vocab).map(|i| KV::Str(format!("t{i}"))).collect();
+
+    // Byte-level vocabulary: 256 byte pieces (GPT-2 alphabet, type 6), a
+    // small deterministic merge table so BPE merging is exercised, filler
+    // unused pieces, and control tokens. This makes the fixture tokenizer
+    // *real*: text round-trips exactly and llama.cpp-style artifacts behave
+    // the same way.
+    let alphabet = crate::bytes_alphabet::bytes_to_unicode();
+    let mut tokens: Vec<KV> = alphabet.iter().map(|c| KV::Str(c.to_string())).collect();
+    let mut token_types: Vec<KV> = (0..256).map(|_| KV::I32(6)).collect();
+
+    // Merge table (rank order matters): enough to compress "hello world"
+    // into two committed pieces and to test multi-step merges.
+    let space = alphabet[0x20];
+    let merge_table: [(&str, &str, String); 10] = [
+        ("h", "e", "he".to_string()),
+        ("l", "l", "ll".to_string()),
+        ("he", "ll", "hell".to_string()),
+        ("hell", "o", "hello".to_string()),
+        (&space.to_string(), "w", format!("{space}w")),
+        ("w", "o", "wo".to_string()),
+        ("wo", "r", "wor".to_string()),
+        ("wor", "l", "worl".to_string()),
+        ("worl", "d", "world".to_string()),
+        (&space.to_string(), "world", format!("{space}world")),
+    ];
+    let mut merges: Vec<KV> = Vec::new();
+    for (left, right, result) in merge_table {
+        merges.push(KV::Str(format!("{left} {right}")));
+        tokens.push(KV::Str(result));
+        token_types.push(KV::I32(1));
+    }
+    while tokens.len() < cfg.vocab as usize - 3 {
+        let i = tokens.len();
+        tokens.push(KV::Str(format!("unused-{i}")));
+        token_types.push(KV::I32(5));
+    }
+    tokens.push(KV::Str("<|bos|>".into()));
+    token_types.push(KV::I32(3));
+    tokens.push(KV::Str("<|eos|>".into()));
+    token_types.push(KV::I32(3));
+    tokens.push(KV::Str("<|pad|>".into()));
+    token_types.push(KV::I32(3));
+    let bos_id = (cfg.vocab - 3) as u32;
+    let eos_id = (cfg.vocab - 2) as u32;
+    let pad_id = (cfg.vocab - 1) as u32;
+
     kvs.push(("tokenizer.ggml.tokens".into(), KV::Array(8, tokens)));
-    let token_types: Vec<KV> = (0..cfg.vocab).map(|_| KV::I32(1)).collect();
     kvs.push((
         "tokenizer.ggml.token_type".into(),
         KV::Array(5, token_types),
     ));
-    kvs.push((
-        "tokenizer.ggml.merges".into(),
-        KV::Array(8, vec![KV::Str("t1 t2".into()), KV::Str("t3 t4".into())]),
-    ));
-    kvs.push(("tokenizer.ggml.eos_token_id".into(), KV::U32(cfg.vocab - 1)));
-    kvs.push(("tokenizer.ggml.bos_token_id".into(), KV::U32(0)));
-    kvs.push((
-        "tokenizer.ggml.padding_token_id".into(),
-        KV::U32(cfg.vocab - 2),
-    ));
+    kvs.push(("tokenizer.ggml.merges".into(), KV::Array(8, merges)));
+    kvs.push(("tokenizer.ggml.eos_token_id".into(), KV::U32(eos_id)));
+    kvs.push(("tokenizer.ggml.bos_token_id".into(), KV::U32(bos_id)));
+    kvs.push(("tokenizer.ggml.padding_token_id".into(), KV::U32(pad_id)));
 
     out.extend_from_slice(&(kvs.len() as u64).to_le_bytes());
     for (key, value) in &kvs {

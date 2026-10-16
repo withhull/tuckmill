@@ -16,6 +16,7 @@ pub mod loader;
 pub mod model;
 pub mod sampling;
 pub mod tensor;
+pub mod tokenizer;
 
 pub use completion::{CompletionTracker, Lease};
 pub use executor::TuckCore;

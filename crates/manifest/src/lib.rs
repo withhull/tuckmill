@@ -11,6 +11,7 @@
 //! before any allocation is implied.
 
 pub mod adapter;
+pub mod bytes_alphabet;
 pub mod error;
 pub mod ggml;
 pub mod gguf;

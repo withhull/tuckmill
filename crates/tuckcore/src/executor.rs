@@ -26,6 +26,7 @@ use crate::loader::{BlockLoader, BlockPolicy};
 use crate::model;
 use crate::sampling::{self, Rng, SamplingConfig};
 use crate::tensor;
+use crate::tokenizer::Tokenizer;
 
 /// Defaults; overridable per run through the versioned Load options.
 pub const DEFAULT_CACHE_BYTES: u64 = 512 * 1024 * 1024;
@@ -42,7 +43,7 @@ struct Loaded {
     loader: Arc<BlockLoader>,
     tracker: Arc<CompletionTracker>,
     weights: Arc<ModelWeights>,
-    token_strings: Vec<String>,
+    tokenizer: Tokenizer,
     context_total: u64,
 }
 
@@ -204,7 +205,7 @@ impl InferenceBackend for TuckCore {
         }
         let mut names = model::TensorNames::for_layers(cfg.layers);
         names.resolve(&insp)?;
-        let token_strings = model::token_strings(&insp)?;
+        let tokenizer = Tokenizer::from_gguf(&insp)?;
 
         let entries = forward::tensor_entries(&insp, policy.block_bytes);
         let loader = Arc::new(BlockLoader::open(path, insp.data_start, entries, policy)?);
@@ -212,8 +213,8 @@ impl InferenceBackend for TuckCore {
         let weights = forward::prepare(&loader, cfg.clone(), names)?;
         let payload: u64 = insp.tensors.iter().map(|t| t.byte_size).sum();
 
-        let note = format!(
-            "tuckcore (experimental, uncertified): dense Qwen3, {} layers, vocab {}, scalar f32 reference kernels; real weights from {} ({} payload), weight cache {}, block {}",
+        let mut note = format!(
+            "tuckcore (experimental, uncertified): dense Qwen3, {} layers, vocab {}, byte-level BPE tokenizer, scalar f32 reference kernels; real weights from {} ({} payload), weight cache {}, block {}",
             cfg.layers,
             cfg.vocab,
             artifact.path,
@@ -221,11 +222,15 @@ impl InferenceBackend for TuckCore {
             tuckmill_manifest::units::Bytes(policy.cache_bytes),
             tuckmill_manifest::units::Bytes(policy.block_bytes)
         );
+        if let Some(extra) = tokenizer.pretokenizer_note() {
+            note.push_str("; ");
+            note.push_str(&extra);
+        }
         self.loaded = Some(Loaded {
             loader,
             tracker,
             weights,
-            token_strings,
+            tokenizer,
             context_total: plan.context.total_context,
         });
         Ok(note)
@@ -314,11 +319,10 @@ impl InferenceBackend for TuckCore {
                     "sampling produced no token: every logit was non-finite",
                 ));
             };
-            let text = loaded
-                .token_strings
-                .get(token as usize)
-                .cloned()
-                .unwrap_or_else(|| format!("<tok {token}>"));
+            let text = match loaded.tokenizer.token_text(token) {
+                Some(_) => loaded.tokenizer.decode_token(token),
+                None => format!("<tok {token}>"),
+            };
             generated.push_str(&text);
             committed += 1;
             if !(ctl.on_token)(i, &text) {

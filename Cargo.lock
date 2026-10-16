@@ -466,6 +466,7 @@ dependencies = [
  "tuckmill-planner",
  "tuckmill-store",
  "tuckmill-supervisor",
+ "tuckmill-tuckcore",
 ]
 
 [[package]]

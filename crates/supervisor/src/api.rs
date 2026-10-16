@@ -605,25 +605,28 @@ fn handle_chat_completions(runtime: Arc<Runtime>, mut stream: TcpStream, body: &
         return;
     }
 
-    // Prompt tokenization: this build has no text tokenizer. The reference
-    // test engine accepts arbitrary ids (synthetic); a real backend requires
-    // in-vocabulary ids, so the prompt maps deterministically into the
-    // artifact's vocabulary and the limitation is disclosed in the response
-    // extension (`tokenizer: "none"`).
+    // Prompt tokenization: the reference test engine accepts arbitrary ids
+    // (synthetic); a real backend tokenizes with the artifact's own byte-level
+    // BPE tables.
     let identity = runtime.engine_identity();
     let synthetic = tuckmill_backend::is_synthetic_engine(&identity.engine);
     let prompt_tokens = if synthetic {
         prompt_to_tokens(&request.messages)
     } else {
-        let vocab = match artifact_vocab(runtime.as_ref(), &artifact) {
-            Ok(v) => v,
+        let tokenizer = match artifact_tokenizer(runtime.as_ref(), &artifact) {
+            Ok(t) => t,
             Err(e) => {
                 respond_error(&mut stream, &e);
                 return;
             }
         };
-        let joined = messages_text(&request.messages);
-        crate::engine::bounded_prompt_tokens(&joined, vocab, 4096)
+        match tokenizer.encode(&messages_text(&request.messages), false) {
+            Ok(ids) => ids,
+            Err(e) => {
+                respond_error(&mut stream, &e);
+                return;
+            }
+        }
     };
     let stop = request.stop.clone().unwrap_or_default();
     let seed = request.seed.unwrap_or_else(now_unix_ms);
@@ -696,20 +699,15 @@ fn messages_text(messages: &[ChatMessage]) -> String {
         .join("\n")
 }
 
-/// Vocabulary length for a stored artifact (bounded header read).
-fn artifact_vocab(
+/// Load a stored artifact's own tokenizer (bounded header read).
+fn artifact_tokenizer(
     runtime: &Runtime,
     artifact: &tuckmill_manifest::records::ModelArtifact,
-) -> Result<u64, TuckmillError> {
+) -> Result<tuckmill_tuckcore::tokenizer::Tokenizer, TuckmillError> {
     let path = runtime.layout.artifact_payload_path(&artifact.artifact_id);
     let insp =
         tuckmill_manifest::gguf::inspect(&path, &tuckmill_manifest::gguf::Limits::default())?;
-    insp.vocabulary_len().ok_or_else(|| {
-        TuckmillError::new(
-            ErrorCode::UnsupportedArchitecture,
-            "artifact exposes no vocabulary for tokenization",
-        )
-    })
+    tuckmill_tuckcore::tokenizer::Tokenizer::from_gguf(&insp)
 }
 
 fn tuckmill_extension(
@@ -729,7 +727,11 @@ fn tuckmill_extension(
         "confidence": plan.confidence,
         "performance_class": plan.performance_class,
         "synthetic_output": tuckmill_backend::is_synthetic_engine(&identity.engine),
-        "tokenizer": "none (deterministic in-vocabulary mapping in this build)",
+        "tokenizer": if tuckmill_backend::is_synthetic_engine(&identity.engine) {
+            "none (synthetic engine)"
+        } else {
+            "gguf byte-level BPE"
+        },
     })
 }
 

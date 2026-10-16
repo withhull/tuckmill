@@ -69,21 +69,6 @@ pub fn synthetic_prompt_tokens(text: &str, max_tokens: usize) -> Vec<u32> {
     ids
 }
 
-/// Deterministic prompt-to-token conversion bounded by the artifact's
-/// vocabulary, for real backends (exact ids are otherwise rejected). This is
-/// a labeled build limitation ("no text tokenizer yet"), not a tokenizer:
-/// the mapping is stable, in-vocabulary, and disclosed in run output and
-/// response extensions.
-pub fn bounded_prompt_tokens(text: &str, vocab: u64, max_tokens: usize) -> Vec<u32> {
-    if vocab == 0 {
-        return vec![0];
-    }
-    synthetic_prompt_tokens(text, max_tokens)
-        .into_iter()
-        .map(|v| v % vocab as u32)
-        .collect()
-}
-
 /// The deterministic reference test engine.
 #[derive(Debug)]
 pub struct ReferenceTestEngine {

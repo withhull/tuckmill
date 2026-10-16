@@ -227,51 +227,6 @@ pub fn resolve(
     ))
 }
 
-/// Tokenizer strings for committed-output text and stop-sequence checks.
-/// Bounded: a vocab above 1M entries or 64 MiB of strings is refused.
-pub fn token_strings(inspection: &GgufInspection) -> Result<Vec<String>> {
-    let Some(value) = inspection.get("tokenizer.ggml.tokens") else {
-        return Err(TuckmillError::new(
-            ErrorCode::UnsupportedArchitecture,
-            "artifact embeds no tokenizer.ggml.tokens; committed text cannot be produced",
-        ));
-    };
-    let items = value.as_array().ok_or_else(|| {
-        TuckmillError::new(
-            ErrorCode::InvalidArtifact,
-            "tokenizer.ggml.tokens is not an array",
-        )
-    })?;
-    if items.len() > 1_048_576 {
-        return Err(TuckmillError::new(
-            ErrorCode::InvalidArtifact,
-            format!(
-                "tokenizer vocabulary of {} entries exceeds the 1M bound",
-                items.len()
-            ),
-        ));
-    }
-    let mut out = Vec::with_capacity(items.len());
-    let mut bytes = 0usize;
-    for item in items {
-        let s = item.as_str().ok_or_else(|| {
-            TuckmillError::new(
-                ErrorCode::InvalidArtifact,
-                "tokenizer.ggml.tokens contains a non-string entry",
-            )
-        })?;
-        bytes += s.len();
-        if bytes > 64 * 1024 * 1024 {
-            return Err(TuckmillError::new(
-                ErrorCode::InvalidArtifact,
-                "tokenizer strings exceed the 64 MiB bound",
-            ));
-        }
-        out.push(s.to_string());
-    }
-    Ok(out)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -325,13 +280,5 @@ mod tests {
         let err = resolve(&insp, &registry).unwrap_err();
         assert_eq!(err.code(), ErrorCode::UnsupportedArchitecture);
         assert!(err.message().contains("qwen3moe"));
-    }
-
-    #[test]
-    fn token_strings_are_bounded_and_extracted() {
-        let insp = inspection();
-        let strings = token_strings(&insp).unwrap();
-        assert_eq!(strings.len(), 512);
-        assert_eq!(strings[0], "t0");
     }
 }
