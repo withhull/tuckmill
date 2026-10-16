@@ -12,6 +12,7 @@
 
 pub mod adapter;
 pub mod bytes_alphabet;
+pub mod chat;
 pub mod digest;
 pub mod error;
 pub mod ggml;
@@ -46,5 +47,12 @@ pub const BACKEND_ABI_VERSION: u32 = 1;
 /// cannot fit a single JSON frame.
 /// v4: Control/ControlAck frames give the governor a real command contract
 /// (cache trim, prefetch control) applied by engines at safe checkpoints.
-/// Plans recorded against older versions are PLAN_STALE.
-pub const WORKER_PROTOCOL_VERSION: u16 = 6;
+/// v5: Loaded carries resolved kernel ids; Load options are typed per backend.
+/// v6: Done carries worker-side request timing; StatsAck carries the actual
+/// KV precision.
+/// v7: Generate carries the typed sampling policy (temperature/top-p); Done
+/// carries the raw generated-token count alongside the visible-token count,
+/// and StatsAck carries the prepared KV-state bytes so the plan's KV
+/// reservation can be acknowledged and enforced. Plans recorded against
+/// older versions are PLAN_STALE.
+pub const WORKER_PROTOCOL_VERSION: u16 = 7;

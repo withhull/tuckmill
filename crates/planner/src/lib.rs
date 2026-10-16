@@ -59,7 +59,11 @@ pub struct PlannerPolicy {
     pub prefill_flops_low: f64,
     pub prefill_flops_mid: f64,
     pub prefill_flops_high: f64,
-    /// KV cache element precision in bytes (F16 default).
+    /// Fallback KV element size in bytes for engines whose resolved storage
+    /// representation the runtime cannot determine (the reference test
+    /// engine allocates no KV state at all). Real backends are priced from
+    /// their actual resolved representation via
+    /// `PlanRequest::kv_bytes_per_element` — never from a nominal precision.
     pub kv_bytes_per_element: u32,
     /// Speculation is off by default; no mandatory draft (PRD §11.3, §12).
     pub speculation_enabled: bool,

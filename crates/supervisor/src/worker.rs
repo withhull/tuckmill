@@ -194,6 +194,7 @@ impl IsolatedWorker {
             max_output_tokens: spec.max_output_tokens,
             stop: spec.stop,
             seed: spec.seed,
+            sampling: spec.sampling,
         }
         .write_to(&mut self.stream)?;
 
@@ -258,6 +259,7 @@ impl IsolatedWorker {
                 Some(WorkerFrame::Done {
                     reason,
                     committed: c,
+                    generated,
                     timing,
                 }) => {
                     committed = c;
@@ -273,7 +275,9 @@ impl IsolatedWorker {
                             ))
                         }
                     };
-                    let mut outcome = GenOutcome::new(finish, committed);
+                    let generated = if generated == 0 { c } else { generated };
+                    let mut outcome =
+                        GenOutcome::new(finish, committed).with_generated(generated.max(c));
                     outcome.timing = timing;
                     return Ok(outcome);
                 }
@@ -648,6 +652,7 @@ mod tests {
                     max_output_tokens: 12,
                     stop: vec![],
                     seed: 7,
+                    sampling: tuckmill_backend::SamplingPolicy::default(),
                 },
                 &cancel,
                 &pause,
@@ -688,6 +693,7 @@ mod tests {
                     max_output_tokens: 100,
                     stop: vec![],
                     seed: 7,
+                    sampling: tuckmill_backend::SamplingPolicy::default(),
                 },
                 &cancel,
                 &pause,
@@ -755,6 +761,7 @@ mod tests {
                     max_output_tokens: 12,
                     stop: vec![],
                     seed: 7,
+                    sampling: tuckmill_backend::SamplingPolicy::default(),
                 },
                 &cancel,
                 &pause,

@@ -15,9 +15,13 @@ pub mod forward;
 pub mod kernels;
 pub mod loader;
 pub mod model;
-pub mod sampling;
 pub mod tensor;
 pub mod tokenizer;
+
+/// Deterministic sampling transforms and the RNG live in the backend
+/// contract (`tuckmill_backend::sampling`) so every engine selects tokens
+/// under the identical declared policy; re-exported here for existing paths.
+pub use tuckmill_backend::sampling;
 
 pub use completion::{CompletionTracker, Lease};
 pub use executor::TuckCore;

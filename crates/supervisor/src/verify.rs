@@ -1045,6 +1045,7 @@ impl Runtime {
                 max_output_tokens: generate_tokens,
                 stop: Vec::new(),
                 seed: 0,
+                sampling: tuckmill_backend::SamplingPolicy::default(),
             },
             &cancel,
             &pause,

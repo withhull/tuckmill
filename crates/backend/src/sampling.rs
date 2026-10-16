@@ -1,4 +1,15 @@
-//! Deterministic sampling (greedy default; knobbed transforms bounded).
+//! Deterministic sampling shared by every backend (ADR-005).
+//!
+//! Greedy is the default and the only behavior when `temperature <= 0`.
+//! Nonzero temperature applies the documented transforms (softmax over
+//! non-NaN logits, optional top-k, optional nucleus top-p) deterministically
+//! before a seeded draw, so two backends given the same logits, policy, and
+//! seed produce the same token. The RNG is xorshift64*: reproducible across
+//! platforms and runs.
+//!
+//! This module moved here from TuckCore when the supervisor's sampling
+//! policy became part of the backend contract: the same transforms must
+//! apply no matter which engine executes the artifact.
 
 /// xorshift64* deterministic RNG: reproducible across platforms and runs.
 #[derive(Debug, Clone)]
@@ -24,9 +35,8 @@ impl Rng {
     }
 }
 
-/// Sampling knobs. Defaults are greedy; the API subset exposes temperature,
-/// top-k and top-p as optional transforms. All transforms are applied before
-/// selection, deterministically.
+/// Sampling knobs. Defaults are greedy; nonzero temperature applies the
+/// optional transforms before selection, deterministically.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct SamplingConfig {
     pub temperature: f32,

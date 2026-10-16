@@ -235,6 +235,7 @@ fn serve(stream: UnixStream, kind: EngineKind) -> Result<()> {
                     max_output_tokens,
                     stop,
                     seed,
+                    sampling,
                 } => {
                     if !loaded {
                         write_frame(
@@ -245,6 +246,12 @@ fn serve(stream: UnixStream, kind: EngineKind) -> Result<()> {
                                 action: "Load a plan first".into(),
                             },
                         )?;
+                        continue;
+                    }
+                    // Wire-level validation: an invalid sampling policy is
+                    // refused before any compute, never clamped silently.
+                    if let Err(e) = sampling.validate() {
+                        write_frame(&writer, &error_frame(&e))?;
                         continue;
                     }
                     cancel.store(false, Ordering::Relaxed);
@@ -266,6 +273,7 @@ fn serve(stream: UnixStream, kind: EngineKind) -> Result<()> {
                             max_output_tokens,
                             stop,
                             seed,
+                            sampling,
                         },
                     );
                     cancel.store(false, Ordering::Relaxed);
@@ -277,6 +285,7 @@ fn serve(stream: UnixStream, kind: EngineKind) -> Result<()> {
                                 &WorkerFrame::Done {
                                     reason: outcome.finish_reason.as_str().to_string(),
                                     committed: outcome.committed,
+                                    generated: outcome.generated,
                                     timing: outcome.timing,
                                 },
                             )?;
@@ -699,6 +708,7 @@ mod tests {
             max_output_tokens: 50,
             stop: vec![],
             seed: 1,
+            sampling: tuckmill_backend::SamplingPolicy::default(),
         }
         .write_to(&mut stream)
         .unwrap();
@@ -847,6 +857,7 @@ mod tests {
             max_output_tokens: 60,
             stop: vec![],
             seed: 0,
+            sampling: tuckmill_backend::SamplingPolicy::default(),
         }
         .write_to(&mut stream)
         .unwrap();

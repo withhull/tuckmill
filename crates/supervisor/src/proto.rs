@@ -5,9 +5,12 @@
 //! used. The protocol carries control messages, tokens, scores, errors, and
 //! statistics — it is deliberately not a general tensor RPC service.
 //!
-//! Protocol v2 (current): `Load` carries an `ArtifactRef` plus optional
+//! Protocol v7 (current): `Load` carries an `ArtifactRef` plus optional
 //! backend options; `Score`/`ScoreChunk`/`ScoreDone` provide bounded
-//! teacher-forced logits; `StatsAck` carries backend statistics.
+//! teacher-forced logits; `StatsAck` carries backend statistics and the
+//! prepared KV-state bytes; `Generate` carries the typed sampling policy;
+//! `Done` carries both the visible (`committed`) and raw (`generated`)
+//! token counts.
 
 use std::io::{Read, Write};
 
@@ -61,6 +64,10 @@ pub enum WorkerFrame {
         max_output_tokens: u64,
         stop: Vec<String>,
         seed: u64,
+        /// v7: typed sampler settings. Absent (older clients) means greedy;
+        /// the worker validates the values before any compute.
+        #[serde(default)]
+        sampling: tuckmill_backend::SamplingPolicy,
     },
     State {
         state: String,
@@ -72,6 +79,10 @@ pub enum WorkerFrame {
     Done {
         reason: String,
         committed: u64,
+        /// v7: raw sampled-token count (committed counts only tokens with
+        /// visible bytes; stop/EOS-trimmed tokens stay visible here).
+        #[serde(default)]
+        generated: u64,
         /// Worker-side timing for this request (v6); absent for backends
         /// that do not measure it.
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -267,6 +278,10 @@ mod tests {
                 max_output_tokens: 16,
                 stop: vec!["</s>".into()],
                 seed: 42,
+                sampling: tuckmill_backend::SamplingPolicy {
+                    temperature: 0.7,
+                    top_p: Some(0.95),
+                },
             },
             WorkerFrame::Score {
                 request_id: "req_2".into(),
@@ -286,6 +301,7 @@ mod tests {
             WorkerFrame::Done {
                 reason: "stop".into(),
                 committed: 5,
+                generated: 7,
                 timing: Some(tuckmill_backend::RequestTiming {
                     total_ms: 12.5,
                     prefill_ms: Some(3.0),
@@ -327,6 +343,7 @@ mod tests {
                     }),
                     footprint_bytes: Some(999),
                     kv_precision: Some("f16".into()),
+                    kv_state_bytes: Some(1 << 20),
                     threads: Some(4),
                     kernel_impl: Some("neon".into()),
                     numerical_profile: Some("oracle-f32".into()),

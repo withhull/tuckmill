@@ -111,7 +111,10 @@ pub enum RunEvent {
     },
     Done {
         reason: String,
+        /// Tokens with visible bytes (the honest completion-token count).
         committed: u64,
+        /// Raw sampled tokens, including stop/EOS-trimmed tokens.
+        generated: u64,
         /// Worker-side timing of the request, when the backend reports it.
         timing: Option<tuckmill_backend::RequestTiming>,
     },
@@ -150,14 +153,30 @@ impl ActiveRun {
     }
 }
 
-/// What a run was started with; enough to reconstruct the session record.
+/// Typed request passed to `start_run`: prompt, output allowance, stopping
+/// and sampling policy. Chat versus raw prompt construction happens before
+/// this point (supervisor::bundle::RequestSpec); the runtime and every
+/// backend only see token ids plus this policy.
 #[derive(Debug, Clone)]
-pub struct RunSpec {
-    pub plan: ExecutionPlan,
-    pub prompt_tokens: u64,
+pub struct RunRequest {
+    pub prompt_tokens: Vec<u32>,
     pub max_output_tokens: u64,
     pub stop: Vec<String>,
     pub seed: u64,
+    pub sampling: tuckmill_backend::SamplingPolicy,
+}
+
+impl RunRequest {
+    /// Greedy request (tests, benchmarks, and pipeline paths).
+    pub fn greedy(prompt_tokens: Vec<u32>, max_output_tokens: u64) -> Self {
+        Self {
+            prompt_tokens,
+            max_output_tokens,
+            stop: Vec::new(),
+            seed: 0,
+            sampling: tuckmill_backend::SamplingPolicy::default(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -173,6 +192,11 @@ pub struct RuntimeStatus {
     pub pressure: String,
     pub thermal: String,
     pub device: DeviceProfile,
+    /// Live worker process id (None when none is running).
+    pub worker_pid: Option<u32>,
+    /// Worker spawns (model loads). Equivalent consecutive requests keep
+    /// this flat; see the loaded-model key (B4).
+    pub worker_generation: u64,
 }
 
 pub struct Runtime {
@@ -203,14 +227,76 @@ pub struct Runtime {
     execution: crate::options::ExecutionOptions,
     /// Worker PID for lock-free monitoring (0 = no worker).
     worker_pid: AtomicU32,
+    /// Count of worker processes spawned (loads). Warm reuse keeps this
+    /// flat across equivalent requests; it is the observable used to prove
+    /// no unnecessary reloads.
+    worker_generations: AtomicU64,
     /// Consecutive footprint-overrun samples (enforcement escalates at 3).
     overrun_streak: AtomicU64,
 }
 
 struct WorkerSlot {
     worker: IsolatedWorker,
-    plan_id: Id,
-    kind: EngineKind,
+    /// Stable identity + prepared capacities of the loaded model. A new
+    /// request reuses this worker only when its own key is satisfied by
+    /// this one; request timestamps, seeds, prompts, budgets, and plan ids
+    /// deliberately do not participate.
+    key: LoadedModelKey,
+}
+
+/// Stable identity of a loaded model in a worker (B4). Built from immutable
+/// model identity, the resolved load options, and the prepared context
+/// capacity — never from request time or plan creation time.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LoadedModelKey {
+    /// Backend that executed the load.
+    pub engine: EngineKind,
+    pub artifact_id: Id,
+    pub file_bytes: u64,
+    pub metadata_hash: String,
+    pub tensor_index_hash: String,
+    pub content_hash: Option<String>,
+    /// KV capacity the load prepared. A request with a smaller admitted
+    /// context is served by the same prepared model; a larger one requires
+    /// a reload.
+    pub prepared_context_total: u64,
+    /// Resolved backend load options (kernel/storage/numerical/precision
+    /// selections). Any change to these is a different loaded model.
+    pub load_options: Option<serde_json::Value>,
+}
+
+impl LoadedModelKey {
+    pub fn new(
+        engine: EngineKind,
+        plan: &ExecutionPlan,
+        artifact: &ArtifactRef,
+        load_options: Option<&serde_json::Value>,
+    ) -> Self {
+        Self {
+            engine,
+            artifact_id: plan.artifact_id.clone(),
+            file_bytes: artifact.file_bytes,
+            metadata_hash: artifact.metadata_hash.clone(),
+            tensor_index_hash: artifact.tensor_index_hash.clone(),
+            content_hash: artifact.content_hash.clone(),
+            prepared_context_total: plan.context.total_context,
+            load_options: load_options.cloned(),
+        }
+    }
+
+    /// Whether the already-prepared model behind `self` satisfies the
+    /// request keyed by `request`: same immutable identity and load options,
+    /// and a prepared context at least as large as requested.
+    pub fn satisfies(&self, request: &LoadedModelKey) -> bool {
+        self.engine == request.engine
+            && self.artifact_id == request.artifact_id
+            && self.file_bytes == request.file_bytes
+            && self.metadata_hash == request.metadata_hash
+            && self.tensor_index_hash == request.tensor_index_hash
+            && self.content_hash == request.content_hash
+            && self.load_options == request.load_options
+            && self.prepared_context_total >= request.prepared_context_total
+    }
 }
 
 impl Runtime {
@@ -282,6 +368,7 @@ impl Runtime {
             allow_test_engine: options.allow_test_engine,
             execution: options.execution,
             worker_pid: AtomicU32::new(0),
+            worker_generations: AtomicU64::new(0),
             overrun_streak: AtomicU64::new(0),
         });
 
@@ -340,6 +427,9 @@ impl Runtime {
                 context: tuckmill_manifest::plan::PlanContext::new(context_total, max_output),
                 requested_budget: budget,
                 policy: self.policy.clone(),
+                kv_bytes_per_element: self
+                    .execution
+                    .kv_bytes_per_element(self.engine_kind, self.policy.kv_bytes_per_element),
             },
             &calibration,
         )
@@ -408,6 +498,8 @@ impl Runtime {
             pressure: self.signals.pressure().as_str(),
             thermal: format!("{:?}", self.signals.thermal()).to_lowercase(),
             device: self.device.clone(),
+            worker_pid: self.worker_pid(),
+            worker_generation: self.worker_generation(),
         }
     }
 
@@ -497,6 +589,12 @@ impl Runtime {
         (pid != 0).then_some(pid)
     }
 
+    /// Number of worker spawns (model loads) this runtime has performed.
+    /// Equivalent consecutive requests must not increase it (B4).
+    pub fn worker_generation(&self) -> u64 {
+        self.worker_generations.load(Ordering::Relaxed)
+    }
+
     /// Cancel the currently active run, if any. Returns whether one was found.
     pub fn cancel_active(&self) -> bool {
         let flags = {
@@ -522,16 +620,12 @@ impl Runtime {
     /// Start a run: waits for the queue turn, reserves the ledger, records a
     /// session, and returns a streaming handle. The caller consumes events
     /// until Done/Error or drops the handle (which cancels via backpressure).
-    #[allow(clippy::too_many_arguments)]
     pub fn start_run(
         self: &Arc<Self>,
         ticket: &QueueTicket,
         plan: ExecutionPlan,
         artifact: ArtifactRef,
-        prompt_tokens: Vec<u32>,
-        max_output_tokens: u64,
-        stop: Vec<String>,
-        seed: u64,
+        request: RunRequest,
     ) -> Result<ActiveRun> {
         self.check_plan_fresh(&plan)?;
         self.plan_admitted(&plan)?;
@@ -668,10 +762,7 @@ impl Runtime {
                     &request_id_evt,
                     &session_id_evt,
                     &controls_evt,
-                    prompt_tokens,
-                    max_output_tokens,
-                    stop,
-                    seed,
+                    request,
                     &cancel_evt,
                     &pause_evt,
                     &committed_evt,
@@ -720,10 +811,7 @@ impl Runtime {
         request_id: &str,
         session_id: &Id,
         controls: &ControlQueue,
-        prompt_tokens: Vec<u32>,
-        max_output_tokens: u64,
-        stop: Vec<String>,
-        seed: u64,
+        request: RunRequest,
         cancel: &Arc<AtomicBool>,
         pause: &Arc<AtomicBool>,
         committed: &Arc<AtomicU64>,
@@ -746,17 +834,24 @@ impl Runtime {
                     serde_json::json!(plan.plan_id.as_str()),
                 ),
                 ("mode".to_string(), serde_json::json!(plan.mode.as_str())),
+                (
+                    "temperature".to_string(),
+                    serde_json::json!(request.sampling.temperature),
+                ),
             ]
             .into_iter()
             .collect(),
         );
 
-        let prompt_len = prompt_tokens.len() as u64;
+        let prompt_len = request.prompt_tokens.len() as u64;
         match self.engine_mode {
             EngineMode::Isolated => {
                 let mut slot = self.worker.lock().expect("worker lock");
+                let load_options = self.execution.load_json(self.engine_kind);
+                let requested =
+                    LoadedModelKey::new(self.engine_kind, plan, artifact, load_options.as_ref());
                 let need_spawn = match slot.as_ref() {
-                    Some(w) => w.plan_id != plan.plan_id || w.kind != self.engine_kind,
+                    Some(w) => !w.key.satisfies(&requested),
                     None => true,
                 };
                 if need_spawn {
@@ -769,7 +864,7 @@ impl Runtime {
                         &self.layout.tmp_dir(),
                         self.engine_kind,
                     )?;
-                    let load_options = self.execution.load_json(self.engine_kind);
+                    self.worker_generations.fetch_add(1, Ordering::Relaxed);
                     let note = worker.load(plan, artifact, load_options.as_ref())?;
                     // Resolved settings, acknowledged by the worker right
                     // after load (the worker is idle here): an explicit
@@ -780,6 +875,29 @@ impl Runtime {
                         &worker.resolved_kernels,
                         ack_stats.as_ref().unwrap_or(&BackendStats::default()),
                     )?;
+                    // Plan acknowledgement (B3): the worker's prepared KV
+                    // state must fit what the admitted plan reserved. A
+                    // worker that would allocate more than the plan priced
+                    // fails closed before any request runs on it.
+                    let kv_prepared = ack_stats
+                        .as_ref()
+                        .and_then(|s| s.kv_state_bytes)
+                        .unwrap_or(0);
+                    let kv_reserved = plan.budget.reservation_breakdown.kv_state.bytes();
+                    if kv_prepared > kv_reserved {
+                        return Err(TuckmillError::new(
+                            ErrorCode::InvalidPlan,
+                            format!(
+                                "the worker prepared {} of KV state for context {} but the plan reserved only {}; refusing to run on an understated plan",
+                                tuckmill_manifest::units::Bytes(kv_prepared),
+                                plan.context.total_context,
+                                tuckmill_manifest::units::Bytes(kv_reserved)
+                            ),
+                        )
+                        .with_action(
+                            "Rebuild the plan from the worker's resolved KV representation.",
+                        ));
+                    }
                     self.logger.info(
                         "WORKER_RESOLVED",
                         [
@@ -795,6 +913,11 @@ impl Runtime {
                                 "numerical_profile".to_string(),
                                 serde_json::json!(acknowledged.numerical_profile),
                             ),
+                            ("kv_state_bytes".to_string(), serde_json::json!(kv_prepared)),
+                            (
+                                "kv_reserved_bytes".to_string(),
+                                serde_json::json!(kv_reserved),
+                            ),
                         ]
                         .into_iter()
                         .collect(),
@@ -807,14 +930,29 @@ impl Runtime {
                     );
                     self.worker_pid.store(worker.pid(), Ordering::Relaxed);
                     *slot = Some(WorkerSlot {
-                        plan_id: plan.plan_id.clone(),
-                        kind: self.engine_kind,
+                        key: requested,
                         worker,
                     });
                     if let Ok(mut slot_controls) = controls.lock() {
                         *slot_controls =
                             Some(slot.as_ref().expect("slot set above").worker.controls());
                     }
+                } else {
+                    // Warm reuse: the loaded model identity and prepared
+                    // capacities satisfy this request; no reload, no new
+                    // session state (KV state is allocated per request).
+                    self.logger.info(
+                        "WORKER_REUSED",
+                        [
+                            ("request_id".to_string(), serde_json::json!(request_id)),
+                            (
+                                "prepared_context".to_string(),
+                                serde_json::json!(requested.prepared_context_total),
+                            ),
+                        ]
+                        .into_iter()
+                        .collect(),
+                    );
                 }
                 let WorkerSlot { worker, .. } = slot.as_mut().expect("worker slot");
                 let mut token_tx = |index: u64, text: &str| -> bool {
@@ -832,10 +970,11 @@ impl Runtime {
                 let outcome = worker.generate(
                     crate::engine::EngineRequest {
                         request_id: request_id.to_string(),
-                        prompt_tokens,
-                        max_output_tokens,
-                        stop,
-                        seed,
+                        prompt_tokens: request.prompt_tokens,
+                        max_output_tokens: request.max_output_tokens,
+                        stop: request.stop,
+                        seed: request.seed,
+                        sampling: request.sampling,
                     },
                     cancel,
                     pause,
@@ -856,10 +995,11 @@ impl Runtime {
                 engine.load(plan)?;
                 let req = crate::engine::EngineRequest {
                     request_id: request_id.to_string(),
-                    prompt_tokens,
-                    max_output_tokens,
-                    stop,
-                    seed,
+                    prompt_tokens: request.prompt_tokens,
+                    max_output_tokens: request.max_output_tokens,
+                    stop: request.stop,
+                    seed: request.seed,
+                    sampling: request.sampling,
                 };
                 let mut token_tx = |index: u64, text: &str| -> bool {
                     committed.store(index + 1, Ordering::Relaxed);
@@ -934,6 +1074,7 @@ impl Runtime {
         let _ = tx.send(RunEvent::Done {
             reason: outcome.finish_reason.as_str().to_string(),
             committed: outcome.committed,
+            generated: outcome.generated,
             timing: outcome.timing,
         });
         Ok(())
@@ -1124,6 +1265,7 @@ pub fn collect_run(run: &ActiveRun, mut on_token: impl FnMut(u64, &str)) -> (Fin
             Ok(RunEvent::Done {
                 reason,
                 committed,
+                generated: _,
                 timing: _,
             }) => return (reason_from_str(&reason), committed),
             Ok(RunEvent::Error { .. }) | Err(_) => {
@@ -1143,6 +1285,13 @@ mod tests {
     use tuckmill_manifest::testing::{write_synthetic, SyntheticConfig};
 
     fn test_runtime(mode: EngineMode) -> (tempfile::TempDir, Arc<Runtime>, Arc<MockSignalSource>) {
+        test_runtime_with(mode, None)
+    }
+
+    fn test_runtime_with(
+        mode: EngineMode,
+        worker_exe: Option<PathBuf>,
+    ) -> (tempfile::TempDir, Arc<Runtime>, Arc<MockSignalSource>) {
         let dir = tempfile::tempdir().unwrap();
         let layout = StoreLayout::open(dir.path().join("store"));
         let src = dir.path().join("m.gguf");
@@ -1165,7 +1314,7 @@ mod tests {
             data_dir: Some(layout.root().to_path_buf()),
             engine_mode: mode,
             engine_kind: EngineKind::ReferenceTest,
-            worker_exe: None,
+            worker_exe,
             queue_capacity: 2,
             execution: crate::options::ExecutionOptions::default(),
             default_budget: Some(Bytes::parse("2GiB").unwrap()),
@@ -1219,10 +1368,13 @@ mod tests {
                 &ticket,
                 plan,
                 artifact,
-                (0..prompt_len as u32).collect(),
-                max_out,
-                vec![],
-                42,
+                RunRequest {
+                    prompt_tokens: (0..prompt_len as u32).collect(),
+                    max_output_tokens: max_out,
+                    stop: vec![],
+                    seed: 42,
+                    sampling: tuckmill_backend::SamplingPolicy::default(),
+                },
             )
             .unwrap();
         let mut text = Vec::new();
@@ -1263,15 +1415,17 @@ mod tests {
                 &ticket_a,
                 plan.clone(),
                 artifact_a,
-                vec![1, 2],
-                8,
-                vec![],
-                1,
+                RunRequest::greedy(vec![1, 2], 8),
             )
             .unwrap();
         let runtime2 = runtime.clone();
         let handle = std::thread::spawn(move || {
-            runtime2.start_run(&ticket_b, plan, artifact_b, vec![1, 2], 8, vec![], 2)
+            runtime2.start_run(
+                &ticket_b,
+                plan,
+                artifact_b,
+                RunRequest::greedy(vec![1, 2], 8),
+            )
         });
         let (reason_a, committed_a) = collect_run(&run_a, |_, _| {});
         assert_eq!(reason_a, FinishReason::Length);
@@ -1280,6 +1434,153 @@ mod tests {
         let (reason_b, committed_b) = collect_run(&run_b, |_, _| {});
         assert_eq!(reason_b, FinishReason::Length);
         assert_eq!(committed_b, 8);
+        runtime.shutdown();
+    }
+
+    #[test]
+    fn loaded_model_key_ignores_time_and_request_content() {
+        let plan = |context: u64, created: u64| {
+            let mut p = ExecutionPlan::new_skeleton(
+                Id::new("a".repeat(64)).unwrap(),
+                Id::new("b".repeat(64)).unwrap(),
+                "qwen3".into(),
+            );
+            p.mode = ExecutionMode::Resident;
+            p.context = tuckmill_manifest::plan::PlanContext::new(context, 64);
+            p.created_unix_ms = created;
+            p.plan_id = p.compute_id().unwrap();
+            p
+        };
+        let artifact = tuckmill_backend::ArtifactRef {
+            path: "/tmp/m.gguf".into(),
+            file_bytes: 11,
+            metadata_hash: "1".repeat(64),
+            tensor_index_hash: "2".repeat(64),
+            tokenizer_hash: None,
+            arch_id: Some("qwen3".into()),
+            content_hash: Some("3".repeat(64)),
+        };
+        let opts = Some(serde_json::json!({"kv_precision": "f16"}));
+        let earlier = LoadedModelKey::new(
+            EngineKind::TuckCore,
+            &plan(2048, 1),
+            &artifact,
+            opts.as_ref(),
+        );
+        let later = LoadedModelKey::new(
+            EngineKind::TuckCore,
+            &plan(2048, 9_999),
+            &artifact,
+            opts.as_ref(),
+        );
+        assert_eq!(
+            earlier, later,
+            "plan creation time must not enter the loaded-model key"
+        );
+        assert!(earlier.satisfies(&later));
+
+        let smaller = LoadedModelKey::new(
+            EngineKind::TuckCore,
+            &plan(1024, 2),
+            &artifact,
+            opts.as_ref(),
+        );
+        assert!(
+            earlier.satisfies(&smaller),
+            "a prepared 2048 context serves a 1024 request"
+        );
+        assert!(
+            !smaller.satisfies(&earlier),
+            "a prepared 1024 context cannot serve a 2048 request"
+        );
+
+        let other_opts = Some(serde_json::json!({"kv_precision": "f32"}));
+        let reloaded = LoadedModelKey::new(
+            EngineKind::TuckCore,
+            &plan(2048, 1),
+            &artifact,
+            other_opts.as_ref(),
+        );
+        assert!(
+            !earlier.satisfies(&reloaded),
+            "a load-defining option change must force a reload"
+        );
+
+        let mut edited = artifact.clone();
+        edited.content_hash = Some("4".repeat(64));
+        let tampered =
+            LoadedModelKey::new(EngineKind::TuckCore, &plan(2048, 1), &edited, opts.as_ref());
+        assert!(
+            !earlier.satisfies(&tampered),
+            "artifact identity change must force a reload"
+        );
+    }
+
+    #[test]
+    fn sequential_requests_reuse_the_loaded_worker_without_state_leaks() {
+        let Some(worker_exe) = std::env::var("TUCKMILL_TEST_WORKER_BIN")
+            .ok()
+            .map(PathBuf::from)
+        else {
+            eprintln!("skipping: TUCKMILL_TEST_WORKER_BIN not set");
+            return;
+        };
+        let (_dir, runtime, _signals) = test_runtime_with(EngineMode::Isolated, Some(worker_exe));
+        let (artifact, adapter) = runtime.resolve_artifact("local").unwrap();
+        let run_once = |context: u64| -> (String, String, u64, Id) {
+            let plan = runtime
+                .plan_for(
+                    &artifact,
+                    &adapter,
+                    Bytes::parse("2GiB").unwrap(),
+                    context,
+                    64,
+                )
+                .unwrap();
+            runtime.plan_admitted(&plan).unwrap();
+            let artifact_ref = artifact_ref_for(&runtime);
+            let ticket = runtime.submit().unwrap();
+            let run = runtime
+                .start_run(
+                    &ticket,
+                    plan,
+                    artifact_ref,
+                    RunRequest::greedy(vec![5, 6], 4),
+                )
+                .unwrap();
+            let mut text = String::new();
+            let (reason, committed) = collect_run(&run, |_i, t| text.push_str(t));
+            (text, reason.as_str().to_string(), committed, run.session_id)
+        };
+
+        // Ten equivalent sequential requests: one load, ten isolated runs.
+        let mut first: Option<(String, Id)> = None;
+        for i in 0..10 {
+            let (text, reason, committed, session) = run_once(2048);
+            assert_eq!(reason, "length");
+            assert_eq!(committed, 4);
+            let fresh_session = first.as_ref().map(|(_, s)| s != &session).unwrap_or(true);
+            match &first {
+                None => first = Some((text, session)),
+                Some((first_text, _)) => assert_eq!(
+                    &text, first_text,
+                    "request {i}: visible output must not inherit session state"
+                ),
+            }
+            assert!(fresh_session, "each request must get a fresh session id");
+            assert_eq!(
+                runtime.worker_generation(),
+                1,
+                "request {i} must reuse the loaded model"
+            );
+        }
+
+        // A load-defining change (larger prepared context) reloads once.
+        let (_text, _reason, _committed, _session) = run_once(4096);
+        assert_eq!(runtime.worker_generation(), 2);
+        // A smaller request fits the prepared model: reuse again.
+        let (_text, _reason, _committed, _session) = run_once(1024);
+        assert_eq!(runtime.worker_generation(), 2);
         runtime.shutdown();
     }
 
@@ -1301,7 +1602,12 @@ mod tests {
         // 300 tokens at ~2ms = ~0.6s of work; plenty of time to drive the
         // governor across a pause and a resume.
         let run = runtime
-            .start_run(&ticket, plan, artifact, vec![1, 2, 3], 300, vec![], 0)
+            .start_run(
+                &ticket,
+                plan,
+                artifact,
+                RunRequest::greedy(vec![1, 2, 3], 300),
+            )
             .unwrap();
 
         let mut saw_paused = false;
@@ -1386,7 +1692,12 @@ mod tests {
         let ticket = runtime.submit().unwrap();
         let artifact_ref = artifact_ref_for(&runtime);
         let run = runtime
-            .start_run(&ticket, plan, artifact_ref, vec![1, 2, 3], 300, vec![], 0)
+            .start_run(
+                &ticket,
+                plan,
+                artifact_ref,
+                RunRequest::greedy(vec![1, 2, 3], 300),
+            )
             .unwrap();
         signals.set_pressure(crate::pressure::PressureLevel::Warning);
         let mut saw_throttling = false;

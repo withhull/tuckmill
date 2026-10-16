@@ -8,6 +8,7 @@
 pub mod admission;
 pub mod api;
 pub mod bench;
+pub mod bundle;
 pub mod engine;
 pub mod governor;
 pub mod log;

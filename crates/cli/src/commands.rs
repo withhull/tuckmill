@@ -877,16 +877,31 @@ fn run(
     };
     let identity = runtime.engine_identity();
     let synthetic = tuckmill_backend::is_synthetic_engine(&identity.engine);
+    // Raw completion stays distinct from chat completion: the prompt is
+    // tokenized as-is and no chat template is applied. Real backends go
+    // through the model bundle (reference-first tokenizer; special-token
+    // spellings map to their vocabulary ids); the synthetic engine keeps
+    // deterministic synthetic tokens (no vocabulary executes).
     let prompt_tokens = if synthetic {
-        tuckmill_supervisor::engine::synthetic_prompt_tokens(&prompt, 4096)
+        let tokens = tuckmill_supervisor::engine::synthetic_prompt_tokens(&prompt, 4096);
+        tuckmill_supervisor::bundle::check_allowance(tokens.len() as u64, max_output, context)?;
+        tokens
     } else {
-        // Reference-first tokenization (llama.cpp when configured; exact
-        // gpt2-style fallback otherwise; refusal rather than approximation).
-        let encoder = artifact_encoder(&runtime, &artifact)?;
+        let bundle = tuckmill_supervisor::bundle::ModelBundle::open(&runtime.layout, &artifact)?;
         if !quiet {
-            eprintln!("note: {}", encoder.note());
+            eprintln!("note: {}", bundle.note);
         }
-        encoder.encode(&prompt, false)?
+        let spec = tuckmill_supervisor::bundle::RequestSpec::raw(
+            &bundle,
+            prompt.clone(),
+            max_output,
+            Vec::new(),
+            0,
+            tuckmill_backend::SamplingPolicy::default(),
+            false,
+            context,
+        )?;
+        spec.prompt_tokens
     };
 
     if !quiet {
@@ -916,10 +931,13 @@ fn run(
         &ticket,
         plan.clone(),
         artifact_ref,
-        prompt_tokens,
-        max_output,
-        Vec::new(),
-        0,
+        tuckmill_supervisor::runtime::RunRequest {
+            prompt_tokens,
+            max_output_tokens: max_output,
+            stop: Vec::new(),
+            seed: 0,
+            sampling: tuckmill_backend::SamplingPolicy::default(),
+        },
     )?;
 
     let mut last_state = String::new();
@@ -955,6 +973,7 @@ fn run(
             Ok(RunEvent::Done {
                 reason,
                 committed: c,
+                generated: _,
                 timing: _,
             }) => {
                 committed = c;
@@ -1194,17 +1213,6 @@ fn bench(
     Ok(ExitCode::SUCCESS)
 }
 
-/// Open the reference-first artifact encoder (bounded header read; the
-/// llama.cpp vocab-only load is cheap and used in preference whenever the
-/// pinned library is configured).
-fn artifact_encoder(
-    runtime: &Arc<Runtime>,
-    artifact: &tuckmill_manifest::records::ModelArtifact,
-) -> Result<tuckmill_supervisor::tokenization::ArtifactEncoder> {
-    let path = runtime.layout.artifact_payload_path(&artifact.artifact_id);
-    tuckmill_supervisor::tokenization::open_encoder(&path, None)
-}
-
 // ---------------- verify ----------------
 
 #[allow(clippy::too_many_arguments)]
@@ -1337,10 +1345,13 @@ fn stats(
         &ticket,
         plan.clone(),
         artifact_ref,
-        prompt,
-        tokens.max(1),
-        Vec::new(),
-        0,
+        tuckmill_supervisor::runtime::RunRequest {
+            prompt_tokens: prompt,
+            max_output_tokens: tokens.max(1),
+            stop: Vec::new(),
+            seed: 0,
+            sampling: tuckmill_backend::SamplingPolicy::default(),
+        },
     )?;
     let committed;
     let reason = loop {
@@ -1350,6 +1361,7 @@ fn stats(
             Ok(tuckmill_supervisor::runtime::RunEvent::Done {
                 reason,
                 committed: c,
+                generated: _,
                 timing: _,
             }) => {
                 committed = c;

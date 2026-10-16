@@ -249,11 +249,18 @@ fn build(cfg: &SyntheticConfig) -> Result<Vec<u8>> {
         tokens.push(KV::Str(result));
         token_types.push(KV::I32(1));
     }
-    while tokens.len() < cfg.vocab as usize - 3 {
+    while tokens.len() < cfg.vocab as usize - 5 {
         let i = tokens.len();
         tokens.push(KV::Str(format!("unused-{i}")));
         token_types.push(KV::I32(5));
     }
+    // ChatML control tokens, exactly as real Qwen-family GGUFs carry them;
+    // the fixture chat template emits these spellings, so special-aware
+    // tokenization is exercised end to end.
+    tokens.push(KV::Str(crate::chat::QWEN3_IM_START.into()));
+    token_types.push(KV::I32(3));
+    tokens.push(KV::Str(crate::chat::QWEN3_IM_END.into()));
+    token_types.push(KV::I32(3));
     tokens.push(KV::Str("<|bos|>".into()));
     token_types.push(KV::I32(3));
     tokens.push(KV::Str("<|eos|>".into()));
@@ -273,6 +280,10 @@ fn build(cfg: &SyntheticConfig) -> Result<Vec<u8>> {
     kvs.push(("tokenizer.ggml.eos_token_id".into(), KV::U32(eos_id)));
     kvs.push(("tokenizer.ggml.bos_token_id".into(), KV::U32(bos_id)));
     kvs.push(("tokenizer.ggml.padding_token_id".into(), KV::U32(pad_id)));
+    kvs.push((
+        "tokenizer.chat_template".into(),
+        KV::Str(crate::chat::QWEN3_CHAT_TEMPLATE.to_string()),
+    ));
 
     out.extend_from_slice(&(kvs.len() as u64).to_le_bytes());
     for (key, value) in &kvs {

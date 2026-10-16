@@ -163,10 +163,13 @@ pub fn run_standard_bench(
             &ticket,
             plan.clone(),
             artifact.clone(),
-            prompt,
-            options.output_tokens as u64,
-            Vec::new(),
-            rep as u64,
+            crate::runtime::RunRequest {
+                prompt_tokens: prompt,
+                max_output_tokens: options.output_tokens as u64,
+                stop: Vec::new(),
+                seed: rep as u64,
+                sampling: tuckmill_backend::SamplingPolicy::default(),
+            },
         )?;
 
         let mut first_token_at: Option<Instant> = None;

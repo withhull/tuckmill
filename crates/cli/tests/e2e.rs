@@ -362,6 +362,203 @@ fn http_request(addr: &str, request: &str, _unused: Option<()>) -> String {
     out
 }
 
+/// Gate B end-to-end through the real API and the isolated TuckCore worker:
+/// identical requests reuse one loaded model, sampling settings reach the
+/// worker, stop sequences never leak, and usage accounts for the actual
+/// prompt tokens.
+#[test]
+fn gate_b_chat_semantics_through_the_real_worker() {
+    let env = TestEnv::new();
+    let fixture = env.fixture.display().to_string();
+    env.run_ok(&["import", &fixture, "--alias", "local-model"]);
+
+    let mut child = Command::new(bin())
+        .args(["serve", "--port", "0", "--engine", "tuckcore"])
+        .env("TUCKMILL_DATA_DIR", &env.data_dir)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn serve");
+
+    let stdout = child.stdout.take().unwrap();
+    let mut reader = BufReader::new(stdout);
+    let mut addr_line = String::new();
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    let mut addr = None;
+    while std::time::Instant::now() < deadline {
+        addr_line.clear();
+        if reader.read_line(&mut addr_line).unwrap_or(0) == 0 {
+            break;
+        }
+        if let Some(rest) = addr_line
+            .trim()
+            .strip_prefix("tuckmill serve: listening on http://")
+        {
+            addr = Some(rest.to_string());
+            break;
+        }
+    }
+    let addr = addr.expect("serve should print its bound address");
+    std::thread::spawn(move || {
+        let mut sink = String::new();
+        let _ = reader.read_to_string(&mut sink);
+    });
+
+    let token = std::fs::read_to_string(env.data_dir.join("control/api-token")).unwrap();
+    let token = token.trim().to_string();
+
+    let chat = |body: &serde_json::Value| -> serde_json::Value {
+        let body = body.to_string();
+        let req = format!(
+            "POST /v1/chat/completions HTTP/1.1\r\nHost: 127.0.0.1\r\nAuthorization: Bearer {token}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        let resp = http_request(&addr, &req, None);
+        let payload = resp
+            .split("\r\n\r\n")
+            .nth(1)
+            .unwrap_or_else(|| panic!("no body: {resp}"));
+        serde_json::from_str(payload).unwrap_or_else(|e| panic!("not JSON ({e}): {resp}"))
+    };
+    let status = || -> serde_json::Value {
+        let req = format!(
+            "GET /control/status HTTP/1.1\r\nHost: 127.0.0.1\r\nAuthorization: Bearer {token}\r\nConnection: close\r\n\r\n"
+        );
+        let resp = http_request(&addr, &req, None);
+        let payload = resp.split("\r\n\r\n").nth(1).expect("status body");
+        serde_json::from_str(payload).expect("status JSON")
+    };
+
+    let messages = serde_json::json!([
+        {"role": "system", "content": "You are terse."},
+        {"role": "user", "content": "say something"}
+    ]);
+
+    // Greedy requests are deterministic; ten equivalent sequential
+    // requests must reuse one loaded model (worker_generation stays 1) and
+    // must not inherit session state (identical visible output).
+    let greedy_body = serde_json::json!({
+        "model": "local-model",
+        "messages": messages,
+        "max_tokens": 6,
+    });
+    let first = chat(&greedy_body);
+    assert!(
+        !first["choices"][0]["message"]["content"]
+            .as_str()
+            .unwrap_or("")
+            .is_empty(),
+        "{first}"
+    );
+    assert_eq!(first["choices"][0]["finish_reason"], "length");
+    let prompt_tokens = first["usage"]["prompt_tokens"].as_u64().unwrap();
+    assert!(
+        prompt_tokens > 0,
+        "usage must count the real prompt: {first}"
+    );
+    assert_eq!(first["usage"]["completion_tokens"], 6);
+    assert_eq!(
+        first["usage"]["total_tokens"].as_u64().unwrap(),
+        prompt_tokens + 6
+    );
+    let first_text = first["choices"][0]["message"]["content"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    for i in 0..9 {
+        let again = chat(&greedy_body);
+        assert_eq!(
+            again["choices"][0]["message"]["content"].as_str().unwrap(),
+            first_text,
+            "request {i} must not inherit session state"
+        );
+    }
+    let s = status();
+    assert_eq!(
+        s["worker_generation"], 1,
+        "equivalent requests must reuse the loaded model: {s}"
+    );
+    let pid = s["worker_pid"].as_u64().expect("worker pid");
+    assert!(pid > 0, "{s}");
+
+    // Sampling: the requested transforms and seed reach the worker.
+    let sampled = |seed: u64, top_p: Option<f64>| -> serde_json::Value {
+        let mut body = serde_json::json!({
+            "model": "local-model",
+            "messages": messages,
+            "max_tokens": 12,
+            "temperature": 1.0,
+            "seed": seed,
+        });
+        if let Some(p) = top_p {
+            body["top_p"] = serde_json::json!(p);
+        }
+        chat(&body)
+    };
+    let a = sampled(11, Some(0.9));
+    let b = sampled(11, Some(0.9));
+    assert_eq!(
+        a["choices"][0]["message"]["content"],
+        b["choices"][0]["message"]["content"]
+    );
+    assert_eq!(a["tuckmill"]["sampling"]["greedy"], false);
+    let c = sampled(12, None);
+    assert_ne!(
+        a["choices"][0]["message"]["content"], c["choices"][0]["message"]["content"],
+        "different seeds must sample different continuations"
+    );
+
+    // Stop handling: a stop sequence that completes mid-stream is trimmed
+    // from visible output and reported as finish_reason "stop".
+    let long = chat(&serde_json::json!({
+        "model": "local-model",
+        "messages": messages,
+        "max_tokens": 8,
+    }));
+    let base = long["choices"][0]["message"]["content"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(
+        base.chars().count() >= 3,
+        "fixture text too short: {base:?}"
+    );
+    let stop: String = base
+        .chars()
+        .rev()
+        .take(3)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect();
+    let stopped = chat(&serde_json::json!({
+        "model": "local-model",
+        "messages": messages,
+        "max_tokens": 8,
+        "stop": [stop.clone()],
+    }));
+    assert_eq!(stopped["choices"][0]["finish_reason"], "stop");
+    let visible = stopped["choices"][0]["message"]["content"]
+        .as_str()
+        .unwrap();
+    assert!(base.starts_with(visible), "{visible:?} vs {base:?}");
+    assert!(!visible.contains(&stop), "stop marker leaked: {visible:?}");
+    let completion_tokens = stopped["usage"]["completion_tokens"].as_u64().unwrap();
+    assert!(completion_tokens <= 8, "{stopped}");
+    assert!(
+        stopped["tuckmill"]["generated_tokens"].as_u64().unwrap() >= completion_tokens,
+        "{stopped}"
+    );
+
+    // The worker persisted across every request above.
+    let s = status();
+    assert_eq!(s["worker_generation"], 1, "{s}");
+    assert_eq!(s["worker_pid"].as_u64().unwrap(), pid);
+
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
 #[test]
 fn import_of_missing_file_is_a_clean_typed_error() {
     let env = TestEnv::new();

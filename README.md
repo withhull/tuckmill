@@ -31,9 +31,17 @@ quality.
 > performance comparative claim is made. Stage A verification is hardened:
 > malformed scoring fails closed, verification records are immutable with
 > held-out qualification, the governor drives real backend commands
-> (protocol v4), tokenization is reference-first (llama.cpp when configured;
+> (protocol v7), tokenization is reference-first (llama.cpp when configured;
 > non-GPT-2 pre-tokenizers are refused, never approximated), and executors
-> verify the artifact's full content digest before running. See
+> verify the artifact's full content digest before running. Chat requests
+> execute with the artifact's own template and typed sampling through the
+> worker: prompts are rendered by a byte-exact recognized Qwen3 template and
+> tokenized reference-first; completed stop sequences and EOS markers never
+> reach visible output, with visible (`committed`) and sampled (`generated`)
+> token counts tracked separately; the worker refuses to load when its live
+> arenas exceed the plan's reservations (KV is priced at the executed
+> representation, 4 bytes per element in TuckCore); and equivalent requests
+> reuse one loaded model with isolated per-request state. See
 > [docs/certification-matrix.md](docs/certification-matrix.md) and
 > [docs/claims.md](docs/claims.md).
 
@@ -155,7 +163,7 @@ crates/tuckcore     experimental executor: zero-copy block loader, completion fe
 crates/llamaref     pinned llama.cpp reference backend (dlopen of the checked tm shim)
 crates/supervisor   queue, ledger, governor, worker protocol/process, API, bench, verify
 crates/cli          the tuckmill binary (incl. hidden __worker-reference)
-native/executor     C ABI header + protocol spec (PROTOCOL.md, v4)
+native/executor     C ABI header + protocol spec (PROTOCOL.md, v7)
 native/llamaref     tm_llama_shim.c: narrow C surface over pinned llama.cpp
 kernels/            K01–K09 work-package registry (K01 implemented increment; K02–K09 specified)
 adapters/           qwen3, qwen3moe, qwen3.5-hybrid, bonsai2-hybrid specs
@@ -168,7 +176,7 @@ scripts/            build.sh, test.sh, demo.sh
 ## Verification and benchmarks
 
 `scripts/test.sh` runs formatting, `clippy -D warnings`, and the full test
-suite (311 tests),
+suite (336 tests),
 including adversarial GGUF/Safetensors fixtures, planner math, governor
 semantics, import/pack fault injection, worker-protocol framing, HTTP
 auth/SSE, CLI end-to-end runs (isolated worker, crash injection, SIGINT

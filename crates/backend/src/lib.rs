@@ -13,9 +13,12 @@ use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 
-use tuckmill_manifest::error::Result;
+use tuckmill_manifest::error::{ErrorCode, Result, TuckmillError};
 use tuckmill_manifest::plan::ExecutionPlan;
 use tuckmill_manifest::records::EngineIdentity;
+
+pub mod output;
+pub mod sampling;
 
 /// Version of this interface. Bumped only with a migration note; plans and
 /// worker sessions record it so incompatible combinations fail closed.
@@ -149,6 +152,69 @@ pub struct GenerateRequest {
     pub max_output_tokens: u64,
     pub stop: Vec<String>,
     pub seed: u64,
+    /// Requested sampler settings. Linear/logit-bias knobs this interface
+    /// does not support must be rejected by the supervisor, never dropped
+    /// silently here.
+    pub sampling: SamplingPolicy,
+}
+
+/// Typed sampler settings carried by a generation request (ADR-005).
+///
+/// `temperature <= 0.0` means deterministic greedy selection, the default.
+/// A positive temperature applies softmax over the non-NaN logits scaled by
+/// the temperature, then the optional nucleus (`top_p`) transform, then a
+/// deterministic draw seeded by the request seed. Backends that cannot
+/// implement a requested transform must refuse the request rather than
+/// silently generating greedily.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct SamplingPolicy {
+    /// 0.0 = greedy (default).
+    #[serde(default)]
+    pub temperature: f32,
+    /// Nucleus threshold in (0.0, 1.0]; 1.0 or absent disables top-p.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub top_p: Option<f32>,
+}
+
+impl Default for SamplingPolicy {
+    fn default() -> Self {
+        Self {
+            temperature: 0.0,
+            top_p: None,
+        }
+    }
+}
+
+impl SamplingPolicy {
+    pub fn greedy() -> Self {
+        Self::default()
+    }
+
+    pub fn is_greedy(&self) -> bool {
+        self.temperature <= 0.0
+    }
+
+    /// Validate the settings; unsupported values are typed rejections.
+    pub fn validate(&self) -> Result<()> {
+        if !self.temperature.is_finite() || !(0.0..=2.0).contains(&self.temperature) {
+            return Err(TuckmillError::new(
+                ErrorCode::InvalidRequest,
+                format!(
+                    "temperature {} is outside the supported range 0.0..=2.0",
+                    self.temperature
+                ),
+            ));
+        }
+        if let Some(p) = self.top_p {
+            if !p.is_finite() || !(0.0..=1.0).contains(&p) {
+                return Err(TuckmillError::new(
+                    ErrorCode::InvalidRequest,
+                    format!("top_p {p} is outside the supported range 0.0..=1.0"),
+                ));
+            }
+        }
+        Ok(())
+    }
 }
 
 /// Cooperative controls and callbacks passed through a generation.
@@ -222,10 +288,18 @@ pub struct RequestTiming {
 
 /// Why a generation finished, with committed-token accounting and optional
 /// worker-side timing.
+///
+/// `committed` counts tokens with at least one byte of user-visible text;
+/// tokens dropped inside a completed stop sequence, or contributing no
+/// bytes, are not counted. `generated` counts every sampled token id,
+/// including the ones a stop sequence or EOS removed from the visible
+/// stream — the two numbers are tracked separately so a report can never
+/// conflate "tokens computed" with "tokens delivered".
 #[derive(Debug, Clone)]
 pub struct GenOutcome {
     pub finish_reason: FinishReason,
     pub committed: u64,
+    pub generated: u64,
     /// Worker-side timing of the request, when the backend measures it.
     pub timing: Option<RequestTiming>,
 }
@@ -235,8 +309,15 @@ impl GenOutcome {
         Self {
             finish_reason,
             committed,
+            generated: committed,
             timing: None,
         }
+    }
+
+    /// Record the raw sampled-token count when it differs from `committed`.
+    pub fn with_generated(mut self, generated: u64) -> Self {
+        self.generated = generated;
+        self
     }
 
     pub fn with_timing(mut self, timing: RequestTiming) -> Self {
@@ -315,6 +396,13 @@ pub struct BackendStats {
     /// supervisor's request.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub kv_precision: Option<String>,
+    /// KV-state bytes the backend has prepared or will allocate for the
+    /// admitted context, in the backend's actual storage representation.
+    /// The supervisor compares this against the plan's KV reservation after
+    /// every load; a worker that would allocate more than the plan reserved
+    /// fails closed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kv_state_bytes: Option<u64>,
     /// Thread count in use for compute, when the backend is threaded.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub threads: Option<u32>,

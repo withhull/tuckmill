@@ -829,6 +829,7 @@ impl InferenceBackend for LlamaRef {
     }
 
     fn generate(&mut self, req: &GenerateRequest, ctl: &mut GenControl<'_>) -> Result<GenOutcome> {
+        req.sampling.validate()?;
         let prompt_len = req.prompt_tokens.len() as u64;
         if prompt_len == 0 {
             return Err(TuckmillError::new(
@@ -852,6 +853,20 @@ impl InferenceBackend for LlamaRef {
             ));
         }
         (ctl.on_state)(RunState::Warming);
+        // A fresh sequence per request: the loaded model is reused, session
+        // state never is. Without this, a second request would append to the
+        // first request's positions (leaked context).
+        {
+            let h = self.h()?;
+            // SAFETY: handle valid; clears KV memory and samples state.
+            let rc = unsafe { (self.shim.reset)(h) };
+            if rc != 0 {
+                return Err(TuckmillError::new(
+                    ErrorCode::WorkerFailed,
+                    "llama context reset failed before prefill",
+                ));
+            }
+        }
         (ctl.on_state)(RunState::Prefilling);
         self.decode_chunked_with_poll(&req.prompt_tokens, ctl.poll)?;
         if ctl.cancel.load(std::sync::atomic::Ordering::Relaxed) {
@@ -859,45 +874,98 @@ impl InferenceBackend for LlamaRef {
         }
 
         (ctl.on_state)(RunState::Generating);
-        let mut committed: u64 = 0;
-        let mut generated = String::new();
+        let mut rng = tuckmill_backend::sampling::Rng::new(req.seed);
+        let sampling_cfg = tuckmill_backend::sampling::SamplingConfig {
+            temperature: req.sampling.temperature,
+            top_k: None,
+            top_p: req.sampling.top_p,
+        };
+        let mut buffer = tuckmill_backend::output::VisibleOutputBuffer::new(&req.stop);
+        let mut release_index: u64 = 0;
+        let mut generated_ids: u64 = 0;
         // Incremental UTF-8 assembly over exact piece bytes.
         let mut decoder = tuckmill_manifest::utf8::Utf8StreamDecoder::new();
+        let emit = |text: &str, release_index: &mut u64, ctl: &mut GenControl<'_>| -> bool {
+            if text.is_empty() {
+                return true;
+            }
+            let keep = (ctl.on_token)(*release_index, text);
+            *release_index += 1;
+            keep
+        };
         for i in 0..req.max_output_tokens {
             if ctl.cancel.load(std::sync::atomic::Ordering::Relaxed) {
-                return Ok(GenOutcome::new(FinishReason::Cancelled, committed));
+                let r = buffer.flush();
+                let _ = emit(&r.text, &mut release_index, ctl);
+                return Ok(
+                    GenOutcome::new(FinishReason::Cancelled, buffer.visible_tokens())
+                        .with_generated(generated_ids),
+                );
             }
             let h = self.h()?;
-            let mut token: i32 = -1;
-            // SAFETY: handle valid; out pointer valid.
-            let rc = unsafe { (self.shim.sample_greedy)(h, &mut token) };
-            if rc != 0 || token < 0 {
-                return Err(TuckmillError::new(
-                    ErrorCode::WorkerFailed,
-                    format!("llama greedy sampling failed (rc {rc})"),
-                ));
+            let token: u32 = if req.sampling.is_greedy() {
+                let mut sampled: i32 = -1;
+                // SAFETY: handle valid; out pointer valid.
+                let rc = unsafe { (self.shim.sample_greedy)(h, &mut sampled) };
+                if rc != 0 || sampled < 0 {
+                    return Err(TuckmillError::new(
+                        ErrorCode::WorkerFailed,
+                        format!("llama greedy sampling failed (rc {rc})"),
+                    ));
+                }
+                sampled as u32
+            } else {
+                // Nonzero temperature: the shared sampler applies the
+                // declared transforms to llama.cpp's own logits.
+                let mut logits = vec![0f32; self.vocab.max(0) as usize];
+                // SAFETY: logits buffer sized to the vocabulary.
+                let n = unsafe { (self.shim.logits)(h, logits.as_mut_ptr(), logits.len() as i32) };
+                if n < 0 {
+                    return Err(TuckmillError::new(
+                        ErrorCode::WorkerFailed,
+                        format!("llama logits unavailable (rc {n})"),
+                    ));
+                }
+                logits.truncate(n as usize);
+                let Some(t) = tuckmill_backend::sampling::sample(&logits, &sampling_cfg, &mut rng)
+                else {
+                    return Err(TuckmillError::new(
+                        ErrorCode::WorkerFailed,
+                        "sampling produced no token: every logit was non-finite",
+                    ));
+                };
+                t
+            };
+            generated_ids = i + 1;
+            if token == self.eos.max(0) as u32 {
+                // The model-defined EOS marker is never visible.
+                let r = buffer.flush();
+                let _ = emit(&r.text, &mut release_index, ctl);
+                return Ok(GenOutcome::new(FinishReason::Eos, buffer.visible_tokens())
+                    .with_generated(generated_ids));
             }
-            let text = decoder.push(&self.piece_bytes(token as u32)?);
-            generated.push_str(&text);
-            committed += 1;
-            if !(ctl.on_token)(i, &text) {
-                return Ok(GenOutcome::new(FinishReason::Stop, committed));
+            let text = decoder.push(&self.piece_bytes(token)?);
+            let release = buffer.push(i, &text);
+            if !emit(&release.text, &mut release_index, ctl) {
+                let r = buffer.flush();
+                let _ = emit(&r.text, &mut release_index, ctl);
+                return Ok(GenOutcome::new(FinishReason::Stop, buffer.visible_tokens())
+                    .with_generated(generated_ids));
             }
-            if req
-                .stop
-                .iter()
-                .any(|s| !s.is_empty() && generated.ends_with(s.as_str()))
-            {
-                return Ok(GenOutcome::new(FinishReason::Stop, committed));
-            }
-            if token == self.eos {
-                return Ok(GenOutcome::new(FinishReason::Eos, committed));
+            if release.stop {
+                return Ok(GenOutcome::new(FinishReason::Stop, buffer.visible_tokens())
+                    .with_generated(generated_ids));
             }
             if i + 1 < req.max_output_tokens {
-                self.decode_chunked_with_poll(&[token as u32], ctl.poll)?;
+                self.decode_chunked_with_poll(&[token], ctl.poll)?;
             }
         }
-        Ok(GenOutcome::new(FinishReason::Length, committed))
+        let r = buffer.flush();
+        let _ = emit(&r.text, &mut release_index, ctl);
+        Ok(
+            GenOutcome::new(FinishReason::Length, buffer.visible_tokens())
+                .with_generated(generated_ids),
+        )
     }
 
     fn score(
@@ -1197,11 +1265,67 @@ mod tests {
             max_output_tokens: 4,
             stop: vec![],
             seed: 0,
+            sampling: tuckmill_backend::SamplingPolicy::default(),
         };
         let outcome = backend.generate(&req, &mut ctl).unwrap();
         assert_eq!(outcome.finish_reason, FinishReason::Length);
         assert_eq!(outcome.committed, 4);
         assert!(!texts.is_empty());
+
+        // A second equivalent request reuses the loaded model but must not
+        // inherit any session state: the reset makes greedy output identical
+        // to the first run instead of appending to it.
+        let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let pause = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut texts2 = Vec::new();
+        let mut on_token2 = |_i: u64, t: &str| {
+            texts2.push(t.to_string());
+            true
+        };
+        let mut on_state2 = |_s: RunState| {};
+        let mut ctl2 = GenControl::new(
+            cancel.clone(),
+            pause.clone(),
+            &mut on_token2,
+            &mut on_state2,
+        );
+        let outcome2 = backend.generate(&req, &mut ctl2).unwrap();
+        assert_eq!(outcome2.finish_reason, FinishReason::Length);
+        assert_eq!(texts2, texts, "no session state may leak between requests");
+
+        // Nonzero temperature: the shared sampler applies the declared
+        // transforms to llama.cpp's own logits, reproducibly per seed.
+        let mut sampled = |seed: u64| -> Vec<String> {
+            let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let pause = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let mut out = Vec::new();
+            let mut on_token = |_i: u64, t: &str| {
+                out.push(t.to_string());
+                true
+            };
+            let mut on_state = |_s: RunState| {};
+            let mut ctl =
+                GenControl::new(cancel.clone(), pause.clone(), &mut on_token, &mut on_state);
+            let mut req = req.clone();
+            req.max_output_tokens = 8;
+            req.seed = seed;
+            req.sampling = tuckmill_backend::SamplingPolicy {
+                temperature: 1.0,
+                top_p: Some(0.9),
+            };
+            let outcome = backend.generate(&req, &mut ctl).unwrap();
+            assert_eq!(outcome.finish_reason, FinishReason::Length);
+            assert!(
+                outcome.committed <= outcome.generated,
+                "visible tokens can never exceed sampled tokens"
+            );
+            out
+        };
+        let s1 = sampled(7);
+        let s2 = sampled(7);
+        assert_eq!(s1, s2, "seeded sampling through llama.cpp is reproducible");
+        let s3 = sampled(8);
+        assert_ne!(s1, s3, "different seeds must diverge (8 sampled tokens)");
         backend.shutdown();
     }
 

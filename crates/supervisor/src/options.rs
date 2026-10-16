@@ -136,6 +136,23 @@ impl ExecutionOptions {
         }
     }
 
+    /// Bytes per KV element in the engine's *actual* storage representation.
+    /// This is the number the planner must price; a nominal precision is
+    /// never used. TuckCore's bounded KV state stores f32 values even in its
+    /// f16-rounded mode, so it is always 4 bytes; llama.cpp honors its
+    /// configured cache type (f16 default). The reference test engine
+    /// allocates no KV state and takes the declared fallback assumption.
+    pub fn kv_bytes_per_element(&self, kind: EngineKind, fallback: u32) -> u32 {
+        match kind {
+            EngineKind::TuckCore => 4,
+            EngineKind::LlamaCpp => match self.kv_precision.as_deref() {
+                Some("f32") => 4,
+                _ => 2,
+            },
+            EngineKind::ReferenceTest => fallback,
+        }
+    }
+
     /// Per-side options for verification. `cache_override` supplies the
     /// cache geometry for the side (the streamed side is deliberately tiny);
     /// the block size follows the cache size as before.

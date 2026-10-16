@@ -10,6 +10,7 @@ use std::time::{Duration, Instant};
 
 use serde::Deserialize;
 
+use tuckmill_backend::output::VisibleOutputBuffer;
 use tuckmill_backend::{
     ArtifactRef, BackendCapabilities, BackendId, BackendStats, FinishReason, GenControl,
     GenOutcome, GenerateRequest, InferenceBackend, RequestTiming, RunState, StorageStats,
@@ -18,6 +19,7 @@ use tuckmill_manifest::adapter::AdapterRegistry;
 use tuckmill_manifest::error::{ErrorCode, Result, TuckmillError};
 use tuckmill_manifest::plan::{ExecutionMode, ExecutionPlan};
 use tuckmill_manifest::records::EngineIdentity;
+use tuckmill_manifest::units::Bytes;
 use tuckmill_manifest::{BACKEND_ABI_VERSION, WORKER_PROTOCOL_VERSION};
 
 use crate::completion::CompletionTracker;
@@ -347,6 +349,52 @@ impl InferenceBackend for TuckCore {
                 ),
             ));
         }
+        // ---- plan arena enforcement (B3) ----
+        // Every live arena this load will own must fit the reservation the
+        // supervisor already admitted against the process budget. An
+        // understated or foreign plan is refused before anything allocates.
+        let kv_reserved = plan.budget.reservation_breakdown.kv_state.bytes();
+        if kv_bound > kv_reserved {
+            return Err(TuckmillError::new(
+                ErrorCode::ContextExceedsBudget,
+                format!(
+                    "the plan reserves {} for KV state but this executor allocates {} for the admitted context {} in its f32 store; refusing to allocate beyond the acknowledged plan",
+                    Bytes(kv_reserved),
+                    Bytes(kv_bound),
+                    plan.context.total_context
+                ),
+            )
+            .with_action(
+                "Rebuild the plan from the executor's resolved KV representation (4 bytes per element); understated reservations are never loaded.",
+            ));
+        }
+        let payload: u64 = insp.tensors.iter().map(|t| t.byte_size).sum();
+        let weight_allowance = plan
+            .budget
+            .reservation_breakdown
+            .weights
+            .bytes()
+            .saturating_add(plan.budget.reservation_breakdown.io_buffers.bytes());
+        // A cache larger than the payload is never useful; clamp before
+        // charging it so the check prices the allocation that can happen.
+        let effective_cache = policy.cache_bytes.min(payload);
+        let cache_wanted = effective_cache.saturating_add(policy.block_bytes);
+        if cache_wanted > weight_allowance {
+            return Err(TuckmillError::new(
+                ErrorCode::InvalidPlan,
+                format!(
+                    "the plan reserves {} for weights + I/O but this load requests up to {} (cache {} clamped to payload {} plus one block of {}); refusing an unacknowledged weight-cache allocation",
+                    Bytes(weight_allowance),
+                    Bytes(cache_wanted),
+                    Bytes(policy.cache_bytes),
+                    Bytes(payload),
+                    Bytes(policy.block_bytes)
+                ),
+            )
+            .with_action(
+                "Raise --memory-budget so the plan reserves resident weights, lower --context, or configure a smaller weight cache — this plan's mode does not cover the executor's live arenas.",
+            ));
+        }
         let mut names = model::TensorNames::for_layers(cfg.layers);
         names.resolve(&insp)?;
         let tokenizer = Tokenizer::from_gguf(&insp)?;
@@ -362,7 +410,6 @@ impl InferenceBackend for TuckCore {
         )?);
         let tracker = Arc::new(CompletionTracker::new());
         let weights = forward::prepare(&loader, cfg.clone(), names)?;
-        let payload: u64 = insp.tensors.iter().map(|t| t.byte_size).sum();
 
         let mut note = format!(
             "tuckcore (experimental, uncertified): dense Qwen3, {} layers, vocab {}, byte-level BPE tokenizer, kernels {} [{}] (K01 scope: Q8_0/F16 CPU fused dot; Q4 and Metal unbuilt), weights {}; kv {}; real weights from {} ({} payload), weight cache {}, block {}",
@@ -498,19 +545,63 @@ impl InferenceBackend for TuckCore {
         let prefill_ms = t0.elapsed().as_secs_f64() * 1000.0;
 
         (ctl.on_state)(RunState::Generating);
+        // Typed sampling policy from the request: greedy when temperature is
+        // zero; the declared transforms and seed otherwise. Unsupported
+        // values are refused before any compute, never ignored.
+        req.sampling.validate()?;
+        let sampling_cfg = SamplingConfig {
+            temperature: req.sampling.temperature,
+            top_k: None,
+            top_p: req.sampling.top_p,
+        };
         let mut rng = Rng::new(req.seed);
-        let sampling_cfg = SamplingConfig::default(); // greedy in Stage 0
-        let mut committed: u64 = 0;
-        let mut generated = String::new();
+        let mut generated_ids: u64 = 0;
+        let mut release_index: u64 = 0;
         let mut first_committed_at: Option<Instant> = None;
         let mut last_committed_at: Option<Instant> = None;
         // Incremental UTF-8 assembly: multibyte characters split across
         // tokens are held until complete, never replacement-mangled mid-char.
         let mut decoder = Utf8StreamDecoder::new();
+        // Bounded pending-output buffering: a stop sequence spanning several
+        // tokens (or a partial stop prefix) is held until it can no longer
+        // complete, so no stop marker can leak into the visible stream.
+        let mut buffer = VisibleOutputBuffer::new(&req.stop);
+        // Emit a release: update timing, deliver the chunk, and report
+        // whether the client asked to stop.
+        let emit = |text: &str,
+                    release_index: &mut u64,
+                    first: &mut Option<Instant>,
+                    last: &mut Option<Instant>,
+                    ctl: &mut GenControl<'_>|
+         -> bool {
+            if text.is_empty() {
+                return true;
+            }
+            let now = Instant::now();
+            if first.is_none() {
+                *first = Some(now);
+            }
+            *last = Some(now);
+            let keep = (ctl.on_token)(*release_index, text);
+            *release_index += 1;
+            keep
+        };
         let outcome = 'decode: {
             for i in 0..req.max_output_tokens {
                 if ctl.cancel.load(Ordering::Relaxed) {
-                    break 'decode GenOutcome::new(FinishReason::Cancelled, committed);
+                    let r = buffer.flush();
+                    let _ = emit(
+                        &r.text,
+                        &mut release_index,
+                        &mut first_committed_at,
+                        &mut last_committed_at,
+                        ctl,
+                    );
+                    break 'decode GenOutcome::new(
+                        FinishReason::Cancelled,
+                        buffer.visible_tokens(),
+                    )
+                    .with_generated(generated_ids);
                 }
                 pause_loop(ctl, self.per_token_delay)?;
 
@@ -520,6 +611,22 @@ impl InferenceBackend for TuckCore {
                         "sampling produced no token: every logit was non-finite",
                     ));
                 };
+                generated_ids = i + 1;
+                if Some(token) == loaded.weights.cfg.eos_token_id {
+                    // The model-defined EOS token is never visible: its
+                    // bytes are not pushed, and anything held is flushed
+                    // because no stop sequence can complete after EOS.
+                    let r = buffer.flush();
+                    let _ = emit(
+                        &r.text,
+                        &mut release_index,
+                        &mut first_committed_at,
+                        &mut last_committed_at,
+                        ctl,
+                    );
+                    break 'decode GenOutcome::new(FinishReason::Eos, buffer.visible_tokens())
+                        .with_generated(generated_ids);
+                }
                 let text = match loaded.tokenizer.token_text(token) {
                     Some(_) => decoder.push(&loaded.tokenizer.token_bytes(token)),
                     None => {
@@ -527,25 +634,28 @@ impl InferenceBackend for TuckCore {
                         decoder.push(placeholder.as_bytes())
                     }
                 };
-                let now = Instant::now();
-                if first_committed_at.is_none() {
-                    first_committed_at = Some(now);
+                let release = buffer.push(i, &text);
+                if !emit(
+                    &release.text,
+                    &mut release_index,
+                    &mut first_committed_at,
+                    &mut last_committed_at,
+                    ctl,
+                ) {
+                    let r = buffer.flush();
+                    let _ = emit(
+                        &r.text,
+                        &mut release_index,
+                        &mut first_committed_at,
+                        &mut last_committed_at,
+                        ctl,
+                    );
+                    break 'decode GenOutcome::new(FinishReason::Stop, buffer.visible_tokens())
+                        .with_generated(generated_ids);
                 }
-                last_committed_at = Some(now);
-                generated.push_str(&text);
-                committed += 1;
-                if !(ctl.on_token)(i, &text) {
-                    break 'decode GenOutcome::new(FinishReason::Stop, committed);
-                }
-                if req
-                    .stop
-                    .iter()
-                    .any(|s| !s.is_empty() && generated.ends_with(s.as_str()))
-                {
-                    break 'decode GenOutcome::new(FinishReason::Stop, committed);
-                }
-                if Some(token) == loaded.weights.cfg.eos_token_id {
-                    break 'decode GenOutcome::new(FinishReason::Eos, committed);
+                if release.stop {
+                    break 'decode GenOutcome::new(FinishReason::Stop, buffer.visible_tokens())
+                        .with_generated(generated_ids);
                 }
                 if i + 1 < req.max_output_tokens {
                     // The generated token i occupies position prompt_len + i.
@@ -553,13 +663,34 @@ impl InferenceBackend for TuckCore {
                     match fwd.forward_token(&mut kv, token, pos, &cancelled) {
                         Ok(l) => logits = l,
                         Err(e) if e.code() == ErrorCode::Cancelled => {
-                            break 'decode GenOutcome::new(FinishReason::Cancelled, committed)
+                            let r = buffer.flush();
+                            let _ = emit(
+                                &r.text,
+                                &mut release_index,
+                                &mut first_committed_at,
+                                &mut last_committed_at,
+                                ctl,
+                            );
+                            break 'decode GenOutcome::new(
+                                FinishReason::Cancelled,
+                                buffer.visible_tokens(),
+                            )
+                            .with_generated(generated_ids);
                         }
                         Err(e) => return Err(e),
                     }
                 }
             }
-            GenOutcome::new(FinishReason::Length, committed)
+            let r = buffer.flush();
+            let _ = emit(
+                &r.text,
+                &mut release_index,
+                &mut first_committed_at,
+                &mut last_committed_at,
+                ctl,
+            );
+            GenOutcome::new(FinishReason::Length, buffer.visible_tokens())
+                .with_generated(generated_ids)
         };
         let ms = |from: Instant, to: Instant| (to - from).as_secs_f64() * 1000.0;
         let timing = RequestTiming {
@@ -652,6 +783,10 @@ impl InferenceBackend for TuckCore {
                     }),
                     footprint_bytes: None,
                     kv_precision: Some(loaded.kv_precision.as_str().to_string()),
+                    kv_state_bytes: Some(KvState::bytes_for(
+                        &loaded.weights.cfg,
+                        loaded.context_total,
+                    )),
                     threads: Some(1), // scalar executor is single-threaded
                     kernel_impl: Some(loaded.kernels.as_str().to_string()),
                     numerical_profile: Some(loaded.profile.as_str().to_string()),
@@ -738,6 +873,7 @@ fn pause_loop(ctl: &mut GenControl<'_>, mut remaining: Duration) -> Result<()> {
 mod tests {
     use super::*;
     use std::sync::atomic::AtomicBool;
+    use tuckmill_backend::SamplingPolicy;
     use tuckmill_manifest::ids::Id;
     use tuckmill_manifest::plan::PlanContext;
     use tuckmill_manifest::testing::{write_synthetic, SyntheticConfig};
@@ -771,6 +907,22 @@ mod tests {
         );
         plan.mode = ExecutionMode::Resident;
         plan.context = PlanContext::new(256, 64);
+        // Arena reservations the executor acknowledges at load: KV priced at
+        // the actual f32 representation, plus generous weights/IO for the
+        // tiny fixture. Understated plans are exercised separately.
+        plan.budget.requested_budget = tuckmill_manifest::units::Bytes::parse("2GiB").unwrap();
+        plan.budget.add_reservation(
+            tuckmill_manifest::records::ReserveClass::KvState,
+            Bytes(64 * 1024 * 1024),
+        );
+        plan.budget.add_reservation(
+            tuckmill_manifest::records::ReserveClass::Weights,
+            Bytes(64 * 1024 * 1024),
+        );
+        plan.budget.add_reservation(
+            tuckmill_manifest::records::ReserveClass::IoBuffers,
+            Bytes(16 * 1024 * 1024),
+        );
         plan.plan_id = plan.compute_id().unwrap();
         (dir, artifact, plan)
     }
@@ -779,6 +931,24 @@ mod tests {
         engine: &mut TuckCore,
         prompt: Vec<u32>,
         max_out: u64,
+    ) -> (GenOutcome, Vec<String>) {
+        run_generate_with(
+            engine,
+            prompt,
+            max_out,
+            vec![],
+            7,
+            SamplingPolicy::default(),
+        )
+    }
+
+    fn run_generate_with(
+        engine: &mut TuckCore,
+        prompt: Vec<u32>,
+        max_out: u64,
+        stop: Vec<String>,
+        seed: u64,
+        sampling: SamplingPolicy,
     ) -> (GenOutcome, Vec<String>) {
         let cancel = Arc::new(AtomicBool::new(false));
         let paused = Arc::new(AtomicBool::new(false));
@@ -793,8 +963,9 @@ mod tests {
             request_id: "t1".into(),
             prompt_tokens: prompt,
             max_output_tokens: max_out,
-            stop: vec![],
-            seed: 7,
+            stop,
+            seed,
+            sampling,
         };
         let outcome = engine.generate(&req, &mut ctl).unwrap();
         (outcome, texts)
@@ -868,10 +1039,157 @@ mod tests {
                 max_output_tokens: 200,
                 stop: vec![],
                 seed: 0,
+                sampling: tuckmill_backend::SamplingPolicy::default(),
             };
             engine.generate(&req, &mut ctl).unwrap_err()
         };
         assert_eq!(err.code(), ErrorCode::ContextExceedsBudget);
+    }
+
+    #[test]
+    fn understated_plan_reservations_are_refused_before_allocation() {
+        let (_dir, artifact, plan) = fixture();
+        let mut engine = TuckCore::new();
+
+        // KV understated (the pre-Gate-B "2 bytes per element" mistake).
+        let mut understated = plan.clone();
+        understated.budget.reservation_breakdown.kv_state = Bytes::ZERO;
+        understated.budget.reservation = understated.budget.reservation_breakdown.total();
+        understated.plan_id = understated.compute_id().unwrap();
+        let err = engine.load(&understated, &artifact, None).unwrap_err();
+        assert_eq!(err.code(), ErrorCode::ContextExceedsBudget);
+        assert!(err.message().contains("acknowledged plan"));
+
+        // Weight cache not covered by the weights + I/O reservation.
+        let mut starved = plan.clone();
+        starved.budget.reservation_breakdown.weights = Bytes(0);
+        starved.budget.reservation_breakdown.io_buffers = Bytes(0);
+        starved.budget.reservation = starved.budget.reservation_breakdown.total();
+        starved.plan_id = starved.compute_id().unwrap();
+        let err = engine.load(&starved, &artifact, None).unwrap_err();
+        assert_eq!(err.code(), ErrorCode::InvalidPlan);
+
+        // The fixture plan remains loadable and acknowledges its KV bytes.
+        engine.load(&plan, &artifact, None).unwrap();
+        let stats = engine.stats();
+        assert_eq!(
+            stats.kv_state_bytes,
+            Some(KvState::bytes_for(
+                &engine.loaded.as_ref().unwrap().weights.cfg,
+                256
+            ))
+        );
+    }
+
+    #[test]
+    fn stop_markers_never_reach_the_visible_stream() {
+        let (_dir, artifact, plan) = fixture();
+        let mut engine = TuckCore::new();
+        engine.load(&plan, &artifact, None).unwrap();
+
+        // Learn the deterministic greedy continuation, then use its own
+        // suffix as the stop sequence: the stopped run is the same greedy
+        // stream, so the stop must fire and must never be visible.
+        let (_o, texts) = run_generate(&mut engine, vec![1, 2, 3], 12);
+        let plain: String = texts.concat();
+        assert!(
+            plain.chars().count() >= 4,
+            "fixture text too short: {plain:?}"
+        );
+        let stop: String = plain
+            .chars()
+            .rev()
+            .take(4)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect();
+
+        let (outcome, stopped) = run_generate_with(
+            &mut engine,
+            vec![1, 2, 3],
+            12,
+            vec![stop.clone()],
+            7,
+            SamplingPolicy::default(),
+        );
+        let visible: String = stopped.concat();
+        assert_eq!(outcome.finish_reason, FinishReason::Stop);
+        assert!(
+            !visible.ends_with(stop.as_str()),
+            "stop marker leaked: {visible:?}"
+        );
+        assert!(
+            plain.starts_with(&visible),
+            "visible output must be an unmodified prefix"
+        );
+        assert!(visible.len() < plain.len());
+        assert!(outcome.generated >= outcome.committed);
+        assert_eq!(outcome.generated, 12.min(outcome.generated)); // bounded by max
+    }
+
+    #[test]
+    fn sampling_policy_from_the_request_is_honored() {
+        let (_dir, artifact, plan) = fixture();
+        let mut engine = TuckCore::new();
+        engine.load(&plan, &artifact, None).unwrap();
+
+        // Greedy stays deterministic regardless of seed.
+        let (g1, t1) = run_generate_with(
+            &mut engine,
+            vec![9, 8, 7],
+            8,
+            vec![],
+            1,
+            SamplingPolicy::default(),
+        );
+        let (_g2, t2) = run_generate_with(
+            &mut engine,
+            vec![9, 8, 7],
+            8,
+            vec![],
+            2,
+            SamplingPolicy::default(),
+        );
+        assert_eq!(g1.finish_reason, FinishReason::Length);
+        assert_eq!(t1, t2, "greedy ignores the seed");
+
+        // Nonzero temperature with a seed is reproducible...
+        let warm = SamplingPolicy {
+            temperature: 1.2,
+            top_p: Some(0.9),
+        };
+        let (a, ta) = run_generate_with(&mut engine, vec![9, 8, 7], 12, vec![], 11, warm);
+        let (_b, tb) = run_generate_with(&mut engine, vec![9, 8, 7], 12, vec![], 11, warm);
+        assert_eq!(ta, tb, "seeded sampling is reproducible");
+        assert_eq!(a.finish_reason, FinishReason::Length);
+        // ...and a different seed diverges.
+        let (_c, tc) = run_generate_with(&mut engine, vec![9, 8, 7], 12, vec![], 12, warm);
+        assert_ne!(ta, tc, "different seeds must produce different samples");
+
+        // Unsupported values are refused before compute, never ignored.
+        let bad = SamplingPolicy {
+            temperature: 3.0,
+            top_p: None,
+        };
+        let err = {
+            let cancel = Arc::new(AtomicBool::new(false));
+            let paused = Arc::new(AtomicBool::new(false));
+            let mut on_token = |_i: u64, _t: &str| true;
+            let mut on_state = |_s: RunState| {};
+            let mut ctl =
+                GenControl::new(cancel.clone(), paused.clone(), &mut on_token, &mut on_state);
+            let req = GenerateRequest {
+                request_id: "bad-sampling".into(),
+                prompt_tokens: vec![1, 2],
+                max_output_tokens: 4,
+                stop: vec![],
+                seed: 0,
+                sampling: bad,
+            };
+            engine.generate(&req, &mut ctl).unwrap_err()
+        };
+        assert_eq!(err.code(), ErrorCode::InvalidRequest);
     }
 
     #[test]
@@ -898,6 +1216,7 @@ mod tests {
             max_output_tokens: 200,
             stop: vec![],
             seed: 0,
+            sampling: tuckmill_backend::SamplingPolicy::default(),
         };
         let outcome = engine.generate(&req, &mut ctl).unwrap();
         assert_eq!(outcome.finish_reason, FinishReason::Cancelled);
@@ -1012,6 +1331,7 @@ mod tests {
             max_output_tokens: 8,
             stop: vec![],
             seed: 0,
+            sampling: tuckmill_backend::SamplingPolicy::default(),
         };
         let before = engine.stats().evictions;
         let outcome = engine.generate(&req, &mut ctl).unwrap();

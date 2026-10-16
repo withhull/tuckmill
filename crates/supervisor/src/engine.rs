@@ -155,6 +155,22 @@ impl ReferenceTestEngine {
                 "max_output_tokens must be positive",
             ));
         }
+        // The synthetic engine emits deterministic markers, not samples from
+        // a distribution: a requested sampling transform cannot be honored
+        // and is refused rather than ignored (greedy requests still work).
+        req.sampling.validate()?;
+        if !req.sampling.is_greedy() {
+            return Err(TuckmillError::new(
+                ErrorCode::Unavailable,
+                format!(
+                    "temperature {} cannot be honored: the reference test engine produces synthetic tokens, not samples from a distribution",
+                    req.sampling.temperature
+                ),
+            )
+            .with_action(
+                "Use a real backend (for example --engine tuckcore) for sampling; greedy requests run on the synthetic engine.",
+            ));
+        }
 
         let t0 = Instant::now();
         let mut first_committed_at: Option<Instant> = None;
@@ -196,12 +212,41 @@ impl ReferenceTestEngine {
         let prefill_ms = t0.elapsed().as_secs_f64() * 1000.0;
 
         (ctl.on_state)(RunState::Generating);
-        let mut committed: u64 = 0;
-        let mut generated = String::new();
+        // Bounded pending-output buffering: a stop sequence may span
+        // tokens, so text is held until a stop can no longer complete; a
+        // completed stop sequence is never visible.
+        let mut buffer = tuckmill_backend::output::VisibleOutputBuffer::new(&req.stop);
+        let mut release_index: u64 = 0;
+        let emit = |text: &str,
+                    release_index: &mut u64,
+                    first: &mut Option<Instant>,
+                    last: &mut Option<Instant>,
+                    ctl: &mut GenControl<'_>|
+         -> bool {
+            if text.is_empty() {
+                return true;
+            }
+            let now = Instant::now();
+            if first.is_none() {
+                *first = Some(now);
+            }
+            *last = Some(now);
+            let keep = (ctl.on_token)(*release_index, text);
+            *release_index += 1;
+            keep
+        };
         for i in 0..req.max_output_tokens {
             if ctl.cancel.load(Ordering::Relaxed) {
+                let r = buffer.flush();
+                let _ = emit(
+                    &r.text,
+                    &mut release_index,
+                    &mut first_committed_at,
+                    &mut last_committed_at,
+                    ctl,
+                );
                 return Ok(finish_with_timing(
-                    GenOutcome::new(FinishReason::Cancelled, committed),
+                    GenOutcome::new(FinishReason::Cancelled, buffer.visible_tokens()),
                     t0,
                     Some(prefill_ms),
                     first_committed_at,
@@ -212,30 +257,33 @@ impl ReferenceTestEngine {
             pause_loop(ctl, self.per_token_delay)?;
 
             let text = format!("[ref:{i}]");
-            let now = Instant::now();
-            if first_committed_at.is_none() {
-                first_committed_at = Some(now);
-            }
-            last_committed_at = Some(now);
-            generated.push_str(&text);
-            committed += 1;
-            if !(ctl.on_token)(i, &text) {
+            let release = buffer.push(i, &text);
+            if !emit(
+                &release.text,
+                &mut release_index,
+                &mut first_committed_at,
+                &mut last_committed_at,
+                ctl,
+            ) {
+                let r = buffer.flush();
+                let _ = emit(
+                    &r.text,
+                    &mut release_index,
+                    &mut first_committed_at,
+                    &mut last_committed_at,
+                    ctl,
+                );
                 return Ok(finish_with_timing(
-                    GenOutcome::new(FinishReason::Stop, committed),
+                    GenOutcome::new(FinishReason::Stop, buffer.visible_tokens()),
                     t0,
                     Some(prefill_ms),
                     first_committed_at,
                     last_committed_at,
                 ));
             }
-            // Stop sequences are checked on the committed text stream.
-            if req
-                .stop
-                .iter()
-                .any(|s| !s.is_empty() && generated.ends_with(s.as_str()))
-            {
+            if release.stop {
                 return Ok(finish_with_timing(
-                    GenOutcome::new(FinishReason::Stop, committed),
+                    GenOutcome::new(FinishReason::Stop, buffer.visible_tokens()),
                     t0,
                     Some(prefill_ms),
                     first_committed_at,
@@ -243,8 +291,16 @@ impl ReferenceTestEngine {
                 ));
             }
         }
+        let r = buffer.flush();
+        let _ = emit(
+            &r.text,
+            &mut release_index,
+            &mut first_committed_at,
+            &mut last_committed_at,
+            ctl,
+        );
         Ok(finish_with_timing(
-            GenOutcome::new(FinishReason::Length, committed),
+            GenOutcome::new(FinishReason::Length, buffer.visible_tokens()),
             t0,
             Some(prefill_ms),
             first_committed_at,
@@ -380,6 +436,7 @@ mod tests {
             max_output_tokens: max_output,
             stop: Vec::new(),
             seed: 7,
+            sampling: tuckmill_backend::SamplingPolicy::default(),
         }
     }
 
@@ -437,7 +494,7 @@ mod tests {
     }
 
     #[test]
-    fn output_stops_on_stop_sequence() {
+    fn output_stops_on_stop_sequence_without_leaking_the_marker() {
         let mut engine = ReferenceTestEngine::new();
         engine.per_token_delay = Duration::ZERO;
         engine.load(&admitted_plan()).unwrap();
@@ -445,8 +502,45 @@ mod tests {
         req.stop = vec!["[ref:3]".into()];
         let (outcome, text, _) = run(&mut engine, &req);
         assert_eq!(outcome.finish_reason, FinishReason::Stop);
-        assert_eq!(outcome.committed, 4);
-        assert!(text.ends_with("[ref:3]"));
+        // The three visible tokens are committed; the stop sequence itself
+        // is dropped from the visible stream.
+        assert_eq!(outcome.committed, 3);
+        assert_eq!(text, "[ref:0][ref:1][ref:2]");
+        assert!(!text.contains("[ref:3]"), "stop marker leaked: {text:?}");
+    }
+
+    #[test]
+    fn stop_marker_spanning_streamed_chunks_is_held_until_complete() {
+        // Stop sequence "[ref:2][ref:3]" spans two "tokens"; nothing of it
+        // may be visible while it can still complete.
+        let mut engine = ReferenceTestEngine::new();
+        engine.per_token_delay = Duration::ZERO;
+        engine.load(&admitted_plan()).unwrap();
+        let mut req = request(30);
+        req.stop = vec!["[ref:2][ref:3]".into()];
+        let (outcome, text, _) = run(&mut engine, &req);
+        assert_eq!(outcome.finish_reason, FinishReason::Stop);
+        assert_eq!(text, "[ref:0][ref:1]");
+        assert_eq!(outcome.committed, 2);
+    }
+
+    #[test]
+    fn non_greedy_sampling_is_refused_by_the_synthetic_engine() {
+        let mut engine = ReferenceTestEngine::new();
+        engine.per_token_delay = Duration::ZERO;
+        engine.load(&admitted_plan()).unwrap();
+        let mut req = request(4);
+        req.sampling = tuckmill_backend::SamplingPolicy {
+            temperature: 1.0,
+            top_p: None,
+        };
+        let cancel = Arc::new(AtomicBool::new(false));
+        let paused = Arc::new(AtomicBool::new(false));
+        let mut on_token = |_i: u64, _t: &str| true;
+        let mut on_state = |_s: RunState| {};
+        let mut ctl = GenControl::new(cancel.clone(), paused.clone(), &mut on_token, &mut on_state);
+        let err = engine.generate(&req, &mut ctl).unwrap_err();
+        assert_eq!(err.code(), ErrorCode::Unavailable);
     }
 
     #[test]

@@ -1,4 +1,4 @@
-# Worker control protocol (v6)
+# Worker control protocol (v7)
 
 Wire contract between the Tuckmill supervisor and an execution worker. The
 transport is a private Unix domain socket under the store's `tmp/` directory.
@@ -35,6 +35,15 @@ payload := UTF-8 JSON, one message object
   `first_token_ms`, `decode_ms`) measured inside the backend. Supervisors
   record it separately from their own wall time so queueing and transport
   are never confused with compute; older workers omit the field.
+- v7: `Generate` carries the typed `sampling` policy (`temperature`, `top_p`;
+  absent means greedy). The worker validates it and refuses unsupported
+  values before any compute — never clamps or ignores them. `Done` carries
+  `generated` alongside `committed`: `committed` counts tokens with visible
+  bytes (stop/EOS-trimmed tokens are excluded), `generated` counts every
+  sampled token id. `StatsAck` backend stats include `kv_state_bytes`, the
+  prepared KV-state bytes in the backend's actual representation; the
+  supervisor checks that number against the plan's KV reservation after
+  every load and fails closed on an understated plan.
 - Clean EOF before the first byte of a frame closes the session. EOF mid-frame
   is `WORKER_FAILED`.
 - All fields are validated before use; unknown message tags are protocol
@@ -56,11 +65,11 @@ Every message is a JSON object with `"t"` as the tag:
 | `HelloAck` | W→C | `protocol`, `abi`, `worker_build`, `engine`, `certified` | Protocol/ABI mismatch fails closed. |
 | `Load` | C→W | `plan` (full ExecutionPlan JSON), `artifact` (`ArtifactRef`: path + identity hashes), optional `options` | The backend must re-verify the artifact hashes before executing; options are validated and unknown keys rejected. |
 | `Loaded` | W→C | `note`, `footprint_bytes`, `resolved_kernels` (v5) | `note` must disclose synthetic engines and experimental kernels; `resolved_kernels` names the implementation actually selected. |
-| `Generate` | C→W | `request_id`, `prompt_tokens` (exact IDs), `max_output_tokens`, `stop`, `seed` | Prompt+output must fit the admitted context. |
+| `Generate` | C→W | `request_id`, `prompt_tokens` (exact IDs), `max_output_tokens`, `stop`, `seed`, `sampling` (v7) | Prompt+output must fit the admitted context. `sampling.temperature <= 0` means greedy; unsupported values are a typed rejection. |
 | `State` | W→C | `state` ∈ warming/prefilling/generating/throttling/paused | Advisory progress. |
-| `Token` | W→C | `index`, `text` | Committed tokens only. Draft text is forbidden. |
+| `Token` | W→C | `index`, `text` | Visible tokens only, stop/EOS-trimmed text excluded. Draft text is forbidden. |
 | `Heartbeat` | W→C | `uptime_ms` | Emitted at ≈500 ms while idle; liveness evidence. |
-| `Done` | W→C | `reason` ∈ stop/length/cancelled/eos, `committed` | Terminal for the current request. |
+| `Done` | W→C | `reason` ∈ stop/length/cancelled/eos, `committed`, `generated` (v7) | Terminal for the current request. |
 | `Error` | W→C | `code` (public error code), `message`, `action` | Terminal; follows the typed error vocabulary. |
 | `Cancel` | C→W | `request_id` | Honored at the next committed-token boundary. |
 | `Score` | C→W | `request_id`, `tokens` (exact ids), `positions` | Bounded: ≤16384 tokens, ≤64 positions, positions within the sequence. |

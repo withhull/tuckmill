@@ -1,0 +1,605 @@
+{
+ "source": "Qwen3-0.6B-Q8_0.gguf tokenizer.chat_template (sha256 57f1fd00f0013a2be96aa79b857391f27e23df5b5f847072b524c897e24d0361)",
+ "method": "prompts rendered with canonical Jinja2 (the template's own semantics, as Hugging Face applies them) under the chat-completions context (tools=None, add_generation_prompt=True); tokens recorded from pinned llama.cpp b11695 (llama-server /tokenize, add_special=false) on the canonical prompt",
+ "llama_server_note": "llama.cpp's bundled jinja executes the trailing-assistant reasoning path differently (it does not apply the .split('</think>') / .lstrip('\n')/rstrip steps there); 'tokens_llama_jinja' records what the pinned server's own rendering tokenizes to, for honest divergence tracking. tuckmill renders the template's canonical semantics. Divergent conversations: assistant_reasoning_split_last, assistant_newline_trimming, assistant_only_think_marker.",
+ "conversations": [
+  {
+   "id": "single_user",
+   "messages": [
+    {
+     "role": "user",
+     "content": "Hello, world!"
+    }
+   ],
+   "prompt": "<|im_start|>user\nHello, world!<|im_end|>\n<|im_start|>assistant\n",
+   "tokens": [
+    151644,
+    872,
+    198,
+    9707,
+    11,
+    1879,
+    0,
+    151645,
+    198,
+    151644,
+    77091,
+    198
+   ]
+  },
+  {
+   "id": "system_and_user",
+   "messages": [
+    {
+     "role": "system",
+     "content": "You are a terse assistant."
+    },
+    {
+     "role": "user",
+     "content": "Name the capital of France."
+    }
+   ],
+   "prompt": "<|im_start|>system\nYou are a terse assistant.<|im_end|>\n<|im_start|>user\nName the capital of France.<|im_end|>\n<|im_start|>assistant\n",
+   "tokens": [
+    151644,
+    8948,
+    198,
+    2610,
+    525,
+    264,
+    50537,
+    17847,
+    13,
+    151645,
+    198,
+    151644,
+    872,
+    198,
+    675,
+    279,
+    6722,
+    315,
+    9625,
+    13,
+    151645,
+    198,
+    151644,
+    77091,
+    198
+   ]
+  },
+  {
+   "id": "multi_turn",
+   "messages": [
+    {
+     "role": "system",
+     "content": "You are a helpful assistant."
+    },
+    {
+     "role": "user",
+     "content": "What is 2+2?"
+    },
+    {
+     "role": "assistant",
+     "content": "2+2 equals 4."
+    },
+    {
+     "role": "user",
+     "content": "And times three?"
+    }
+   ],
+   "prompt": "<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n<|im_start|>user\nWhat is 2+2?<|im_end|>\n<|im_start|>assistant\n2+2 equals 4.<|im_end|>\n<|im_start|>user\nAnd times three?<|im_end|>\n<|im_start|>assistant\n",
+   "tokens": [
+    151644,
+    8948,
+    198,
+    2610,
+    525,
+    264,
+    10950,
+    17847,
+    13,
+    151645,
+    198,
+    151644,
+    872,
+    198,
+    3838,
+    374,
+    220,
+    17,
+    10,
+    17,
+    30,
+    151645,
+    198,
+    151644,
+    77091,
+    198,
+    17,
+    10,
+    17,
+    16819,
+    220,
+    19,
+    13,
+    151645,
+    198,
+    151644,
+    872,
+    198,
+    3036,
+    3039,
+    2326,
+    30,
+    151645,
+    198,
+    151644,
+    77091,
+    198
+   ]
+  },
+  {
+   "id": "unicode_content",
+   "messages": [
+    {
+     "role": "user",
+     "content": "Příliš žluťoučký kůň 🐎 日本語のテキスト && <emojis>✨"
+    }
+   ],
+   "prompt": "<|im_start|>user\nPříliš žluťoučký kůň 🐎 日本語のテキスト && <emojis>✨<|im_end|>\n<|im_start|>assistant\n",
+   "tokens": [
+    151644,
+    872,
+    198,
+    47,
+    28332,
+    2426,
+    742,
+    11645,
+    30963,
+    9835,
+    74801,
+    283,
+    13152,
+    74,
+    19622,
+    595,
+    51253,
+    145082,
+    11162,
+    238,
+    236,
+    75402,
+    21894,
+    102819,
+    15767,
+    56833,
+    61803,
+    70534,
+    1009,
+    366,
+    6726,
+    82726,
+    29,
+    144232,
+    151645,
+    198,
+    151644,
+    77091,
+    198
+   ]
+  },
+  {
+   "id": "assistant_reasoning_split_last",
+   "messages": [
+    {
+     "role": "user",
+     "content": "Why is the sky blue?"
+    },
+    {
+     "role": "assistant",
+     "content": "Rayleigh scattering favors short wavelengths.\n</think>\n\nBecause shorter wavelengths scatter more strongly."
+    }
+   ],
+   "prompt": "<|im_start|>user\nWhy is the sky blue?<|im_end|>\n<|im_start|>assistant\n<think>\nRayleigh scattering favors short wavelengths.\n</think>\n\nBecause shorter wavelengths scatter more strongly.<|im_end|>\n<|im_start|>assistant\n",
+   "tokens": [
+    151644,
+    872,
+    198,
+    10234,
+    374,
+    279,
+    12884,
+    6303,
+    30,
+    151645,
+    198,
+    151644,
+    77091,
+    198,
+    151667,
+    198,
+    29187,
+    62969,
+    71816,
+    53847,
+    2805,
+    92859,
+    624,
+    151668,
+    271,
+    17949,
+    23327,
+    92859,
+    44477,
+    803,
+    16510,
+    13,
+    151645,
+    198,
+    151644,
+    77091,
+    198
+   ],
+   "tokens_llama_jinja": [
+    151644,
+    872,
+    198,
+    10234,
+    374,
+    279,
+    12884,
+    6303,
+    30,
+    151645,
+    198,
+    151644,
+    77091,
+    198,
+    151667,
+    271,
+    151668,
+    271,
+    29187,
+    62969,
+    71816,
+    53847,
+    2805,
+    92859,
+    624,
+    151668,
+    271,
+    17949,
+    23327,
+    92859,
+    44477,
+    803,
+    16510,
+    13
+   ]
+  },
+  {
+   "id": "assistant_reasoning_split_mid_history",
+   "messages": [
+    {
+     "role": "user",
+     "content": "First question"
+    },
+    {
+     "role": "assistant",
+     "content": "<think>\ninternal reasoning\n</think>\nThe first answer."
+    },
+    {
+     "role": "user",
+     "content": "Second question"
+    }
+   ],
+   "prompt": "<|im_start|>user\nFirst question<|im_end|>\n<|im_start|>assistant\nThe first answer.<|im_end|>\n<|im_start|>user\nSecond question<|im_end|>\n<|im_start|>assistant\n",
+   "tokens": [
+    151644,
+    872,
+    198,
+    5338,
+    3405,
+    151645,
+    198,
+    151644,
+    77091,
+    198,
+    785,
+    1156,
+    4226,
+    13,
+    151645,
+    198,
+    151644,
+    872,
+    198,
+    15666,
+    3405,
+    151645,
+    198,
+    151644,
+    77091,
+    198
+   ]
+  },
+  {
+   "id": "assistant_newline_trimming",
+   "messages": [
+    {
+     "role": "user",
+     "content": "Write two lines."
+    },
+    {
+     "role": "assistant",
+     "content": "\nline one\nline two\n"
+    }
+   ],
+   "prompt": "<|im_start|>user\nWrite two lines.<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\nline one\nline two\n<|im_end|>\n<|im_start|>assistant\n",
+   "tokens": [
+    151644,
+    872,
+    198,
+    7985,
+    1378,
+    5128,
+    13,
+    151645,
+    198,
+    151644,
+    77091,
+    198,
+    151667,
+    271,
+    151668,
+    271,
+    1056,
+    825,
+    198,
+    1056,
+    1378,
+    198,
+    151645,
+    198,
+    151644,
+    77091,
+    198
+   ],
+   "tokens_llama_jinja": [
+    151644,
+    872,
+    198,
+    7985,
+    1378,
+    5128,
+    13,
+    151645,
+    198,
+    151644,
+    77091,
+    198,
+    151667,
+    271,
+    151668,
+    1406,
+    1056,
+    825,
+    198,
+    1056,
+    1378,
+    198
+   ]
+  },
+  {
+   "id": "assistant_only_think_marker",
+   "messages": [
+    {
+     "role": "user",
+     "content": "q"
+    },
+    {
+     "role": "assistant",
+     "content": "</think>\nAFTER"
+    }
+   ],
+   "prompt": "<|im_start|>user\nq<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\nAFTER<|im_end|>\n<|im_start|>assistant\n",
+   "tokens": [
+    151644,
+    872,
+    198,
+    80,
+    151645,
+    198,
+    151644,
+    77091,
+    198,
+    151667,
+    271,
+    151668,
+    271,
+    32,
+    32635,
+    151645,
+    198,
+    151644,
+    77091,
+    198
+   ],
+   "tokens_llama_jinja": [
+    151644,
+    872,
+    198,
+    80,
+    151645,
+    198,
+    151644,
+    77091,
+    198,
+    151667,
+    271,
+    151668,
+    271,
+    151668,
+    198,
+    32,
+    32635
+   ]
+  },
+  {
+   "id": "user_with_tool_response_markers",
+   "messages": [
+    {
+     "role": "user",
+     "content": "look at <tool_response>\ndata\n</tool_response> carefully"
+    },
+    {
+     "role": "user",
+     "content": "now summarize"
+    }
+   ],
+   "prompt": "<|im_start|>user\nlook at <tool_response>\ndata\n</tool_response> carefully<|im_end|>\n<|im_start|>user\nnow summarize<|im_end|>\n<|im_start|>assistant\n",
+   "tokens": [
+    151644,
+    872,
+    198,
+    7201,
+    518,
+    220,
+    151665,
+    198,
+    691,
+    198,
+    151666,
+    15516,
+    151645,
+    198,
+    151644,
+    872,
+    198,
+    3328,
+    62079,
+    151645,
+    198,
+    151644,
+    77091,
+    198
+   ]
+  },
+  {
+   "id": "literal_special_token_text",
+   "messages": [
+    {
+     "role": "user",
+     "content": "Print the literal spellings <|im_start|> and <|im_end|> and <|endoftext|>."
+    }
+   ],
+   "prompt": "<|im_start|>user\nPrint the literal spellings <|im_start|> and <|im_end|> and <|endoftext|>.<|im_end|>\n<|im_start|>assistant\n",
+   "tokens": [
+    151644,
+    872,
+    198,
+    8994,
+    279,
+    23141,
+    12845,
+    819,
+    220,
+    151644,
+    323,
+    220,
+    151645,
+    323,
+    220,
+    151643,
+    13,
+    151645,
+    198,
+    151644,
+    77091,
+    198
+   ]
+  },
+  {
+   "id": "late_system_message",
+   "messages": [
+    {
+     "role": "user",
+     "content": "Who are you?"
+    },
+    {
+     "role": "system",
+     "content": "Answer in one word."
+    }
+   ],
+   "prompt": "<|im_start|>user\nWho are you?<|im_end|>\n<|im_start|>system\nAnswer in one word.<|im_end|>\n<|im_start|>assistant\n",
+   "tokens": [
+    151644,
+    872,
+    198,
+    15191,
+    525,
+    498,
+    30,
+    151645,
+    198,
+    151644,
+    8948,
+    198,
+    16141,
+    304,
+    825,
+    3409,
+    13,
+    151645,
+    198,
+    151644,
+    77091,
+    198
+   ]
+  },
+  {
+   "id": "empty_assistant_history",
+   "messages": [
+    {
+     "role": "user",
+     "content": "Hi"
+    },
+    {
+     "role": "assistant",
+     "content": ""
+    },
+    {
+     "role": "user",
+     "content": "Still there?"
+    }
+   ],
+   "prompt": "<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n<|im_end|>\n<|im_start|>user\nStill there?<|im_end|>\n<|im_start|>assistant\n",
+   "tokens": [
+    151644,
+    872,
+    198,
+    13048,
+    151645,
+    198,
+    151644,
+    77091,
+    198,
+    151645,
+    198,
+    151644,
+    872,
+    198,
+    23322,
+    1052,
+    30,
+    151645,
+    198,
+    151644,
+    77091,
+    198
+   ]
+  }
+ ]
+}

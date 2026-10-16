@@ -38,6 +38,12 @@ pub struct PlanRequest {
     pub context: PlanContext,
     pub requested_budget: Bytes,
     pub policy: PlannerPolicy,
+    /// Bytes per KV element in the *actual* storage representation of the
+    /// backend that will execute (for example 4 for the current TuckCore
+    /// f32 KV store, 2 for an f16 llama.cpp cache). The runtime resolves
+    /// this from the selected engine and its acknowledged execution
+    /// options; the planner never assumes a representation on its own.
+    pub kv_bytes_per_element: u32,
 }
 
 /// Active weight bytes touched per decode token for a given split.
@@ -183,7 +189,7 @@ pub fn build_plan(
     // ---- capacity math ----
     let geometry = artifact.geometry.as_ref();
     let kv_bytes = geometry
-        .and_then(|_| kv_bytes_for(geometry, &request.context, policy.kv_bytes_per_element));
+        .and_then(|_| kv_bytes_for(geometry, &request.context, request.kv_bytes_per_element));
     let geometry_missing = kv_bytes.is_none();
 
     let split = split_weights(&artifact.tensor_stats);
@@ -410,7 +416,14 @@ pub fn build_plan(
                     );
                 }
             }
-            push_standard_assumptions(&mut plan, policy, &est, artifact, device);
+            push_standard_assumptions(
+                &mut plan,
+                policy,
+                &est,
+                artifact,
+                device,
+                request.kv_bytes_per_element,
+            );
         }
         _ => {
             // Nothing fits. Reject with the most informative typed reason.
@@ -478,6 +491,7 @@ fn push_standard_assumptions(
     est: &ScheduleEstimate,
     artifact: &ModelArtifact,
     device: &DeviceProfile,
+    kv_bytes_per_element: u32,
 ) {
     plan.assumptions.push(format!(
         "budget arithmetic: reservation {} + overhead estimate {} + safety reserve {} <= {}",
@@ -499,8 +513,8 @@ fn push_standard_assumptions(
         est.ttft_ms.low, est.ttft_ms.high, est.tps.low, est.tps.high, est.tps.mid
     ));
     plan.assumptions.push(format!(
-        "KV state priced at {} bytes per element for {} total tokens",
-        policy.kv_bytes_per_element, plan.context.total_context
+        "KV state priced at {} bytes per element (the resolved backend storage representation, not a nominal precision) for {} total tokens",
+        kv_bytes_per_element, plan.context.total_context
     ));
     plan.assumptions.push(
         "no speculation and no mandatory draft; a draft is enabled only after measured benefit"
@@ -542,6 +556,7 @@ mod tests {
             context: PlanContext::new(context, output),
             requested_budget: Bytes::parse(budget).unwrap(),
             policy: PlannerPolicy::default(),
+            kv_bytes_per_element: 2,
         }
     }
 
@@ -663,6 +678,57 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(err.code(), ErrorCode::ContextExceedsBudget);
+    }
+
+    #[test]
+    fn kv_pricing_follows_the_resolved_representation() {
+        // The same request must be priced from the backend's actual KV
+        // representation: 4 bytes per element (TuckCore's f32 store) must
+        // reserve twice the bytes of a 2-byte (f16) assumption and can flip
+        // admission. This is the corrected Gate B memory model.
+        let artifact = mock_artifact("qwen3", 400 * 1024 * 1024, 0, Some(mock_geometry(true)));
+        let adapter = registry().find("qwen3").unwrap().clone();
+        let device = mock_device(8 * 1024 * 1024 * 1024);
+        let mut two = request("1400MiB", 4096, 256);
+        two.kv_bytes_per_element = 2;
+        let plan_two = build_plan(
+            &kernels(),
+            &artifact,
+            &adapter,
+            &device,
+            &two,
+            &CalibrationStore::default(),
+        )
+        .unwrap();
+        let mut four = two.clone();
+        four.kv_bytes_per_element = 4;
+        let plan_four = build_plan(
+            &kernels(),
+            &artifact,
+            &adapter,
+            &device,
+            &four,
+            &CalibrationStore::default(),
+        )
+        .unwrap();
+
+        // 28 layers x 8 kv heads x 256 (k+v) x 4096 tokens.
+        let per_token = 28u64 * 8 * 256;
+        assert_ne!(plan_two.mode, ExecutionMode::Rejected);
+        assert_eq!(
+            plan_two.budget.reservation_breakdown.kv_state.bytes(),
+            per_token * 4096 * 2
+        );
+        assert_eq!(
+            plan_four.mode,
+            ExecutionMode::Rejected,
+            "4-byte KV pricing must reject what 2-byte pricing admitted"
+        );
+        assert!(plan_four.rejection.is_some());
+        assert!(plan_two
+            .assumptions
+            .iter()
+            .any(|a| a.contains("resolved backend storage representation")));
     }
 
     #[test]

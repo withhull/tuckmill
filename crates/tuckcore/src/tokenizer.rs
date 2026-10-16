@@ -49,6 +49,12 @@ pub struct Tokenizer {
     pub pretokenizer: String,
     /// True when all 256 byte pieces exist (encoding can never fail).
     pub byte_coverage: bool,
+    /// Control/user-defined token spellings (e.g. `<|im_start|>`), sorted
+    /// longest-first for longest-match scanning. Encoding recognizes these
+    /// exactly as llama.cpp does with `parse_special`: a special spelling in
+    /// the input maps to its vocabulary id and is never BPE-split, so both
+    /// engines select the identical token ids for identical text.
+    specials: Vec<(String, u32)>,
 }
 
 impl Tokenizer {
@@ -161,6 +167,22 @@ impl Tokenizer {
             .unwrap_or("gpt2")
             .to_string();
 
+        let mut specials: Vec<(String, u32)> = tokens
+            .iter()
+            .enumerate()
+            .filter(|(i, t)| {
+                !t.is_empty()
+                    && matches!(
+                        token_types[*i],
+                        TOKEN_TYPE_CONTROL | TOKEN_TYPE_USER_DEFINED
+                    )
+            })
+            .map(|(i, t)| (t.clone(), i as u32))
+            .collect();
+        // Longest-match first so `<|im_start|>` is preferred over any
+        // shorter control piece that is its prefix.
+        specials.sort_by_key(|b| std::cmp::Reverse(b.0.len()));
+
         Ok(Self {
             tokens,
             token_types,
@@ -170,6 +192,7 @@ impl Tokenizer {
             special,
             pretokenizer,
             byte_coverage,
+            specials,
         })
     }
 
@@ -207,7 +230,11 @@ impl Tokenizer {
     /// Encode text. `add_bos` prepends the BOS piece when the tokenizer
     /// declares one. Encoding is exact: with byte coverage every input maps,
     /// and the byte-coverage requirement is checked up front rather than
-    /// silently substituting unknowns.
+    /// silently substituting unknowns. Control/user-defined token spellings
+    /// in the input (e.g. `<|im_start|>`) are recognized and mapped to their
+    /// vocabulary ids exactly as llama.cpp does with `parse_special`, so a
+    /// rendered chat template produces the model's intended token ids on
+    /// both engines.
     pub fn encode(&self, text: &str, add_bos: bool) -> Result<Vec<u32>> {
         if !self.encode_is_exact() {
             return Err(TuckmillError::new(
@@ -238,7 +265,36 @@ impl Tokenizer {
                 ids.push(bos);
             }
         }
-        for segment in pretokenize(text) {
+        // Special-token recognition: exact spellings map to their ids; the
+        // spans between them are BPE-encoded as usual.
+        let mut plain_start = 0usize;
+        let mut i = 0usize;
+        while i < text.len() {
+            if let Some((spelling, id)) = self.match_special(&text[i..]) {
+                if plain_start < i {
+                    self.encode_span(&text[plain_start..i], &piece_ids, &mut ids)?;
+                }
+                ids.push(id);
+                i += spelling.len();
+                plain_start = i;
+            } else {
+                i += text[i..].chars().next().map(|c| c.len_utf8()).unwrap_or(1);
+            }
+        }
+        if plain_start < text.len() {
+            self.encode_span(&text[plain_start..], &piece_ids, &mut ids)?;
+        }
+        Ok(ids)
+    }
+
+    /// BPE-encode one plain (non-special) span into `ids`.
+    fn encode_span(
+        &self,
+        span: &str,
+        piece_ids: &HashMap<&str, u32>,
+        ids: &mut Vec<u32>,
+    ) -> Result<()> {
+        for segment in pretokenize(span) {
             // Byte-level mapping then BPE merges.
             let mapped: String = segment
                 .bytes()
@@ -256,7 +312,23 @@ impl Tokenizer {
                 ids.push(*id);
             }
         }
-        Ok(ids)
+        Ok(())
+    }
+
+    /// Longest special spelling matching at the start of `rest`.
+    fn match_special<'s>(&'s self, rest: &str) -> Option<(&'s str, u32)> {
+        self.specials
+            .iter()
+            .find(|(s, _)| rest.starts_with(s.as_str()))
+            .map(|(s, id)| (s.as_str(), *id))
+    }
+
+    /// Vocabulary id of a control/user-defined token spelling, when present.
+    pub fn special_piece_id(&self, spelling: &str) -> Option<u32> {
+        self.specials
+            .iter()
+            .find(|(s, _)| s == spelling)
+            .map(|(_, id)| *id)
     }
 
     /// Greedy merge-rank BPE over one pre-tokenized segment (standard
@@ -520,6 +592,25 @@ mod tests {
         assert_eq!(ids[0], t.special.bos.unwrap());
         let ids = t.encode("hi", false).unwrap();
         assert_ne!(ids[0], t.special.bos.unwrap());
+    }
+
+    #[test]
+    fn special_spellings_map_to_their_token_ids() {
+        let t = fixture_tokenizer();
+        let im_start = t.special_piece_id("<|im_start|>").expect("fixture special");
+        let im_end = t.special_piece_id("<|im_end|>").expect("fixture special");
+        assert_eq!(t.token_type(im_start), Some(TOKEN_TYPE_CONTROL));
+        // parse_special semantics: the spelling maps to one id, anywhere.
+        assert_eq!(t.encode("<|im_start|>", false).unwrap(), vec![im_start]);
+        let ids = t.encode("a<|im_start|>b<|im_end|>", false).unwrap();
+        assert!(ids.contains(&im_start));
+        assert!(ids.contains(&im_end));
+        // Splitting by eyes: the plain spans around specials are BPE'd.
+        let plain = t.encode("ab", false).unwrap();
+        assert_eq!(ids.len(), plain.len() + 2);
+        // A spelling that is not in the vocabulary stays literal text.
+        let literal = t.encode("<|not_a_token|>", false).unwrap();
+        assert!(literal.len() > 1, "unknown spellings are not special");
     }
 
     #[test]

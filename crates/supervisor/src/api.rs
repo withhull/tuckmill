@@ -20,6 +20,7 @@ use serde::Deserialize;
 use tuckmill_manifest::error::{ErrorCode, TuckmillError};
 use tuckmill_manifest::ids::{now_unix_ms, secure_random_hex};
 
+use crate::bundle::{ChatMessageSpec, ChatRole, ModelBundle, RequestMode, RequestSpec};
 use crate::runtime::{RunEvent, Runtime};
 
 pub const DEFAULT_PORT: u16 = 8378;
@@ -96,6 +97,12 @@ fn validate_chat_request(req: &ChatCompletionRequest) -> Result<(), TuckmillErro
             return Err(TuckmillError::new(
                 ErrorCode::InvalidRequest,
                 "at most 4 stop sequences are supported",
+            ));
+        }
+        if stop.iter().any(|s| s.is_empty()) {
+            return Err(TuckmillError::new(
+                ErrorCode::InvalidRequest,
+                "stop sequences must be non-empty",
             ));
         }
     }
@@ -574,7 +581,10 @@ fn handle_chat_completions(runtime: Arc<Runtime>, mut stream: TcpStream, body: &
         return;
     }
 
-    // Resolve the model and plan.
+    // B1 order: resolve the model bundle (tokenizer + template), render the
+    // model-specific chat prompt, tokenize it, count the actual prompt
+    // tokens, validate the context/output allowance — and only then admit a
+    // plan and execute under the typed request.
     let (artifact, adapter) = match runtime.resolve_artifact(&request.model) {
         Ok(v) => v,
         Err(e) => {
@@ -582,7 +592,45 @@ fn handle_chat_completions(runtime: Arc<Runtime>, mut stream: TcpStream, body: &
             return;
         }
     };
+    let bundle = match ModelBundle::open(&runtime.layout, &artifact) {
+        Ok(b) => b,
+        Err(e) => {
+            respond_error(&mut stream, &e);
+            return;
+        }
+    };
     let max_tokens = request.max_tokens.unwrap_or(runtime.default_max_output);
+    let sampling = tuckmill_backend::SamplingPolicy {
+        temperature: request.temperature.unwrap_or(0.0) as f32,
+        top_p: request.top_p.map(|p| p as f32),
+    };
+    let stop = request.stop.clone().unwrap_or_default();
+    let seed = request.seed.unwrap_or_else(now_unix_ms);
+    let messages: Vec<ChatMessageSpec> = request
+        .messages
+        .iter()
+        .map(|m| ChatMessageSpec {
+            role: ChatRole::parse(&m.role).expect("validated role"),
+            content: m.content.clone(),
+        })
+        .collect();
+    let spec = match RequestSpec::chat(
+        &bundle,
+        messages,
+        max_tokens,
+        stop,
+        seed,
+        sampling,
+        request.stream,
+        runtime.default_context,
+    ) {
+        Ok(s) => s,
+        Err(e) => {
+            respond_error(&mut stream, &e);
+            return;
+        }
+    };
+
     let plan = match runtime.plan_for(
         &artifact,
         &adapter,
@@ -605,35 +653,6 @@ fn handle_chat_completions(runtime: Arc<Runtime>, mut stream: TcpStream, body: &
         return;
     }
 
-    // Prompt tokenization: the reference test engine accepts arbitrary ids
-    // (synthetic); a real backend tokenizes with the artifact's own byte-level
-    // BPE tables.
-    let identity = runtime.engine_identity();
-    let synthetic = tuckmill_backend::is_synthetic_engine(&identity.engine);
-    let prompt_tokens = if synthetic {
-        prompt_to_tokens(&request.messages)
-    } else {
-        let encoder = match crate::tokenization::open_encoder(
-            &runtime.layout.artifact_payload_path(&artifact.artifact_id),
-            None,
-        ) {
-            Ok(t) => t,
-            Err(e) => {
-                respond_error(&mut stream, &e);
-                return;
-            }
-        };
-        match encoder.encode(&messages_text(&request.messages), false) {
-            Ok(ids) => ids,
-            Err(e) => {
-                respond_error(&mut stream, &e);
-                return;
-            }
-        }
-    };
-    let stop = request.stop.clone().unwrap_or_default();
-    let seed = request.seed.unwrap_or_else(now_unix_ms);
-
     let ticket = match runtime.submit() {
         Ok(t) => t,
         Err(e) => {
@@ -649,10 +668,13 @@ fn handle_chat_completions(runtime: Arc<Runtime>, mut stream: TcpStream, body: &
         &ticket,
         plan.clone(),
         artifact_ref,
-        prompt_tokens,
-        max_tokens,
-        stop,
-        seed,
+        crate::runtime::RunRequest {
+            prompt_tokens: spec.prompt_tokens.clone(),
+            max_output_tokens: spec.max_output_tokens,
+            stop: spec.stop.clone(),
+            seed: spec.seed,
+            sampling: spec.sampling,
+        },
     ) {
         Ok(r) => r,
         Err(e) => {
@@ -661,68 +683,62 @@ fn handle_chat_completions(runtime: Arc<Runtime>, mut stream: TcpStream, body: &
         }
     };
 
-    let completion_id = format!("chatcmpl-{}", &run.request_id[4..]);
-    let created = now_unix_ms() / 1000;
+    let meta = CompletionMeta {
+        completion_id: format!("chatcmpl-{}", &run.request_id[4..]),
+        created: now_unix_ms() / 1000,
+        model: request.model.clone(),
+        plan: plan.clone(),
+        spec,
+    };
 
-    if request.stream {
-        stream_sse(
-            &mut stream,
-            &runtime,
-            &run,
-            &completion_id,
-            created,
-            &request.model,
-            &plan,
-        );
+    if meta.spec.stream {
+        stream_sse(&mut stream, &runtime, &run, &meta);
     } else {
-        collect_json(
-            &mut stream,
-            &runtime,
-            &run,
-            &completion_id,
-            created,
-            &request.model,
-            &plan,
-        );
+        collect_json(&mut stream, &runtime, &run, &meta);
     }
 }
 
-/// Deterministic prompt-to-token conversion for the reference engine. No
-/// vocabulary or tokenizer is executed in this build; the exact token IDs a
-/// real tokenizer would produce arrive with the certified executor.
-fn prompt_to_tokens(messages: &[ChatMessage]) -> Vec<u32> {
-    crate::engine::synthetic_prompt_tokens(&messages_text(messages), 4096)
-}
-
-fn messages_text(messages: &[ChatMessage]) -> String {
-    messages
-        .iter()
-        .map(|m| format!("{}:{}", m.role, m.content))
-        .collect::<Vec<_>>()
-        .join("\n")
+/// Per-request metadata shared by the JSON and SSE serializers.
+struct CompletionMeta {
+    completion_id: String,
+    created: u64,
+    model: String,
+    plan: tuckmill_manifest::plan::ExecutionPlan,
+    spec: RequestSpec,
 }
 
 fn tuckmill_extension(
     runtime: &Runtime,
-    plan: &tuckmill_manifest::plan::ExecutionPlan,
-    request_id: &str,
+    meta: &CompletionMeta,
+    run: &crate::runtime::ActiveRun,
 ) -> serde_json::Value {
     let identity = runtime.engine_identity();
+    let mode = match &meta.spec.mode {
+        RequestMode::Chat { template, .. } => serde_json::json!({
+            "kind": "chat",
+            "chat_template": template,
+        }),
+        RequestMode::Raw { .. } => serde_json::json!({"kind": "raw"}),
+    };
     serde_json::json!({
-        "request_id": request_id,
-        "plan_id": plan.plan_id.as_str(),
-        "mode": plan.mode.as_str(),
-        "planned_engine": plan.engine.engine,
-        "engine_availability": plan.engine.availability,
+        "request_id": run.request_id,
+        "plan_id": meta.plan.plan_id.as_str(),
+        "mode": meta.plan.mode.as_str(),
+        "planned_engine": meta.plan.engine.engine,
+        "engine_availability": meta.plan.engine.availability,
         "backend": identity.engine,
         "certified": identity.certified,
-        "confidence": plan.confidence,
-        "performance_class": plan.performance_class,
+        "confidence": meta.plan.confidence,
+        "performance_class": meta.plan.performance_class,
         "synthetic_output": tuckmill_backend::is_synthetic_engine(&identity.engine),
-        "tokenizer": if tuckmill_backend::is_synthetic_engine(&identity.engine) {
-            "none (synthetic engine)"
-        } else {
-            "reference-first (llama.cpp pinned; gpt2-style BPE fallback)"
+        "tokenizer": meta.spec.tokenizer_label,
+        "prompt": mode,
+        "prompt_tokens": meta.spec.prompt_tokens.len(),
+        "sampling": {
+            "temperature": meta.spec.sampling.temperature,
+            "top_p": meta.spec.sampling.top_p,
+            "greedy": meta.spec.sampling.is_greedy(),
+            "seed": meta.spec.seed,
         },
     })
 }
@@ -731,38 +747,43 @@ fn collect_json(
     stream: &mut TcpStream,
     runtime: &Runtime,
     run: &crate::runtime::ActiveRun,
-    completion_id: &str,
-    created: u64,
-    model: &str,
-    plan: &tuckmill_manifest::plan::ExecutionPlan,
+    meta: &CompletionMeta,
 ) {
     let mut text = String::new();
-    let mut committed: u64 = 0;
     loop {
         match run.events.recv() {
             Ok(RunEvent::Token { text: t, .. }) => {
                 text.push_str(&t);
-                committed += 1;
             }
             Ok(RunEvent::State(_)) => {}
-            Ok(RunEvent::Done { reason, .. }) => {
+            Ok(RunEvent::Done {
+                reason,
+                committed,
+                generated,
+                timing: _,
+            }) => {
+                let prompt_tokens = meta.spec.prompt_tokens.len() as u64;
                 let body = serde_json::json!({
-                    "id": completion_id,
+                    "id": meta.completion_id,
                     "object": "chat.completion",
-                    "created": created,
-                    "model": model,
+                    "created": meta.created,
+                    "model": meta.model,
                     "choices": [{
                         "index": 0,
                         "message": {"role": "assistant", "content": text},
                         "finish_reason": normalize_finish(&reason),
                     }],
                     "usage": {
-                        "prompt_tokens": 0,
+                        // Actual tokenized prompt; visible-token completion
+                        // count from the worker's own accounting.
+                        "prompt_tokens": prompt_tokens,
                         "completion_tokens": committed,
-                        "total_tokens": committed,
+                        "total_tokens": prompt_tokens + committed,
                     },
-                    "tuckmill": tuckmill_extension(runtime, plan, &run.request_id),
+                    "tuckmill": tuckmill_extension(runtime, meta, run),
                 });
+                let mut body = body;
+                body["tuckmill"]["generated_tokens"] = serde_json::json!(generated);
                 let _ = runtime.status(); // keeps runtime alive for logging hooks
                 let _ = respond_json(stream, 200, "OK", &body);
                 return;
@@ -805,10 +826,7 @@ fn stream_sse(
     stream: &mut TcpStream,
     runtime: &Runtime,
     run: &crate::runtime::ActiveRun,
-    completion_id: &str,
-    created: u64,
-    model: &str,
-    plan: &tuckmill_manifest::plan::ExecutionPlan,
+    meta: &CompletionMeta,
 ) {
     let head = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nX-Accel-Buffering: no\r\nConnection: close\r\n\r\n";
     if stream.write_all(head.as_bytes()).is_err() {
@@ -834,10 +852,10 @@ fn stream_sse(
                 }
                 let identity = runtime.engine_identity();
                 let chunk = serde_json::json!({
-                    "id": completion_id,
+                    "id": meta.completion_id,
                     "object": "chat.completion.chunk",
-                    "created": created,
-                    "model": model,
+                    "created": meta.created,
+                    "model": meta.model,
                     "choices": [{
                         "index": 0,
                         "delta": if !role_sent {
@@ -863,22 +881,30 @@ fn stream_sse(
             Ok(RunEvent::Done {
                 reason,
                 committed,
+                generated,
                 timing: _,
             }) => {
+                let prompt_tokens = meta.spec.prompt_tokens.len() as u64;
                 let chunk = serde_json::json!({
-                    "id": completion_id,
+                    "id": meta.completion_id,
                     "object": "chat.completion.chunk",
-                    "created": created,
-                    "model": model,
+                    "created": meta.created,
+                    "model": meta.model,
                     "choices": [{
                         "index": 0,
                         "delta": {},
                         "finish_reason": normalize_finish(&reason),
                     }],
+                    "usage": {
+                        "prompt_tokens": prompt_tokens,
+                        "completion_tokens": committed,
+                        "total_tokens": prompt_tokens + committed,
+                    },
                     "tuckmill": {
                         "request_id": run.request_id,
-                        "plan_id": plan.plan_id.as_str(),
+                        "plan_id": meta.plan.plan_id.as_str(),
                         "committed_tokens": committed,
+                        "generated_tokens": generated,
                     },
                 });
                 let _ = write_sse(stream, &chunk.to_string());
@@ -1123,17 +1149,201 @@ mod tests {
         assert_eq!(token, again);
     }
 
+    /// Issue a chat-completions request and return the raw HTTP response.
+    fn chat_request(addr: std::net::SocketAddr, token: &str, body: &serde_json::Value) -> String {
+        let body = body.to_string();
+        let req = format!(
+            "POST /v1/chat/completions HTTP/1.1\r\nHost: 127.0.0.1\r\nAuthorization: Bearer {token}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        raw_request(addr, &req)
+    }
+
+    fn response_json(resp: &str) -> serde_json::Value {
+        let body = resp.split("\r\n\r\n").nth(1).expect("response body");
+        serde_json::from_str(body).unwrap_or_else(|e| panic!("not JSON ({e}): {resp}"))
+    }
+
+    /// Collect the visible text from an SSE response body.
+    fn sse_text(resp: &str) -> String {
+        let mut text = String::new();
+        for line in resp.lines() {
+            let Some(payload) = line.strip_prefix("data: ") else {
+                continue;
+            };
+            if payload == "[DONE]" {
+                continue;
+            }
+            if let Ok(chunk) = serde_json::from_str::<serde_json::Value>(payload) {
+                if let Some(content) = chunk["choices"][0]["delta"]["content"].as_str() {
+                    text.push_str(content);
+                }
+            }
+        }
+        text
+    }
+
     #[test]
-    fn prompt_tokens_are_deterministic_and_bounded() {
-        let messages = vec![ChatMessage {
-            role: "user".into(),
-            content: "hello world".into(),
-        }];
-        let a = prompt_to_tokens(&messages);
-        let b = prompt_to_tokens(&messages);
-        assert_eq!(a, b);
-        assert!(!a.is_empty());
-        assert!(a.len() <= 4096);
+    fn chat_prompts_are_rendered_and_tokenized_with_the_model_contract() {
+        let (_dir, runtime, server, token) = test_server();
+        let addr = server.local_addr();
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let s2 = shutdown.clone();
+        let handle = std::thread::spawn(move || server.serve(s2));
+
+        let resp = chat_request(
+            addr,
+            &token,
+            &serde_json::json!({
+                "model": "local",
+                "messages": [
+                    {"role": "system", "content": "You are terse."},
+                    {"role": "user", "content": "hello"}
+                ],
+                "max_tokens": 3,
+                "stream": false
+            }),
+        );
+        assert!(resp.contains("200"), "{resp}");
+        let body = response_json(&resp);
+        // Usage accounts for the actual rendered+tokenized prompt.
+        let prompt_tokens = body["usage"]["prompt_tokens"].as_u64().unwrap();
+        assert!(prompt_tokens > 0, "{body}");
+        assert_eq!(body["usage"]["completion_tokens"], 3);
+        assert_eq!(
+            body["usage"]["total_tokens"].as_u64().unwrap(),
+            prompt_tokens + 3
+        );
+        // The request is reported as a chat with the recognized template,
+        // and greedy by default.
+        assert_eq!(body["tuckmill"]["prompt"]["kind"], "chat");
+        assert_eq!(body["tuckmill"]["prompt"]["chat_template"], "qwen3-chatml");
+        assert_eq!(body["tuckmill"]["sampling"]["greedy"], true);
+        assert_eq!(body["tuckmill"]["generated_tokens"], 3);
+
+        // Nonzero temperature is refused by the synthetic engine instead of
+        // silently generating greedily.
+        let resp = chat_request(
+            addr,
+            &token,
+            &serde_json::json!({
+                "model": "local",
+                "messages": [{"role": "user", "content": "hello"}],
+                "max_tokens": 3,
+                "temperature": 1.0
+            }),
+        );
+        assert!(resp.contains("UNAVAILABLE"), "{resp}");
+        assert!(!resp.contains("200 OK"), "{resp}");
+
+        shutdown.store(true, Ordering::Relaxed);
+        let _ = handle.join();
+        runtime.shutdown();
+    }
+
+    #[test]
+    fn streaming_and_non_streaming_agree_and_unicode_roundtrips() {
+        let (_dir, runtime, server, token) = test_server();
+        let addr = server.local_addr();
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let s2 = shutdown.clone();
+        let handle = std::thread::spawn(move || server.serve(s2));
+
+        let request = serde_json::json!({
+            "model": "local",
+            "messages": [{"role": "user", "content": "héllo 🐎 日本語"}],
+            "max_tokens": 4,
+        });
+        let mut non_stream = request.clone();
+        non_stream["stream"] = serde_json::json!(false);
+        let mut stream = request.clone();
+        stream["stream"] = serde_json::json!(true);
+
+        let resp_a = chat_request(addr, &token, &non_stream);
+        let body_a = response_json(&resp_a);
+        assert_eq!(body_a["choices"][0]["finish_reason"], "length");
+        let text_a = body_a["choices"][0]["message"]["content"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        let resp_b = chat_request(addr, &token, &stream);
+        assert!(resp_b.contains("text/event-stream"), "{resp_b}");
+        let text_b = sse_text(&resp_b);
+
+        assert_eq!(
+            text_a, text_b,
+            "visible output must be identical across transports"
+        );
+        // Unicode content tokenized and rendered without loss.
+        assert!(
+            body_a["usage"]["prompt_tokens"].as_u64().unwrap() > 0,
+            "{body_a}"
+        );
+        assert!(resp_b.contains("\"completion_tokens\":4"), "{resp_b}");
+
+        shutdown.store(true, Ordering::Relaxed);
+        let _ = handle.join();
+        runtime.shutdown();
+    }
+
+    #[test]
+    fn stop_sequences_are_trimmed_from_visible_output() {
+        let (_dir, runtime, server, token) = test_server();
+        let addr = server.local_addr();
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let s2 = shutdown.clone();
+        let handle = std::thread::spawn(move || server.serve(s2));
+
+        let resp = chat_request(
+            addr,
+            &token,
+            &serde_json::json!({
+                "model": "local",
+                "messages": [{"role": "user", "content": "stop early"}],
+                "max_tokens": 8,
+                "stop": ["[ref:2]"]
+            }),
+        );
+        assert!(resp.contains("200"), "{resp}");
+        let body = response_json(&resp);
+        let text = body["choices"][0]["message"]["content"].as_str().unwrap();
+        assert_eq!(body["choices"][0]["finish_reason"], "stop");
+        assert_eq!(text, "[ref:0][ref:1]");
+        assert!(!text.contains("[ref:2]"), "stop marker leaked: {text:?}");
+        assert_eq!(body["usage"]["completion_tokens"], 2);
+        // The stop token was generated (and billed honestly as generated),
+        // but only visible tokens count as completion tokens.
+        assert!(body["tuckmill"]["generated_tokens"].as_u64().unwrap() >= 2);
+
+        shutdown.store(true, Ordering::Relaxed);
+        let _ = handle.join();
+        runtime.shutdown();
+    }
+
+    #[test]
+    fn max_tokens_beyond_context_is_rejected_before_admission() {
+        let (_dir, runtime, server, token) = test_server();
+        let addr = server.local_addr();
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let s2 = shutdown.clone();
+        let handle = std::thread::spawn(move || server.serve(s2));
+
+        let resp = chat_request(
+            addr,
+            &token,
+            &serde_json::json!({
+                "model": "local",
+                "messages": [{"role": "user", "content": "hello"}],
+                "max_tokens": 4096
+            }),
+        );
+        assert!(resp.contains("CONTEXT_EXCEEDS_BUDGET"), "{resp}");
+        assert!(!resp.contains("200 OK"), "{resp}");
+
+        shutdown.store(true, Ordering::Relaxed);
+        let _ = handle.join();
+        runtime.shutdown();
     }
 
     #[test]
@@ -1180,5 +1390,19 @@ mod tests {
             seed: None,
         };
         assert!(validate_chat_request(&bad_temp).is_err());
+        let empty_stop = ChatCompletionRequest {
+            model: "m".into(),
+            messages: vec![ChatMessage {
+                role: "user".into(),
+                content: "x".into(),
+            }],
+            stream: false,
+            max_tokens: None,
+            temperature: None,
+            top_p: None,
+            stop: Some(vec!["".into()]),
+            seed: None,
+        };
+        assert!(validate_chat_request(&empty_stop).is_err());
     }
 }
