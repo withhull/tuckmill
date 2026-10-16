@@ -4,7 +4,7 @@
 //! kernels and bounded weight streaming. It is uncertified by construction:
 //! `EngineIdentity.certified` is false, and its note says exactly what it is.
 
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -75,6 +75,11 @@ struct Loaded {
     kv_precision: KvPrecision,
     counters: ProfileCounters,
     kernels: ResolvedKernels,
+    /// KV bytes allocated for the most recent request (the request's actual
+    /// prompt+output need), set at generate time. The prepared capacity is
+    /// `context_total`; per-request sessions are allocated for their own
+    /// admitted need, never for a previously prepared larger capacity.
+    session_kv_bytes: Arc<AtomicU64>,
 }
 
 /// The experimental custom native executor.
@@ -447,6 +452,7 @@ impl InferenceBackend for TuckCore {
             kv_precision,
             counters,
             kernels,
+            session_kv_bytes: Arc::new(AtomicU64::new(0)),
         });
         Ok(note)
     }
@@ -492,11 +498,16 @@ impl InferenceBackend for TuckCore {
             }
             let _ = self.apply_pending_trim();
         };
-        let mut kv = KvState::new(
-            &loaded.weights.cfg,
-            loaded.context_total,
-            loaded.kv_precision,
-        )?;
+        // Per-request KV session: allocated for this request's actual
+        // admitted need (prompt + output), bounded by the prepared capacity.
+        // A warm-reused worker never allocates for an older, larger
+        // prepared context than the one this request was priced against.
+        let session_context = prompt_len + req.max_output_tokens;
+        let session_kv_bytes = KvState::bytes_for(&loaded.weights.cfg, session_context);
+        loaded
+            .session_kv_bytes
+            .store(session_kv_bytes, Ordering::Relaxed);
+        let mut kv = KvState::new(&loaded.weights.cfg, session_context, loaded.kv_precision)?;
         let fwd = Forward {
             loader: &loaded.loader,
             tracker: &loaded.tracker,
@@ -557,31 +568,27 @@ impl InferenceBackend for TuckCore {
         let mut rng = Rng::new(req.seed);
         let mut generated_ids: u64 = 0;
         let mut release_index: u64 = 0;
-        let mut first_committed_at: Option<Instant> = None;
-        let mut last_committed_at: Option<Instant> = None;
-        // Incremental UTF-8 assembly: multibyte characters split across
-        // tokens are held until complete, never replacement-mangled mid-char.
+        // Model-token production timing (the honest basis for decode
+        // throughput); visible-content timing stays a supervisor-side,
+        // user-experience concern and is never mixed into it.
+        let mut first_generated_at: Option<Instant> = None;
+        let mut last_generated_at: Option<Instant> = None;
+        // Incremental UTF-8 assembly with byte-level token provenance:
+        // multibyte characters split across tokens are held until complete,
+        // and every token that contributed a byte to a visible character is
+        // counted, never just the token that happened to complete it.
         let mut decoder = Utf8StreamDecoder::new();
         // Bounded pending-output buffering: a stop sequence spanning several
-        // tokens (or a partial stop prefix) is held until it can no longer
-        // complete, so no stop marker can leak into the visible stream.
+        // tokens (or completing inside a piece, with trailing text after it)
+        // is held until it is found, so no stop marker can leak into the
+        // visible stream.
         let mut buffer = VisibleOutputBuffer::new(&req.stop);
-        // Emit a release: update timing, deliver the chunk, and report
-        // whether the client asked to stop.
-        let emit = |text: &str,
-                    release_index: &mut u64,
-                    first: &mut Option<Instant>,
-                    last: &mut Option<Instant>,
-                    ctl: &mut GenControl<'_>|
-         -> bool {
+        // Emit a release: deliver the chunk and report whether the client
+        // asked to stop.
+        let emit = |text: &str, release_index: &mut u64, ctl: &mut GenControl<'_>| -> bool {
             if text.is_empty() {
                 return true;
             }
-            let now = Instant::now();
-            if first.is_none() {
-                *first = Some(now);
-            }
-            *last = Some(now);
             let keep = (ctl.on_token)(*release_index, text);
             *release_index += 1;
             keep
@@ -590,13 +597,7 @@ impl InferenceBackend for TuckCore {
             for i in 0..req.max_output_tokens {
                 if ctl.cancel.load(Ordering::Relaxed) {
                     let r = buffer.flush();
-                    let _ = emit(
-                        &r.text,
-                        &mut release_index,
-                        &mut first_committed_at,
-                        &mut last_committed_at,
-                        ctl,
-                    );
+                    let _ = emit(&r.text, &mut release_index, ctl);
                     break 'decode GenOutcome::new(
                         FinishReason::Cancelled,
                         buffer.visible_tokens(),
@@ -612,48 +613,47 @@ impl InferenceBackend for TuckCore {
                     ));
                 };
                 generated_ids = i + 1;
+                let produced_at = Instant::now();
+                if first_generated_at.is_none() {
+                    first_generated_at = Some(produced_at);
+                }
+                last_generated_at = Some(produced_at);
                 if Some(token) == loaded.weights.cfg.eos_token_id {
                     // The model-defined EOS token is never visible: its
                     // bytes are not pushed, and anything held is flushed
                     // because no stop sequence can complete after EOS.
                     let r = buffer.flush();
-                    let _ = emit(
-                        &r.text,
-                        &mut release_index,
-                        &mut first_committed_at,
-                        &mut last_committed_at,
-                        ctl,
-                    );
+                    let _ = emit(&r.text, &mut release_index, ctl);
                     break 'decode GenOutcome::new(FinishReason::Eos, buffer.visible_tokens())
                         .with_generated(generated_ids);
                 }
-                let text = match loaded.tokenizer.token_text(token) {
-                    Some(_) => decoder.push(&loaded.tokenizer.token_bytes(token)),
+                let piece = match loaded.tokenizer.token_text(token) {
+                    Some(_) => decoder.push_token(&loaded.tokenizer.token_bytes(token), i),
                     None => {
                         let placeholder = format!("<tok {token}>");
-                        decoder.push(placeholder.as_bytes())
+                        decoder.push_token(placeholder.as_bytes(), i)
                     }
                 };
-                let release = buffer.push(i, &text);
-                if !emit(
-                    &release.text,
-                    &mut release_index,
-                    &mut first_committed_at,
-                    &mut last_committed_at,
-                    ctl,
-                ) {
+                let mut client_stop = false;
+                let mut stop = false;
+                for run in piece {
+                    let release = buffer.push(&run.owners, &run.text);
+                    if !emit(&release.text, &mut release_index, ctl) {
+                        client_stop = true;
+                        break;
+                    }
+                    if release.stop {
+                        stop = true;
+                        break;
+                    }
+                }
+                if client_stop {
                     let r = buffer.flush();
-                    let _ = emit(
-                        &r.text,
-                        &mut release_index,
-                        &mut first_committed_at,
-                        &mut last_committed_at,
-                        ctl,
-                    );
+                    let _ = emit(&r.text, &mut release_index, ctl);
                     break 'decode GenOutcome::new(FinishReason::Stop, buffer.visible_tokens())
                         .with_generated(generated_ids);
                 }
-                if release.stop {
+                if stop {
                     break 'decode GenOutcome::new(FinishReason::Stop, buffer.visible_tokens())
                         .with_generated(generated_ids);
                 }
@@ -664,13 +664,7 @@ impl InferenceBackend for TuckCore {
                         Ok(l) => logits = l,
                         Err(e) if e.code() == ErrorCode::Cancelled => {
                             let r = buffer.flush();
-                            let _ = emit(
-                                &r.text,
-                                &mut release_index,
-                                &mut first_committed_at,
-                                &mut last_committed_at,
-                                ctl,
-                            );
+                            let _ = emit(&r.text, &mut release_index, ctl);
                             break 'decode GenOutcome::new(
                                 FinishReason::Cancelled,
                                 buffer.visible_tokens(),
@@ -682,13 +676,7 @@ impl InferenceBackend for TuckCore {
                 }
             }
             let r = buffer.flush();
-            let _ = emit(
-                &r.text,
-                &mut release_index,
-                &mut first_committed_at,
-                &mut last_committed_at,
-                ctl,
-            );
+            let _ = emit(&r.text, &mut release_index, ctl);
             GenOutcome::new(FinishReason::Length, buffer.visible_tokens())
                 .with_generated(generated_ids)
         };
@@ -696,8 +684,11 @@ impl InferenceBackend for TuckCore {
         let timing = RequestTiming {
             total_ms: ms(t0, Instant::now()),
             prefill_ms: Some(prefill_ms),
-            first_token_ms: first_committed_at.map(|f| ms(t0, f)),
-            decode_ms: match (first_committed_at, last_committed_at) {
+            // Production-based: time to the first sampled token, and the
+            // span between first and last sampled token. Buffering and
+            // visibility decisions cannot inflate model throughput.
+            first_token_ms: first_generated_at.map(|f| ms(t0, f)),
+            decode_ms: match (first_generated_at, last_generated_at) {
                 (Some(f), Some(l)) if l > f => Some(ms(f, l)),
                 _ => None,
             },
@@ -787,6 +778,10 @@ impl InferenceBackend for TuckCore {
                         &loaded.weights.cfg,
                         loaded.context_total,
                     )),
+                    session_kv_bytes: match loaded.session_kv_bytes.load(Ordering::Relaxed) {
+                        0 => None,
+                        bytes => Some(bytes),
+                    },
                     threads: Some(1), // scalar executor is single-threaded
                     kernel_impl: Some(loaded.kernels.as_str().to_string()),
                     numerical_profile: Some(loaded.profile.as_str().to_string()),
@@ -1078,6 +1073,42 @@ mod tests {
                 &engine.loaded.as_ref().unwrap().weights.cfg,
                 256
             ))
+        );
+    }
+
+    #[test]
+    fn warm_style_smaller_request_allocates_its_own_session_kv() {
+        // Gate B review finding 2, at the byte level: with a large capacity
+        // already prepared, a smaller request's KV session is allocated for
+        // its own prompt+output need — never for the prepared capacity.
+        let (_dir, artifact, plan) = fixture();
+        let mut engine = TuckCore::new();
+        engine.load(&plan, &artifact, None).unwrap();
+        // Snapshot the geometry so the closure does not hold the engine.
+        let cfg = engine.loaded.as_ref().unwrap().weights.cfg.clone();
+        let cfg_bytes = move |cap: u64| KvState::bytes_for(&cfg, cap);
+
+        let prepared = engine.stats().kv_state_bytes.unwrap();
+        assert_eq!(prepared, cfg_bytes(256), "prepared capacity is the plan's");
+
+        // Prompt 8 + max 16 = 24 admitted tokens.
+        let (_o, _t) = run_generate_with(
+            &mut engine,
+            vec![1, 2, 3, 4, 5, 6, 7, 8],
+            16,
+            vec![],
+            0,
+            SamplingPolicy::default(),
+        );
+        let session = engine.stats().session_kv_bytes.expect("session bytes");
+        assert_eq!(
+            session,
+            cfg_bytes(24),
+            "the session allocates the request's own admitted need"
+        );
+        assert!(
+            session < prepared,
+            "a reused worker must not allocate the prepared capacity for a smaller request"
         );
     }
 

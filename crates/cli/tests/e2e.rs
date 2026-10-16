@@ -1069,7 +1069,11 @@ fn bench_warm_repetitions_and_long_output_drain() {
     let samples = v["samples"].as_array().unwrap();
     assert_eq!(samples.len(), 3);
     for s in samples {
+        // Authoritative model-token counts from the worker's Done frame.
         assert_eq!(s["committed_tokens"], 600);
+        assert_eq!(s["generated_tokens"], 600);
+        // Visible-chunk cadence is a separate UX metric.
+        assert_eq!(s["visible_chunks"], 600);
         let total = s["total_ms"].as_f64().unwrap();
         assert!(total > 0.0);
         if let Some(worker_total) = s["worker_total_ms"].as_f64() {
@@ -1079,5 +1083,5 @@ fn bench_warm_repetitions_and_long_output_drain() {
             );
         }
     }
-    assert_eq!(v["schema_version"], 3);
+    assert_eq!(v["schema_version"], 4);
 }

@@ -30,7 +30,8 @@ use crate::admission::{LedgerStats, LiveLedger};
 
 /// Governor command queue shared with the live worker (queued by monitor
 /// threads, flushed by the generate/score loops).
-pub type ControlQueue = Arc<Mutex<Option<Arc<Mutex<std::collections::VecDeque<String>>>>>>;
+pub type ControlQueue =
+    Arc<Mutex<Option<Arc<Mutex<std::collections::VecDeque<crate::worker::ControlCommand>>>>>>;
 use crate::engine::{FinishReason, GenOutcome, ReferenceTestEngine, RunState};
 use crate::governor::{GovState, Governor, GovernorAction, GovernorConfig, GovernorSignal};
 use crate::log::Logger;
@@ -144,6 +145,12 @@ pub struct ActiveRun {
     pub committed: Arc<AtomicU64>,
     pub state: Arc<Mutex<String>>,
     pub events: Receiver<RunEvent>,
+    /// Resolved engine identity, published once by the executor thread
+    /// after the load completes. Streaming consumers read this snapshot;
+    /// they must never query the worker directly (it is busy generating
+    /// and holding its lock — querying it from the event consumer is the
+    /// Gate B review's SSE deadlock).
+    pub identity: Arc<std::sync::OnceLock<tuckmill_manifest::records::EngineIdentity>>,
 }
 
 impl ActiveRun {
@@ -233,6 +240,19 @@ pub struct Runtime {
     worker_generations: AtomicU64,
     /// Consecutive footprint-overrun samples (enforcement escalates at 3).
     overrun_streak: AtomicU64,
+}
+
+/// Resolved identity of a loaded worker (caller holds the worker lock or is
+/// inside the executor thread after load).
+fn worker_identity(worker: &IsolatedWorker) -> tuckmill_manifest::records::EngineIdentity {
+    let mut id = crate::engine::reference_test_identity();
+    id.engine = worker.engine.clone();
+    id.certified = worker.certified;
+    id.build_id = worker.worker_build.clone();
+    if !worker.resolved_kernels.is_empty() {
+        id.kernels = worker.resolved_kernels.clone();
+    }
+    id
 }
 
 struct WorkerSlot {
@@ -557,19 +577,21 @@ impl Runtime {
 
     /// Identity of the engine that would serve the next request. Falls back
     /// to the selected backend's declared identity before any worker exists.
+    /// May wait for the worker lock: streaming paths must use the run-scoped
+    /// snapshot (`ActiveRun::identity`) instead, never this.
     pub fn engine_identity(&self) -> tuckmill_manifest::records::EngineIdentity {
         if let Ok(slot) = self.worker.lock() {
             if let Some(s) = slot.as_ref() {
-                let mut id = crate::engine::reference_test_identity();
-                id.engine = s.worker.engine.clone();
-                id.certified = s.worker.certified;
-                id.build_id = s.worker.worker_build.clone();
-                if !s.worker.resolved_kernels.is_empty() {
-                    id.kernels = s.worker.resolved_kernels.clone();
-                }
-                return id;
+                return worker_identity(&s.worker);
             }
         }
+        self.declared_identity()
+    }
+
+    /// Declared identity of the selected backend, lock-free. Used as the
+    /// explicit fallback for a request whose worker has not finished
+    /// loading (never a substitute for a resolved worker identity).
+    pub fn declared_identity(&self) -> tuckmill_manifest::records::EngineIdentity {
         match self.engine_kind {
             EngineKind::ReferenceTest => crate::engine::reference_test_identity(),
             EngineKind::TuckCore => tuckmill_tuckcore::TuckCore::new().identity(),
@@ -693,6 +715,7 @@ impl Runtime {
         let committed = Arc::new(AtomicU64::new(0));
         let state = Arc::new(Mutex::new("admitted".to_string()));
         let controls: ControlQueue = Arc::new(Mutex::new(None));
+        let identity = Arc::new(std::sync::OnceLock::new());
 
         // Session record (committed state only; no speculative state).
         let session = SessionRecord {
@@ -752,6 +775,7 @@ impl Runtime {
         let session_id_evt = session_id.clone();
         let artifact_evt = artifact;
         let controls_evt = controls.clone();
+        let identity_evt = identity.clone();
         let thread_name = format!("tuckmill-run-{request_id}");
         std::thread::Builder::new()
             .name(thread_name)
@@ -762,6 +786,7 @@ impl Runtime {
                     &request_id_evt,
                     &session_id_evt,
                     &controls_evt,
+                    &identity_evt,
                     request,
                     &cancel_evt,
                     &pause_evt,
@@ -800,6 +825,7 @@ impl Runtime {
             committed,
             state,
             events: rx,
+            identity,
         })
     }
 
@@ -811,6 +837,7 @@ impl Runtime {
         request_id: &str,
         session_id: &Id,
         controls: &ControlQueue,
+        identity: &Arc<std::sync::OnceLock<tuckmill_manifest::records::EngineIdentity>>,
         request: RunRequest,
         cancel: &Arc<AtomicBool>,
         pause: &Arc<AtomicBool>,
@@ -933,10 +960,6 @@ impl Runtime {
                         key: requested,
                         worker,
                     });
-                    if let Ok(mut slot_controls) = controls.lock() {
-                        *slot_controls =
-                            Some(slot.as_ref().expect("slot set above").worker.controls());
-                    }
                 } else {
                     // Warm reuse: the loaded model identity and prepared
                     // capacities satisfy this request; no reload, no new
@@ -954,8 +977,21 @@ impl Runtime {
                         .collect(),
                     );
                 }
+                // Every request — fresh load or warm reuse — attaches the
+                // live worker's control queue to its own scoped holder, so a
+                // governor command reaches the backend even when the worker
+                // was reused (Gate B review: the reuse branch used to leave
+                // it None and throttling was labelled without a command).
+                if let Ok(mut slot_controls) = controls.lock() {
+                    *slot_controls = Some(slot.as_ref().expect("worker slot").worker.controls());
+                }
+                // Publish the resolved identity for streaming consumers.
+                let _ = identity.set(worker_identity(&slot.as_ref().expect("worker slot").worker));
                 let WorkerSlot { worker, .. } = slot.as_mut().expect("worker slot");
                 let mut token_tx = |index: u64, text: &str| -> bool {
+                    // Interim status only (release ordinal, not a token
+                    // count); the authoritative visible-token count arrives
+                    // with Done and is stored below.
                     committed.store(index + 1, Ordering::Relaxed);
                     *state.lock().expect("state lock") = "generating".to_string();
                     tx.send(RunEvent::Token {
@@ -993,6 +1029,7 @@ impl Runtime {
                 let mut engine = self.in_process.lock().expect("engine lock");
                 engine.per_token_delay = Duration::from_millis(2);
                 engine.load(plan)?;
+                let _ = identity.set(engine.identity());
                 let req = crate::engine::EngineRequest {
                     request_id: request_id.to_string(),
                     prompt_tokens: request.prompt_tokens,
@@ -1002,6 +1039,9 @@ impl Runtime {
                     sampling: request.sampling,
                 };
                 let mut token_tx = |index: u64, text: &str| -> bool {
+                    // Interim status only (release ordinal, not a token
+                    // count); the authoritative visible-token count arrives
+                    // with Done and is stored below.
                     committed.store(index + 1, Ordering::Relaxed);
                     tx.send(RunEvent::Token {
                         index,
@@ -1142,6 +1182,7 @@ impl Runtime {
                 let active = self.active.lock().expect("active lock");
                 active.as_ref().map(|a| {
                     (
+                        a.request_id.clone(),
                         a.cancel.clone(),
                         a.pause.clone(),
                         a.committed.clone(),
@@ -1150,12 +1191,19 @@ impl Runtime {
                     )
                 })
             };
-            if let Some((cancel, pause, committed, state, controls)) = snapshot {
+            if let Some((request_id, cancel, pause, committed, state, controls)) = snapshot {
+                // Commands are scoped to the request that was active when
+                // the governor decided them; the worker drops late commands
+                // whose request already ended instead of applying them to a
+                // different request.
                 let push_control = |action: &str| {
                     if let Ok(guard) = controls.lock() {
                         if let Some(queue) = guard.as_ref() {
                             if let Ok(mut queue) = queue.lock() {
-                                queue.push_back(action.to_string());
+                                queue.push_back(crate::worker::ControlCommand {
+                                    scope: request_id.clone(),
+                                    action: action.to_string(),
+                                });
                             }
                         }
                     }
@@ -1292,6 +1340,14 @@ mod tests {
         mode: EngineMode,
         worker_exe: Option<PathBuf>,
     ) -> (tempfile::TempDir, Arc<Runtime>, Arc<MockSignalSource>) {
+        test_runtime_kind(mode, worker_exe, EngineKind::ReferenceTest)
+    }
+
+    fn test_runtime_kind(
+        mode: EngineMode,
+        worker_exe: Option<PathBuf>,
+        kind: EngineKind,
+    ) -> (tempfile::TempDir, Arc<Runtime>, Arc<MockSignalSource>) {
         let dir = tempfile::tempdir().unwrap();
         let layout = StoreLayout::open(dir.path().join("store"));
         let src = dir.path().join("m.gguf");
@@ -1313,7 +1369,7 @@ mod tests {
         let runtime = Runtime::open(RuntimeOptions {
             data_dir: Some(layout.root().to_path_buf()),
             engine_mode: mode,
-            engine_kind: EngineKind::ReferenceTest,
+            engine_kind: kind,
             worker_exe,
             queue_capacity: 2,
             execution: crate::options::ExecutionOptions::default(),
@@ -1328,7 +1384,7 @@ mod tests {
                 min_dwell: Duration::from_millis(20),
             },
             monitor: true,
-            allow_test_engine: true,
+            allow_test_engine: kind == EngineKind::ReferenceTest,
         })
         .unwrap();
         (dir, runtime, signals)
@@ -1518,11 +1574,7 @@ mod tests {
 
     #[test]
     fn sequential_requests_reuse_the_loaded_worker_without_state_leaks() {
-        let Some(worker_exe) = std::env::var("TUCKMILL_TEST_WORKER_BIN")
-            .ok()
-            .map(PathBuf::from)
-        else {
-            eprintln!("skipping: TUCKMILL_TEST_WORKER_BIN not set");
+        let Some(worker_exe) = crate::test_worker_bin() else {
             return;
         };
         let (_dir, runtime, _signals) = test_runtime_with(EngineMode::Isolated, Some(worker_exe));
@@ -1581,6 +1633,138 @@ mod tests {
         // A smaller request fits the prepared model: reuse again.
         let (_text, _reason, _committed, _session) = run_once(1024);
         assert_eq!(runtime.worker_generation(), 2);
+        runtime.shutdown();
+    }
+
+    #[test]
+    fn warm_reuse_allocates_kv_for_the_current_request_need() {
+        // Gate B review finding 2: reusing a worker prepared for a larger
+        // context must not allocate the old capacity against the current,
+        // smaller admitted plan. TuckCore allocates per-request KV for the
+        // request's own prompt+output need; assert the actual bytes the
+        // worker reports, not just that it did not reload.
+        let Some(worker_exe) = crate::test_worker_bin() else {
+            return;
+        };
+        let (_dir, runtime, _signals) =
+            test_runtime_kind(EngineMode::Isolated, Some(worker_exe), EngineKind::TuckCore);
+        let (artifact, adapter) = runtime.resolve_artifact("local").unwrap();
+        let run_once = |context: u64| -> (u64, u64) {
+            let plan = runtime
+                .plan_for(
+                    &artifact,
+                    &adapter,
+                    Bytes::parse("2GiB").unwrap(),
+                    context,
+                    16,
+                )
+                .unwrap();
+            runtime.plan_admitted(&plan).unwrap();
+            runtime.admit_engine(&plan).unwrap();
+            let ticket = runtime.submit().unwrap();
+            let run = runtime
+                .start_run(
+                    &ticket,
+                    plan,
+                    artifact_ref_for(&runtime),
+                    RunRequest::greedy(vec![5, 6, 7, 8], 16),
+                )
+                .unwrap();
+            let (reason, _committed) = collect_run(&run, |_, _| {});
+            assert_eq!(reason, FinishReason::Length);
+            let stats = runtime.backend_stats().expect("backend stats");
+            (
+                stats.session_kv_bytes.expect("session KV bytes reported"),
+                stats.kv_state_bytes.expect("prepared KV bytes reported"),
+            )
+        };
+
+        // Load once with a large prepared context, then reuse it for a much
+        // smaller admitted context: the second request allocates exactly the
+        // same small session (prompt+output need), never the prepared 4k.
+        let (session_large_prepared, prepared_large) = run_once(4096);
+        assert_eq!(runtime.worker_generation(), 1);
+        assert!(
+            session_large_prepared < prepared_large,
+            "a request allocates its own need ({session_large_prepared} B), not the prepared capacity ({prepared_large} B)"
+        );
+        let (session_small_plan, prepared_after_small) = run_once(1024);
+        assert_eq!(runtime.worker_generation(), 1, "still one load");
+        assert_eq!(
+            session_small_plan, session_large_prepared,
+            "identical requests allocate identical session KV regardless of prepared capacity"
+        );
+        assert_eq!(
+            prepared_after_small, prepared_large,
+            "the reused worker still reports its one loaded (4096) preparation"
+        );
+        assert!(
+            session_small_plan < prepared_large,
+            "the reused request's KV allocation ({session_small_plan} B) is its own need, not the prepared 4096-token capacity ({prepared_large} B)"
+        );
+        runtime.shutdown();
+    }
+
+    #[test]
+    fn pressure_during_a_reused_request_reaches_the_backend() {
+        // Gate B review finding 3: the warm-reuse branch used to leave the
+        // per-request control holder empty, so a governor Throttling state
+        // was labelled without any command reaching the worker. Complete a
+        // request, reuse the worker for a second one under warning pressure,
+        // and verify the backend actually acted (its loader cache was
+        // trimmed), not just that the display said throttling.
+        let Some(worker_exe) = crate::test_worker_bin() else {
+            return;
+        };
+        let (_dir, runtime, signals) =
+            test_runtime_kind(EngineMode::Isolated, Some(worker_exe), EngineKind::TuckCore);
+        let (artifact, adapter) = runtime.resolve_artifact("local").unwrap();
+        let run_once = |tokens: u64| {
+            let plan = runtime
+                .plan_for(
+                    &artifact,
+                    &adapter,
+                    Bytes::parse("2GiB").unwrap(),
+                    2048,
+                    tokens,
+                )
+                .unwrap();
+            runtime.plan_admitted(&plan).unwrap();
+            runtime.admit_engine(&plan).unwrap();
+            let ticket = runtime.submit().unwrap();
+            let run = runtime
+                .start_run(
+                    &ticket,
+                    plan,
+                    artifact_ref_for(&runtime),
+                    RunRequest::greedy(vec![1, 2, 3, 4], tokens),
+                )
+                .unwrap();
+            let (reason, committed) = collect_run(&run, |_, _| {});
+            assert_eq!(reason, FinishReason::Length);
+            assert_eq!(committed, tokens);
+        };
+
+        // First request loads the worker.
+        run_once(4);
+        assert_eq!(runtime.worker_generation(), 1);
+        let evictions_before = runtime.backend_stats().map(|s| s.evictions).unwrap_or(0);
+
+        // Warning pressure while the second (reused) request runs.
+        signals.set_pressure(crate::pressure::PressureLevel::Warning);
+        run_once(24);
+        signals.set_pressure(crate::pressure::PressureLevel::Normal);
+
+        assert_eq!(
+            runtime.worker_generation(),
+            1,
+            "the second request reused the worker"
+        );
+        let evictions_after = runtime.backend_stats().map(|s| s.evictions).unwrap_or(0);
+        assert!(
+            evictions_after > evictions_before,
+            "the trim command must reach the reused worker's backend: evictions {evictions_before} -> {evictions_after}"
+        );
         runtime.shutdown();
     }
 

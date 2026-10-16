@@ -2,16 +2,21 @@
 //!
 //! Contract (PRD §7, backend interface): a stop sequence or model-defined
 //! EOS marker must never appear in user-visible output. A stop sequence can
-//! span several generated tokens, so text is held back until it can no
-//! longer become part of a stop sequence. The hold-back is bounded by the
-//! longest stop sequence: memory never grows with generation length.
+//! span several generated tokens, and a token's text can contain trailing
+//! characters after a completed stop — the buffer handles both: it searches
+//! the held region plus each new piece for the earliest completed stop,
+//! releases only the text before it, and discards the stop and any bytes
+//! after it in that piece. The hold-back is bounded by the longest stop
+//! sequence: memory never grows with generation length.
 //!
 //! Release is at byte granularity inside the held text: a token whose text
 //! straddles a stop boundary is partially visible, never wholly dropped, so
 //! the visible stream is identical no matter how a tokenizer splits the
-//! stop string across tokens. Tokens whose bytes are still held when the
-//! stream ends are flushed (EOS, length, or cancellation); tokens fully
-//! inside a completed stop sequence are dropped and never counted visible.
+//! stop string across tokens. Every pushed run carries the token owners of
+//! its bytes, so a token that contributed at least one byte to visible
+//! output is counted even when the bytes were split across tokens by
+//! UTF-8 assembly. Tokens fully inside a completed stop sequence are
+//! dropped and never counted visible.
 
 use std::collections::VecDeque;
 
@@ -20,8 +25,9 @@ use std::collections::VecDeque;
 pub struct Release {
     /// Text that is now safe to publish (possibly empty).
     pub text: String,
-    /// True when a stop sequence completed; `text` excludes it and the
-    /// generator must finish with reason `stop`.
+    /// True when a stop sequence completed; `text` excludes it (and any
+    /// bytes that followed it in the same piece) and the generator must
+    /// finish with reason `stop`.
     pub stop: bool,
 }
 
@@ -34,13 +40,17 @@ impl Release {
 /// Bounded buffer between generated token text and user-visible output.
 #[derive(Debug)]
 pub struct VisibleOutputBuffer {
-    /// Held text. Invariant: never ends with a proper prefix of a stop
-    /// sequence (so a completing stop always starts inside this buffer).
+    /// Held text. Invariant: never contains a complete stop sequence, and
+    /// never ends with a proper prefix of a stop sequence (so a completing
+    /// stop that starts before the newest piece cannot exist).
     pending: String,
     /// Non-empty stop sequences in request order.
     stops: Vec<String>,
-    /// (byte offset in `pending`, token ordinal) per token that contributed
-    /// text now held. Bounded by the longest stop plus one token's text.
+    /// (byte offset in `pending`, token ordinal) per token-owner that
+    /// contributed bytes now held. A byte run owned by several tokens
+    /// (a multibyte character split across tokens) produces one mark per
+    /// owner at the same offset. Bounded by the longest stop plus one
+    /// push's text.
     marks: VecDeque<(usize, u64)>,
     /// Tokens with at least one visible byte. This is the honest
     /// completion-token count: tokens dropped inside a stop sequence or
@@ -59,37 +69,41 @@ impl VisibleOutputBuffer {
         }
     }
 
-    /// Feed the decoded text of one generated token (already assembled as
-    /// complete UTF-8 by the caller's stream decoder). `token` is the
-    /// caller's monotonic token ordinal.
-    pub fn push(&mut self, token: u64, text: &str) -> Release {
+    /// Feed one decoded run: `text` composed of bytes owned by `owners`
+    /// (deduplicated token ordinals; more than one owner means a multibyte
+    /// character was split across tokens).
+    pub fn push(&mut self, owners: &[u64], text: &str) -> Release {
         if text.is_empty() {
             return Release::empty();
         }
         let start = self.pending.len();
         self.pending.push_str(text);
-        self.marks.push_back((start, token));
+        for owner in owners {
+            self.marks.push_back((start, *owner));
+        }
 
-        // A completed stop must end inside `pending` (see invariant).
-        let mut matched: Option<(usize, usize)> = None; // (start, length)
+        // Earliest completed stop inside the held region. An occurrence
+        // cannot start in already-released text: the invariant keeps
+        // visible output from ending in a proper stop prefix.
+        let mut matched: Option<(usize, usize)> = None; // (start, stop length)
         for s in &self.stops {
-            if self.pending.ends_with(s.as_str()) {
-                let st = self.pending.len() - s.len();
+            if let Some(at) = self.pending.find(s.as_str()) {
                 let better = match matched {
                     None => true,
-                    // Earliest occurrence wins; ties keep the longest.
-                    Some((ms, ml)) => st < ms || (st == ms && s.len() > ml),
+                    Some((ms, ml)) => at < ms || (at == ms && s.len() > ml),
                 };
                 if better {
-                    matched = Some((st, s.len()));
+                    matched = Some((at, s.len()));
                 }
             }
         }
         if let Some((start, _)) = matched {
+            // Release everything before the stop; discard the stop and
+            // every byte that followed it in this piece.
             let visible: String = self.pending[..start].to_string();
             self.count_visible_before(start);
             self.pending.clear();
-            // Remaining marks lie inside the dropped stop region.
+            // Remaining marks lie inside the discarded region.
             self.marks.clear();
             return Release {
                 text: visible,
@@ -135,14 +149,14 @@ impl VisibleOutputBuffer {
         self.pending.len()
     }
 
-    /// A stop string can only complete if it begins at least one held byte;
-    /// so a completing stop always starts inside P (see invariant).
+    /// Longest suffix of the held text that is a proper prefix of a stop
+    /// sequence — the only bytes that may still begin a completing stop.
     fn holdback_len(&self) -> usize {
         let mut keep = 0usize;
         let pending = self.pending.as_bytes();
         for s in &self.stops {
             let bytes = s.as_bytes();
-            // Proper prefixes only: a full match would have been handled.
+            // Proper prefixes only: a full match was handled above.
             for k in (1..bytes.len()).rev() {
                 if k <= keep {
                     break;
@@ -156,9 +170,9 @@ impl VisibleOutputBuffer {
         keep
     }
 
-    /// Count tokens whose mark starts before `visible_end` as visible and
-    /// drop their marks. Callers must have set `visible_end` to the length
-    /// of the released region (before draining/mutating `pending`).
+    /// Count marks starting before `visible_end` as visible and drop them.
+    /// Callers must pass the length of the released region before mutating
+    /// `pending`.
     fn count_visible_before(&mut self, visible_end: usize) {
         let mut count = 0u64;
         while let Some((m, _)) = self.marks.front() {
@@ -184,7 +198,7 @@ mod tests {
     #[test]
     fn no_stops_releases_immediately() {
         let mut b = VisibleOutputBuffer::new(&[]);
-        let r = b.push(0, "hello");
+        let r = b.push(&[0], "hello");
         assert_eq!(r.text, "hello");
         assert!(!r.stop);
         assert_eq!(b.held_bytes(), 0);
@@ -197,7 +211,7 @@ mod tests {
         let mut visible = String::new();
         let mut finished = false;
         for (i, t) in ["hello<|", "im_", "end", "|>", "more"].iter().enumerate() {
-            let r = b.push(i as u64, t);
+            let r = b.push(&[i as u64], t);
             visible.push_str(&r.text);
             if r.stop {
                 finished = true;
@@ -213,14 +227,76 @@ mod tests {
     }
 
     #[test]
+    fn stop_completed_inside_a_piece_discards_the_trailing_text() {
+        // The counterexample from the Gate B review: the stop completes in
+        // the middle of a single token's text, with extra characters after
+        // it in the same piece.
+        let mut b = VisibleOutputBuffer::new(&stops(&["STOP"]));
+        let r = b.push(&[0], "helloSTOPworld");
+        assert_eq!(r.text, "hello");
+        assert!(r.stop);
+        assert_eq!(b.visible_tokens(), 1);
+    }
+
+    #[test]
+    fn stop_completed_across_pieces_with_trailing_text() {
+        let mut b = VisibleOutputBuffer::new(&stops(&["STOP"]));
+        let r1 = b.push(&[0], "helloST");
+        assert_eq!(r1.text, "hello");
+        assert!(!r1.stop);
+        let r2 = b.push(&[1], "OPworld");
+        assert_eq!(r2.text, "");
+        assert!(r2.stop);
+        assert_eq!(b.visible_tokens(), 1, "the piece after the stop is dropped");
+        assert_eq!(b.held_bytes(), 0);
+    }
+
+    #[test]
+    fn all_partitions_of_a_stop_inside_a_piece_are_equivalent() {
+        // Exhaustive: every composition of "helloSTOPworld" into pieces must
+        // produce the identical visible output "hello" with the stop fired
+        // exactly once — independent of tokenizer boundaries.
+        let text = b"helloSTOPworld";
+        for mask in 0u32..(1 << (text.len() - 1)) {
+            let mut pieces: Vec<&[u8]> = Vec::new();
+            let mut start = 0usize;
+            for i in 1..text.len() {
+                if mask & (1 << (i - 1)) != 0 {
+                    pieces.push(&text[start..i]);
+                    start = i;
+                }
+            }
+            pieces.push(&text[start..]);
+
+            let mut b = VisibleOutputBuffer::new(&stops(&["STOP"]));
+            let mut visible = String::new();
+            let mut fired = 0usize;
+            for (i, piece) in pieces.iter().enumerate() {
+                let r = b.push(&[i as u64], std::str::from_utf8(piece).unwrap());
+                visible.push_str(&r.text);
+                if r.stop {
+                    fired += 1;
+                    break;
+                }
+                assert!(
+                    !visible.contains("STOP"),
+                    "mask {mask:#b}: marker leaked mid-stream: {visible:?}"
+                );
+            }
+            assert_eq!(fired, 1, "mask {mask:#b}: stop must fire once");
+            assert_eq!(visible, "hello", "mask {mask:#b}");
+        }
+    }
+
+    #[test]
     fn partial_token_keeps_its_visible_prefix() {
         // Token text "ab" then "cd" with stop "bcd": "a" is visible, the
         // rest of the stop region is dropped.
         let mut b = VisibleOutputBuffer::new(&stops(&["bcd"]));
-        let r1 = b.push(0, "ab");
+        let r1 = b.push(&[0], "ab");
         assert_eq!(r1.text, "a");
         assert!(!r1.stop);
-        let r2 = b.push(1, "cd");
+        let r2 = b.push(&[1], "cd");
         assert_eq!(r2.text, "");
         assert!(r2.stop);
         assert_eq!(
@@ -233,12 +309,12 @@ mod tests {
     #[test]
     fn overlapping_stops_earliest_occurrence_wins() {
         let mut b = VisibleOutputBuffer::new(&stops(&["ab", "aab"]));
-        let r = b.push(0, "aab");
+        let r = b.push(&[0], "aab");
         assert_eq!(r.text, "");
         assert!(r.stop, "earliest occurrence (aab at 0) must win");
-        // And with the same text but stops that do not overlap at 0:
+        // And with the same text but stops that first overlap later:
         let mut b = VisibleOutputBuffer::new(&stops(&["ab", "ba"]));
-        let r = b.push(0, "xab");
+        let r = b.push(&[0], "xab");
         assert_eq!(r.text, "x");
         assert!(r.stop);
     }
@@ -246,7 +322,7 @@ mod tests {
     #[test]
     fn flush_releases_held_text() {
         let mut b = VisibleOutputBuffer::new(&stops(&["STOP"]));
-        let r1 = b.push(0, "abcST");
+        let r1 = b.push(&[0], "abcST");
         assert_eq!(r1.text, "abc", "only the potential-stop suffix is held");
         assert_eq!(b.held_bytes(), 2);
         let r2 = b.flush();
@@ -262,7 +338,7 @@ mod tests {
         for i in 0..1000u64 {
             // Single random letters never complete the stop.
             let c = (b'a' + (rng.next_u64() % 26) as u8) as char;
-            let r = b.push(i, &c.to_string());
+            let r = b.push(&[i], &c.to_string());
             assert!(!r.stop);
             assert!(
                 b.held_bytes() <= 7,
@@ -275,9 +351,9 @@ mod tests {
     #[test]
     fn unicode_stop_boundaries_are_byte_exact() {
         let mut b = VisibleOutputBuffer::new(&stops(&["日本語"]));
-        let r1 = b.push(0, "です日");
+        let r1 = b.push(&[0], "です日");
         assert_eq!(r1.text, "です");
-        let r2 = b.push(1, "本語");
+        let r2 = b.push(&[1], "本語");
         assert_eq!(r2.text, "");
         assert!(r2.stop);
     }
@@ -285,7 +361,23 @@ mod tests {
     #[test]
     fn empty_stop_strings_are_ignored() {
         let mut b = VisibleOutputBuffer::new(&stops(&["", ""]));
-        let r = b.push(0, "text");
+        let r = b.push(&[0], "text");
         assert_eq!(r.text, "text");
+    }
+
+    #[test]
+    fn multi_owner_runs_count_every_contributing_token() {
+        // A multibyte character split across three tokens: the run is owned
+        // by all three; when visible, all three count; when dropped inside a
+        // stop, none do.
+        let mut b = VisibleOutputBuffer::new(&[]);
+        let r = b.push(&[4, 5, 6], "€");
+        assert_eq!(r.text, "€");
+        assert_eq!(b.visible_tokens(), 3);
+
+        let mut b = VisibleOutputBuffer::new(&stops(&["€"]));
+        let r = b.push(&[7, 8, 9], "€");
+        assert!(r.stop);
+        assert_eq!(b.visible_tokens(), 0, "a dropped run is not visible");
     }
 }

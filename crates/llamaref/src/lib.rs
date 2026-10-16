@@ -17,6 +17,7 @@
 use std::ffi::{CStr, CString};
 use std::os::raw::{c_char, c_int, c_void};
 use std::path::{Path, PathBuf};
+use std::time::Instant;
 
 use tuckmill_backend::{
     ArtifactRef, BackendCapabilities, BackendId, BackendStats, FinishReason, GenControl,
@@ -673,6 +674,26 @@ unsafe extern "C" fn unreachable_probe(_: *const TmHandle) -> i32 {
     unreachable!("shim not open")
 }
 
+/// Production-based timing for a generate request: time to the first
+/// sampled token and the first-to-last sampled span (model-token
+/// production, never visible-chunk release).
+fn production_timing(
+    t0: std::time::Instant,
+    first: Option<std::time::Instant>,
+    last: Option<std::time::Instant>,
+) -> tuckmill_backend::RequestTiming {
+    let ms = |from: std::time::Instant, to: std::time::Instant| (to - from).as_secs_f64() * 1000.0;
+    tuckmill_backend::RequestTiming {
+        total_ms: ms(t0, std::time::Instant::now()),
+        prefill_ms: None,
+        first_token_ms: first.map(|f| ms(t0, f)),
+        decode_ms: match (first, last) {
+            (Some(f), Some(l)) if l > f => Some(ms(f, l)),
+            _ => None,
+        },
+    }
+}
+
 impl InferenceBackend for LlamaRef {
     fn backend_id(&self) -> BackendId {
         BackendId::LlamaCpp
@@ -874,6 +895,9 @@ impl InferenceBackend for LlamaRef {
         }
 
         (ctl.on_state)(RunState::Generating);
+        let t0 = Instant::now();
+        let mut first_generated_at: Option<Instant> = None;
+        let mut last_generated_at: Option<Instant> = None;
         let mut rng = tuckmill_backend::sampling::Rng::new(req.seed);
         let sampling_cfg = tuckmill_backend::sampling::SamplingConfig {
             temperature: req.sampling.temperature,
@@ -883,7 +907,7 @@ impl InferenceBackend for LlamaRef {
         let mut buffer = tuckmill_backend::output::VisibleOutputBuffer::new(&req.stop);
         let mut release_index: u64 = 0;
         let mut generated_ids: u64 = 0;
-        // Incremental UTF-8 assembly over exact piece bytes.
+        // Incremental UTF-8 assembly with byte-level token provenance.
         let mut decoder = tuckmill_manifest::utf8::Utf8StreamDecoder::new();
         let emit = |text: &str, release_index: &mut u64, ctl: &mut GenControl<'_>| -> bool {
             if text.is_empty() {
@@ -899,7 +923,8 @@ impl InferenceBackend for LlamaRef {
                 let _ = emit(&r.text, &mut release_index, ctl);
                 return Ok(
                     GenOutcome::new(FinishReason::Cancelled, buffer.visible_tokens())
-                        .with_generated(generated_ids),
+                        .with_generated(generated_ids)
+                        .with_timing(production_timing(t0, first_generated_at, last_generated_at)),
                 );
             }
             let h = self.h()?;
@@ -937,24 +962,39 @@ impl InferenceBackend for LlamaRef {
                 t
             };
             generated_ids = i + 1;
+            let produced_at = Instant::now();
+            if first_generated_at.is_none() {
+                first_generated_at = Some(produced_at);
+            }
+            last_generated_at = Some(produced_at);
             if token == self.eos.max(0) as u32 {
                 // The model-defined EOS marker is never visible.
                 let r = buffer.flush();
                 let _ = emit(&r.text, &mut release_index, ctl);
                 return Ok(GenOutcome::new(FinishReason::Eos, buffer.visible_tokens())
-                    .with_generated(generated_ids));
+                    .with_generated(generated_ids)
+                    .with_timing(production_timing(t0, first_generated_at, last_generated_at)));
             }
-            let text = decoder.push(&self.piece_bytes(token)?);
-            let release = buffer.push(i, &text);
-            if !emit(&release.text, &mut release_index, ctl) {
+            let piece = decoder.push_token(&self.piece_bytes(token)?, i);
+            let mut client_stop = false;
+            let mut stop = false;
+            for run in piece {
+                let release = buffer.push(&run.owners, &run.text);
+                if !emit(&release.text, &mut release_index, ctl) {
+                    client_stop = true;
+                    break;
+                }
+                if release.stop {
+                    stop = true;
+                    break;
+                }
+            }
+            if client_stop || stop {
                 let r = buffer.flush();
                 let _ = emit(&r.text, &mut release_index, ctl);
                 return Ok(GenOutcome::new(FinishReason::Stop, buffer.visible_tokens())
-                    .with_generated(generated_ids));
-            }
-            if release.stop {
-                return Ok(GenOutcome::new(FinishReason::Stop, buffer.visible_tokens())
-                    .with_generated(generated_ids));
+                    .with_generated(generated_ids)
+                    .with_timing(production_timing(t0, first_generated_at, last_generated_at)));
             }
             if i + 1 < req.max_output_tokens {
                 self.decode_chunked_with_poll(&[token], ctl.poll)?;
@@ -964,7 +1004,8 @@ impl InferenceBackend for LlamaRef {
         let _ = emit(&r.text, &mut release_index, ctl);
         Ok(
             GenOutcome::new(FinishReason::Length, buffer.visible_tokens())
-                .with_generated(generated_ids),
+                .with_generated(generated_ids)
+                .with_timing(production_timing(t0, first_generated_at, last_generated_at)),
         )
     }
 

@@ -173,8 +173,10 @@ impl ReferenceTestEngine {
         }
 
         let t0 = Instant::now();
-        let mut first_committed_at: Option<Instant> = None;
-        let mut last_committed_at: Option<Instant> = None;
+        // Production-based timing: set when each synthetic token is
+        // produced, never when its text is released to the client.
+        let mut first_produced_at: Option<Instant> = None;
+        let mut last_produced_at: Option<Instant> = None;
         let finish_with_timing = |outcome: GenOutcome,
                                   t0: Instant,
                                   prefill_ms: Option<f64>,
@@ -217,20 +219,10 @@ impl ReferenceTestEngine {
         // completed stop sequence is never visible.
         let mut buffer = tuckmill_backend::output::VisibleOutputBuffer::new(&req.stop);
         let mut release_index: u64 = 0;
-        let emit = |text: &str,
-                    release_index: &mut u64,
-                    first: &mut Option<Instant>,
-                    last: &mut Option<Instant>,
-                    ctl: &mut GenControl<'_>|
-         -> bool {
+        let emit = |text: &str, release_index: &mut u64, ctl: &mut GenControl<'_>| -> bool {
             if text.is_empty() {
                 return true;
             }
-            let now = Instant::now();
-            if first.is_none() {
-                *first = Some(now);
-            }
-            *last = Some(now);
             let keep = (ctl.on_token)(*release_index, text);
             *release_index += 1;
             keep
@@ -238,47 +230,36 @@ impl ReferenceTestEngine {
         for i in 0..req.max_output_tokens {
             if ctl.cancel.load(Ordering::Relaxed) {
                 let r = buffer.flush();
-                let _ = emit(
-                    &r.text,
-                    &mut release_index,
-                    &mut first_committed_at,
-                    &mut last_committed_at,
-                    ctl,
-                );
+                let _ = emit(&r.text, &mut release_index, ctl);
                 return Ok(finish_with_timing(
                     GenOutcome::new(FinishReason::Cancelled, buffer.visible_tokens()),
                     t0,
                     Some(prefill_ms),
-                    first_committed_at,
-                    last_committed_at,
+                    first_produced_at,
+                    last_produced_at,
                 ));
             }
             // Safe-boundary pause between committed tokens.
             pause_loop(ctl, self.per_token_delay)?;
 
+            // Production-based timing: the synthetic engine produces one
+            // token per iteration.
+            let produced_at = Instant::now();
+            if first_produced_at.is_none() {
+                first_produced_at = Some(produced_at);
+            }
+            last_produced_at = Some(produced_at);
             let text = format!("[ref:{i}]");
-            let release = buffer.push(i, &text);
-            if !emit(
-                &release.text,
-                &mut release_index,
-                &mut first_committed_at,
-                &mut last_committed_at,
-                ctl,
-            ) {
+            let release = buffer.push(&[i], &text);
+            if !emit(&release.text, &mut release_index, ctl) {
                 let r = buffer.flush();
-                let _ = emit(
-                    &r.text,
-                    &mut release_index,
-                    &mut first_committed_at,
-                    &mut last_committed_at,
-                    ctl,
-                );
+                let _ = emit(&r.text, &mut release_index, ctl);
                 return Ok(finish_with_timing(
                     GenOutcome::new(FinishReason::Stop, buffer.visible_tokens()),
                     t0,
                     Some(prefill_ms),
-                    first_committed_at,
-                    last_committed_at,
+                    first_produced_at,
+                    last_produced_at,
                 ));
             }
             if release.stop {
@@ -286,25 +267,19 @@ impl ReferenceTestEngine {
                     GenOutcome::new(FinishReason::Stop, buffer.visible_tokens()),
                     t0,
                     Some(prefill_ms),
-                    first_committed_at,
-                    last_committed_at,
+                    first_produced_at,
+                    last_produced_at,
                 ));
             }
         }
         let r = buffer.flush();
-        let _ = emit(
-            &r.text,
-            &mut release_index,
-            &mut first_committed_at,
-            &mut last_committed_at,
-            ctl,
-        );
+        let _ = emit(&r.text, &mut release_index, ctl);
         Ok(finish_with_timing(
             GenOutcome::new(FinishReason::Length, buffer.visible_tokens()),
             t0,
             Some(prefill_ms),
-            first_committed_at,
-            last_committed_at,
+            first_produced_at,
+            last_produced_at,
         ))
     }
 }

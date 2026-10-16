@@ -140,6 +140,7 @@ pub fn run_standard_bench(
     let mut decode_values: Vec<f64> = Vec::new();
     let mut all_gap_p95: Vec<f64> = Vec::new();
     let mut footprint_peak: u64 = 0;
+    let mut resolved_identity: Option<tuckmill_manifest::records::EngineIdentity> = None;
 
     for rep in 0..options.repetitions.max(1) {
         let prompt_id = format!(
@@ -172,10 +173,15 @@ pub fn run_standard_bench(
             },
         )?;
 
-        let mut first_token_at: Option<Instant> = None;
-        let mut last_token_at: Option<Instant> = None;
+        // Visible-stream cadence (user experience): first/last visible
+        // chunk and the gaps between them.
+        let mut first_visible_at: Option<Instant> = None;
+        let mut last_visible_at: Option<Instant> = None;
+        let mut visible_chunks: u64 = 0;
         let mut gaps: Vec<f64> = Vec::new();
+        // Authoritative model-token counts from the worker's Done frame.
         let mut committed: u64 = 0;
+        let mut generated: u64 = 0;
         let mut failure: Option<String> = None;
         let mut worker_timing: Option<tuckmill_backend::RequestTiming> = None;
 
@@ -207,18 +213,27 @@ pub fn run_standard_bench(
                 Ok(RunEvent::State(_)) => {}
                 Ok(RunEvent::Token { text, .. }) => {
                     let now = Instant::now();
-                    if first_token_at.is_none() {
-                        first_token_at = Some(now);
-                    } else if let Some(last) = last_token_at {
+                    if first_visible_at.is_none() {
+                        first_visible_at = Some(now);
+                    } else if let Some(last) = last_visible_at {
                         gaps.push((now - last).as_secs_f64() * 1000.0);
                     }
-                    last_token_at = Some(now);
-                    committed += 1;
+                    last_visible_at = Some(now);
+                    visible_chunks += 1;
                     let _ = text;
-                    // Reuse the token text length guard: reference tokens are
-                    // fixed-size; nothing is assumed about content.
+                    // Text chunks are the visible stream; token counts below
+                    // come from the worker's Done frame, never from chunk
+                    // events (a chunk is not a token: buffering, Unicode
+                    // assembly, and stop handling can all change the count).
                 }
-                Ok(RunEvent::Done { timing, .. }) => {
+                Ok(RunEvent::Done {
+                    committed: c,
+                    generated: g,
+                    timing,
+                    ..
+                }) => {
+                    committed = c;
+                    generated = if g == 0 { c } else { g };
                     worker_timing = timing;
                     break;
                 }
@@ -231,6 +246,9 @@ pub fn run_standard_bench(
                     break;
                 }
             }
+        }
+        if let Some(id) = run.identity.get() {
+            resolved_identity = Some(id.clone());
         }
         let total_ms = t0.elapsed().as_secs_f64() * 1000.0;
         let final_stats = runtime.backend_stats();
@@ -248,26 +266,23 @@ pub fn run_standard_bench(
         let run_peak = peak.load(Ordering::Relaxed);
         footprint_peak = footprint_peak.max(run_peak);
 
-        let ttft = first_token_at
+        // TTFT as the user experiences it: time to the first visible chunk.
+        let ttft = first_visible_at
             .map(|t| t.duration_since(t0).as_secs_f64() * 1000.0)
             .unwrap_or(total_ms);
+        // End-to-end throughput over model tokens (the worker's own
+        // generated-token count), including the wait before the first token.
         let tps = if total_ms > 0.0 {
-            committed as f64 / (total_ms / 1000.0)
+            generated as f64 / (total_ms / 1000.0)
         } else {
             0.0
         };
-        // Decode-only throughput: post-first-token tokens over the first-to-
-        // last committed-token span. Distinct from `tps` (end-to-end, which
-        // includes the wait before the first token); both are reported.
-        let decode_tps = match (first_token_at, last_token_at) {
-            (Some(first), Some(last)) if committed >= 2 => {
-                let secs = (last - first).as_secs_f64();
-                if secs > 0.0 {
-                    Some((committed - 1) as f64 / secs)
-                } else {
-                    None
-                }
-            }
+        // Decode-only throughput over model-token production: post-first
+        // generated tokens over the worker-measured first-to-last sampled
+        // span. Buffering and visibility never enter this number. Absent
+        // when the backend reports no production timing.
+        let decode_tps = match worker_timing.as_ref().and_then(|t| t.decode_ms) {
+            Some(ms) if ms > 0.0 && generated >= 2 => Some((generated - 1) as f64 / (ms / 1000.0)),
             _ => None,
         };
         let mut gaps_for_p95 = gaps.clone();
@@ -293,6 +308,8 @@ pub fn run_standard_bench(
             prompt_id,
             ttft_ms: ttft,
             committed_tokens: committed as u32,
+            generated_tokens: generated as u32,
+            visible_chunks: visible_chunks as u32,
             total_ms,
             gap_p95_ms: gap_p95,
             gap_max_ms: gap_max,
@@ -330,7 +347,10 @@ pub fn run_standard_bench(
         LatencyClass::BatchLocal
     };
 
-    let engine = runtime.engine_identity();
+    // Lock-free: the resolved identity comes from the last run's published
+    // snapshot (set by the executor after load); falls back to the declared
+    // identity, never waits on a busy worker.
+    let engine = resolved_identity.unwrap_or_else(|| runtime.declared_identity());
     let summary = SummaryStats {
         ttft_median_ms: ttft_median,
         ttft_p95_ms: ttft_p95,
@@ -350,7 +370,7 @@ pub fn run_standard_bench(
     let synthetic = tuckmill_backend::is_synthetic_engine(&engine.engine);
     let mut caveats = vec![
         format!("suite {} frozen: {}", suite.suite, suite.notes.join("; ")),
-        "throughput_median_tps is end-to-end (committed tokens / total request time, including TTFT); throughput_decode_median_tps is decode-only (first-to-last token) — never compare across the two definitions".into(),
+        "all throughput figures count model tokens from the worker's Done frame: throughput_median_tps is end-to-end (generated tokens / total request time, including TTFT) and throughput_decode_median_tps is (generated - 1) over the worker's first-to-last sampled-token span; ttft_ms, visible_chunks, and the gap percentiles describe the visible stream (user experience), not token production".into(),
         if synthetic {
             "reference test engine: synthetic output; model weights were not executed".into()
         } else {
@@ -380,8 +400,14 @@ pub fn run_standard_bench(
     let run = BenchmarkRun {
         // 2: decode-only throughput fields. 3: worker-side component timings
         //    (worker_total_ms / worker_prefill_ms / worker_decode_ms); all
-        //    optional, older records parse.
-        schema_version: 3,
+        //    optional, older records parse. 4: token counts are the worker's
+        //    authoritative Done counts (committed = visible tokens,
+        //    generated = sampled tokens) and decode throughput uses
+        //    production timing; text-chunk counts are reported separately as
+        //    visible_chunks. Values from v3-and-earlier records counted
+        //    streamed chunks, which match the v4 figures on plain ASCII
+        //    output but not with buffering, Unicode assembly, or stops.
+        schema_version: 4,
         run_id: Id::new("0".repeat(64)).expect("zero id"),
         started_unix_ms: started,
         device_id: plan.device_id.clone(),

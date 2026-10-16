@@ -403,6 +403,11 @@ pub struct BackendStats {
     /// fails closed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub kv_state_bytes: Option<u64>,
+    /// KV bytes allocated for the most recent request's own admitted need
+    /// (prompt + output allowance), which is what a warm-reused worker
+    /// actually allocates — never a previously prepared larger capacity.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_kv_bytes: Option<u64>,
     /// Thread count in use for compute, when the backend is threaded.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub threads: Option<u32>,

@@ -22,7 +22,18 @@ jobs:
         run: cargo fmt --all --check
       - name: clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
+      # Build the worker binary the isolated-worker tests spawn, then require
+      # those tests: a missing prerequisite must fail the gate, never look
+      # like a pass. Test labels are explicit — portable tests always run;
+      # isolated-worker tests run here mandatorily; real-weight reference
+      # tests (pinned llama.cpp library + artifacts) and physical-Mac
+      # qualification are separate, machine-local gates.
+      - name: build worker binary
+        run: cargo build -p tuckmill-cli
       - name: tests
+        env:
+          TUCKMILL_TEST_WORKER_BIN: ${{ github.workspace }}/target/debug/tuckmill
+          TUCKMILL_REQUIRE_ISOLATED_WORKER: "1"
         run: cargo test --workspace
       # The llama.cpp reference backend, the pinned shim, and physical-Mac
       # qualification runs are intentionally NOT part of this workflow:

@@ -16,9 +16,18 @@
 pub struct Rng(u64);
 
 impl Rng {
+    /// Expand an arbitrary user seed into a nonzero RNG state with a
+    /// SplitMix64 finalizer, then force the low bit so the state can never
+    /// be zero. (Seed mapping changed in the Gate B hardening patch: the
+    /// previous `seed ^ constant` construction initialized a zero state —
+    /// an absorbing fixed point — for exactly one accepted seed, and
+    /// sequences are not comparable across the change.)
     pub fn new(seed: u64) -> Self {
-        // Zero state would lock xorshift; mix it.
-        Rng(seed ^ 0x9E37_79B9_7F4A_7C15)
+        let mut z = seed.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^= z >> 31;
+        Rng(z | 1)
     }
 
     pub fn next_u64(&mut self) -> u64 {
@@ -231,5 +240,65 @@ mod tests {
         };
         let mut rng = Rng::new(0);
         assert_eq!(sample(&[f32::NAN, f32::NAN], &cfg, &mut rng), None);
+    }
+
+    #[test]
+    fn degenerate_seeds_never_produce_an_absorbing_state() {
+        // The previous construction (`seed ^ 0x9E37_79B9_7F4A_7C15`) mapped
+        // exactly one accepted seed to state zero, after which xorshift64*
+        // stays zero forever. The expansion must keep every seed — including
+        // that one and the u64 edges — nondegenerate and finite.
+        const OLD_TRAP: u64 = 0x9E37_79B9_7F4A_7C15;
+        for seed in [
+            0u64,
+            1,
+            OLD_TRAP - 1,
+            OLD_TRAP,
+            OLD_TRAP + 1,
+            u64::MAX / 2,
+            u64::MAX - 1,
+            u64::MAX,
+        ] {
+            let mut rng = Rng::new(seed);
+            let first = rng.next_u64();
+            let mut distinct = std::collections::HashSet::new();
+            for _ in 0..16 {
+                distinct.insert(rng.next_u64());
+            }
+            assert!(
+                first != 0,
+                "seed {seed:#x} must not start at the zero state"
+            );
+            assert!(
+                distinct.len() >= 15,
+                "seed {seed:#x} produced a degenerate stream: {distinct:?}"
+            );
+            let draw = rng.next_f64();
+            assert!((0.0..1.0).contains(&draw), "seed {seed:#x} drew {draw}");
+        }
+    }
+
+    #[test]
+    fn the_former_trap_seed_is_repeatable_and_nonconstant() {
+        const OLD_TRAP: u64 = 0x9E37_79B9_7F4A_7C15;
+        let cfg = SamplingConfig {
+            temperature: 1.0,
+            top_k: None,
+            top_p: None,
+        };
+        let logits = [0.5f32, 1.0, -0.5, 2.0];
+        let mut a = Rng::new(OLD_TRAP);
+        let mut b = Rng::new(OLD_TRAP);
+        let sa: Vec<u32> = (0..64)
+            .filter_map(|_| sample(&logits, &cfg, &mut a))
+            .collect();
+        let sb: Vec<u32> = (0..64)
+            .filter_map(|_| sample(&logits, &cfg, &mut b))
+            .collect();
+        assert_eq!(sa, sb, "identical seeds remain reproducible");
+        assert!(
+            sa.iter().collect::<std::collections::HashSet<_>>().len() > 1,
+            "the former zero-state seed must not collapse to a constant draw"
+        );
     }
 }

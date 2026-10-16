@@ -33,6 +33,11 @@ pub struct ExecutionOptions {
     pub kv_precision: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub profile: Option<bool>,
+    /// Test aid: a per-token delay for the reference test engine, used by
+    /// pipeline/lifecycle tests that need a slow producer (long streaming,
+    /// governor commands mid-run). Refused for real engines.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub per_token_delay_ms: Option<u64>,
 }
 
 impl ExecutionOptions {
@@ -45,6 +50,12 @@ impl ExecutionOptions {
                     return Err(TuckmillError::new(
                         ErrorCode::InvalidRequest,
                         "--gpu-layers applies only to --engine llama (the Metal performance baseline); arithmetic diagnostics stay CPU",
+                    ));
+                }
+                if self.per_token_delay_ms.is_some() {
+                    return Err(TuckmillError::new(
+                        ErrorCode::InvalidRequest,
+                        "per-token delay is a reference-test-engine test aid; real engines never simulate slowness",
                     ));
                 }
                 Ok(())
@@ -79,7 +90,9 @@ impl ExecutionOptions {
                 Ok(())
             }
             EngineKind::ReferenceTest => {
-                if self != &Self::default() {
+                let mut without_test_aid = self.clone();
+                without_test_aid.per_token_delay_ms = None;
+                if without_test_aid != Self::default() {
                     return Err(TuckmillError::new(
                         ErrorCode::InvalidRequest,
                         "the reference test engine executes synthetic work and accepts no execution options",
@@ -127,7 +140,11 @@ impl ExecutionOptions {
                     obj.insert("kv_precision".into(), Value::from(v.clone()));
                 }
             }
-            EngineKind::ReferenceTest => {}
+            EngineKind::ReferenceTest => {
+                if let Some(v) = self.per_token_delay_ms {
+                    obj.insert("per_token_delay_ms".into(), Value::from(v));
+                }
+            }
         }
         if obj.is_empty() {
             None

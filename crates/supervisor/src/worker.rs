@@ -28,6 +28,15 @@ const CANCEL_GRACE: Duration = Duration::from_secs(3);
 /// worker is alive, but must never let a stalled request run forever.
 pub const DEFAULT_SCORE_DEADLINE: Duration = Duration::from_secs(900);
 
+/// A governor/administrative command scoped to the request that was active
+/// when it was decided. Scope mismatch at flush time means the command's
+/// request already ended: it is dropped, never applied to a later request.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ControlCommand {
+    pub scope: String,
+    pub action: String,
+}
+
 pub struct IsolatedWorker {
     child: Child,
     stream: UnixStream,
@@ -41,7 +50,10 @@ pub struct IsolatedWorker {
     last_frame: Instant,
     /// Governor commands queued by other threads; the generate/score loops
     /// flush them to the worker as Control frames at read checkpoints.
-    pending_controls: Arc<Mutex<VecDeque<String>>>,
+    pending_controls: Arc<Mutex<VecDeque<ControlCommand>>>,
+    /// Commands drained at a request boundary whose scope belonged to an
+    /// earlier request: dropped, never applied to the wrong request.
+    stale_controls_dropped: u64,
 }
 
 impl IsolatedWorker {
@@ -105,6 +117,7 @@ impl IsolatedWorker {
             resolved_kernels: Vec::new(),
             last_frame: Instant::now(),
             pending_controls: Arc::new(Mutex::new(VecDeque::new())),
+            stale_controls_dropped: 0,
         };
         worker.handshake()?;
         Ok(worker)
@@ -202,7 +215,7 @@ impl IsolatedWorker {
         let mut cancel_sent_at: Option<Instant> = None;
         let mut paused_reported = false;
         loop {
-            self.flush_controls()?;
+            self.flush_controls(&request_id)?;
             if cancel.load(Ordering::Relaxed) && cancel_sent_at.is_none() {
                 let _ = WorkerFrame::Cancel {
                     request_id: request_id.clone(),
@@ -378,7 +391,7 @@ impl IsolatedWorker {
         let deadline = Instant::now() + deadline;
         let mut cancel_sent = false;
         loop {
-            self.flush_controls()?;
+            self.flush_controls(request_id)?;
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
                 if !cancel_sent {
@@ -457,20 +470,41 @@ impl IsolatedWorker {
     }
 
     /// Handle for other threads (governor) to enqueue backend commands; the
-    /// running loop flushes them within one read slice.
-    pub fn controls(&self) -> Arc<Mutex<VecDeque<String>>> {
+    /// running loop flushes them within one read slice. Commands are scoped
+    /// to the request that was active when the governor decided them, so a
+    /// command can never silently execute during a different request.
+    pub fn controls(&self) -> Arc<Mutex<VecDeque<ControlCommand>>> {
         self.pending_controls.clone()
     }
 
-    /// Flush queued Control frames; called from the generate/score read loops
-    /// so mid-run commands reach the worker without contending for its lock.
-    fn flush_controls(&mut self) -> Result<()> {
-        let actions: Vec<String> = {
+    /// Commands dropped at request boundaries because their scope belonged
+    /// to an earlier request.
+    pub fn stale_controls_dropped(&self) -> u64 {
+        self.stale_controls_dropped
+    }
+
+    /// Flush queued Control frames for this request's scope; called from the
+    /// generate/score read loops so mid-run commands reach the worker
+    /// without contending for its lock. Commands scoped to another (older)
+    /// request are dropped and counted, never sent late.
+    fn flush_controls(&mut self, scope: &str) -> Result<()> {
+        let (actions, stale): (Vec<String>, usize) = {
             let mut queue = self.pending_controls.lock().map_err(|_| {
                 TuckmillError::new(ErrorCode::WorkerFailed, "control queue poisoned")
             })?;
-            queue.drain(..).collect()
+            let drained: Vec<ControlCommand> = queue.drain(..).collect();
+            let mut actions = Vec::new();
+            let mut stale = 0usize;
+            for cmd in drained {
+                if cmd.scope == scope {
+                    actions.push(cmd.action);
+                } else {
+                    stale += 1;
+                }
+            }
+            (actions, stale)
         };
+        self.stale_controls_dropped += stale as u64;
         for action in actions {
             WorkerFrame::Control { action }.write_to(&mut self.stream)?;
         }
@@ -595,8 +629,7 @@ mod tests {
     /// test is skipped rather than simulated.
     #[test]
     fn isolated_worker_round_trip_when_binary_available() {
-        let Ok(bin) = std::env::var("TUCKMILL_TEST_WORKER_BIN") else {
-            eprintln!("skipping: TUCKMILL_TEST_WORKER_BIN not set");
+        let Some(bin) = crate::test_worker_bin() else {
             return;
         };
         let dir = tempfile::tempdir().unwrap();
@@ -630,11 +663,10 @@ mod tests {
         // a governor `trim-caches` queued before/during generation produces a
         // ControlAck that lands mid-stream. The read loops must absorb it —
         // it used to abort the run as "unexpected frame".
-        worker
-            .controls()
-            .lock()
-            .unwrap()
-            .push_back("trim-caches".to_string());
+        worker.controls().lock().unwrap().push_back(ControlCommand {
+            scope: "r1".into(),
+            action: "trim-caches".into(),
+        });
 
         let cancel = Arc::new(AtomicBool::new(false));
         let pause = Arc::new(AtomicBool::new(false));
@@ -719,8 +751,7 @@ mod tests {
     /// that latencies are not measured after production already happened.
     #[test]
     fn isolated_worker_delay_option_is_measured() {
-        let Ok(bin) = std::env::var("TUCKMILL_TEST_WORKER_BIN") else {
-            eprintln!("skipping: TUCKMILL_TEST_WORKER_BIN not set");
+        let Some(bin) = crate::test_worker_bin() else {
             return;
         };
         let dir = tempfile::tempdir().unwrap();
@@ -788,5 +819,86 @@ mod tests {
             "supervisor wall {wall_ms} ms must not be below worker total {} ms",
             timing.total_ms
         );
+    }
+
+    /// Commands are scoped to the request that was active when the governor
+    /// decided them: a command whose request already ended is dropped at the
+    /// next flush (counted), never applied during a different request.
+    #[test]
+    fn stale_control_commands_never_cross_request_scopes() {
+        let Some(bin) = crate::test_worker_bin() else {
+            return;
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let mut worker =
+            IsolatedWorker::spawn(&bin, dir.path(), EngineKind::ReferenceTest).unwrap();
+        let mut plan = ExecutionPlan::new_skeleton(
+            tuckmill_manifest::Id::new("a".repeat(64)).unwrap(),
+            tuckmill_manifest::Id::new("b".repeat(64)).unwrap(),
+            "qwen3".into(),
+        );
+        plan.mode = tuckmill_manifest::plan::ExecutionMode::Resident;
+        plan.context = tuckmill_manifest::plan::PlanContext::new(128, 16);
+        plan.plan_id = plan.compute_id().unwrap();
+        let artifact = ArtifactRef {
+            path: dir.path().join("fixture.bin").display().to_string(),
+            file_bytes: 0,
+            metadata_hash: "0".repeat(64),
+            tensor_index_hash: "0".repeat(64),
+            tokenizer_hash: None,
+            arch_id: Some("qwen3".into()),
+            content_hash: None,
+        };
+        worker.load(&plan, &artifact, None).unwrap();
+
+        {
+            let controls = worker.controls();
+            let mut queue = controls.lock().unwrap();
+            queue.push_back(ControlCommand {
+                scope: "previous-request".into(),
+                action: "trim-caches".into(),
+            });
+            queue.push_back(ControlCommand {
+                scope: "r1".into(),
+                action: "set-prefetch=off".into(),
+            });
+        }
+
+        let run = |worker: &mut IsolatedWorker, request_id: &str| {
+            let cancel = Arc::new(AtomicBool::new(false));
+            let pause = Arc::new(AtomicBool::new(false));
+            let mut on_token = |_i: u64, _t: &str| true;
+            let mut on_state = |_s: RunState| {};
+            worker
+                .generate(
+                    crate::engine::EngineRequest {
+                        request_id: request_id.into(),
+                        prompt_tokens: vec![1, 2, 3, 4],
+                        max_output_tokens: 4,
+                        stop: vec![],
+                        seed: 0,
+                        sampling: tuckmill_backend::SamplingPolicy::default(),
+                    },
+                    &cancel,
+                    &pause,
+                    &mut on_token,
+                    &mut on_state,
+                )
+                .unwrap()
+        };
+
+        // The stale-scope command is dropped; the r1-scope command is sent
+        // and acknowledged during r1 without failing the run.
+        let outcome = run(&mut worker, "r1");
+        assert_eq!(outcome.finish_reason, FinishReason::Length);
+        assert_eq!(
+            worker.stale_controls_dropped(),
+            1,
+            "the previous-request-scoped command must be dropped, not late-applied"
+        );
+        // Nothing left to drop for the next request.
+        let outcome = run(&mut worker, "r2");
+        assert_eq!(outcome.finish_reason, FinishReason::Length);
+        assert_eq!(worker.stale_controls_dropped(), 1);
     }
 }

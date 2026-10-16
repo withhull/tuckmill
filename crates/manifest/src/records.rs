@@ -297,17 +297,30 @@ pub enum CacheState {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PromptSample {
     pub prompt_id: String,
+    /// Time to the first *visible* content chunk: the user-experience TTFT.
     pub ttft_ms: f64,
+    /// Visible completion tokens from the worker's authoritative Done
+    /// frame: tokens with at least one byte of user-visible text. This is
+    /// NOT a count of streamed text chunks (`visible_chunks` is).
     pub committed_tokens: u32,
+    /// Raw sampled tokens from the worker's Done frame, including tokens a
+    /// stop sequence or EOS removed from the visible stream.
+    #[serde(default)]
+    pub generated_tokens: u32,
+    /// Text chunks delivered to the client (user-experience cadence).
+    #[serde(default)]
+    pub visible_chunks: u32,
     pub total_ms: f64,
+    /// Gaps between consecutive visible chunks (not token production).
     pub gap_p95_ms: f64,
     pub gap_max_ms: f64,
     pub footprint_peak_bytes: u64,
     pub logical_read_bytes: u64,
-    /// Decode-only throughput: committed tokens after the first, divided by
-    /// the time from the first committed token to the last. `None` when the
-    /// run produced fewer than two tokens. Never compare this with another
-    /// engine's end-to-end rate without saying which one is meant.
+    /// Decode-only model throughput: generated tokens after the first,
+    /// divided by the worker-measured first-to-last sampled-token span.
+    /// `None` when the backend reports no production timing or fewer than
+    /// two tokens were generated. Never compare this with another engine's
+    /// end-to-end rate without saying which one is meant.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub throughput_decode_tps: Option<f64>,
     /// Worker-side (backend-measured) request durations. The gap to the
@@ -331,10 +344,11 @@ pub struct PromptSample {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SummaryStats {
+    /// Median of TTFT to the first visible content chunk (user experience).
     pub ttft_median_ms: f64,
     pub ttft_p95_ms: f64,
-    /// End-to-end output throughput (committed tokens / total request time,
-    /// including the wait before the first token).
+    /// End-to-end model-token throughput (worker-generated tokens / total
+    /// request time, including the wait before the first token).
     pub throughput_median_tps: f64,
     /// Median decode-only throughput over samples that produced one. See
     /// `PromptSample::throughput_decode_tps`.

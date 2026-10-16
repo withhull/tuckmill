@@ -708,11 +708,10 @@ struct CompletionMeta {
 }
 
 fn tuckmill_extension(
-    runtime: &Runtime,
+    identity: &tuckmill_manifest::records::EngineIdentity,
     meta: &CompletionMeta,
     run: &crate::runtime::ActiveRun,
 ) -> serde_json::Value {
-    let identity = runtime.engine_identity();
     let mode = match &meta.spec.mode {
         RequestMode::Chat { template, .. } => serde_json::json!({
             "kind": "chat",
@@ -762,6 +761,13 @@ fn collect_json(
                 generated,
                 timing: _,
             }) => {
+                // The load completed before Done: read the run-scoped
+                // snapshot, never the busy worker's lock.
+                let identity = run
+                    .identity
+                    .get()
+                    .cloned()
+                    .unwrap_or_else(|| runtime.declared_identity());
                 let prompt_tokens = meta.spec.prompt_tokens.len() as u64;
                 let body = serde_json::json!({
                     "id": meta.completion_id,
@@ -780,11 +786,10 @@ fn collect_json(
                         "completion_tokens": committed,
                         "total_tokens": prompt_tokens + committed,
                     },
-                    "tuckmill": tuckmill_extension(runtime, meta, run),
+                    "tuckmill": tuckmill_extension(&identity, meta, run),
                 });
                 let mut body = body;
                 body["tuckmill"]["generated_tokens"] = serde_json::json!(generated);
-                let _ = runtime.status(); // keeps runtime alive for logging hooks
                 let _ = respond_json(stream, 200, "OK", &body);
                 return;
             }
@@ -836,6 +841,9 @@ fn stream_sse(
     let _ = stream.flush();
 
     let mut first = true;
+    // The engine identity is read from the run-scoped snapshot exactly
+    // once, at the first content chunk.
+    let mut identity: Option<tuckmill_manifest::records::EngineIdentity> = None;
     let mut role_sent = false;
     loop {
         match run.events.recv() {
@@ -850,7 +858,17 @@ fn stream_sse(
                     let _ = first;
                     first = false;
                 }
-                let identity = runtime.engine_identity();
+                // Read the resolved identity from the run-scoped snapshot
+                // once (it is published after the load, before any token).
+                // Querying the worker here would deadlock against the
+                // generation lock once the event channel fills (Gate B
+                // review finding 1).
+                let identity = identity.get_or_insert_with(|| {
+                    run.identity
+                        .get()
+                        .cloned()
+                        .unwrap_or_else(|| runtime.declared_identity())
+                });
                 let chunk = serde_json::json!({
                     "id": meta.completion_id,
                     "object": "chat.completion.chunk",
@@ -1315,6 +1333,209 @@ mod tests {
         // The stop token was generated (and billed honestly as generated),
         // but only visible tokens count as completion tokens.
         assert!(body["tuckmill"]["generated_tokens"].as_u64().unwrap() >= 2);
+
+        shutdown.store(true, Ordering::Relaxed);
+        let _ = handle.join();
+        runtime.shutdown();
+    }
+
+    #[test]
+    fn stop_completing_inside_a_single_piece_drops_the_trailing_text() {
+        // Gate B review finding 4: the stop completes before the end of the
+        // newest token's text; the visible prefix is released and the stop
+        // plus everything after it in that piece is dropped.
+        let (_dir, runtime, server, token) = test_server();
+        let addr = server.local_addr();
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let s2 = shutdown.clone();
+        let handle = std::thread::spawn(move || server.serve(s2));
+
+        let resp = chat_request(
+            addr,
+            &token,
+            &serde_json::json!({
+                "model": "local",
+                "messages": [{"role": "user", "content": "stop inside a piece"}],
+                "max_tokens": 5,
+                "stop": ["ref:1"]
+            }),
+        );
+        assert!(resp.contains("200"), "{resp}");
+        let body = response_json(&resp);
+        let text = body["choices"][0]["message"]["content"].as_str().unwrap();
+        assert_eq!(body["choices"][0]["finish_reason"], "stop");
+        assert_eq!(text, "[ref:0][");
+        assert!(!text.contains("ref:1"), "stop marker leaked: {text:?}");
+        // Both materialized pieces contributed visible bytes.
+        assert_eq!(body["usage"]["completion_tokens"], 2);
+
+        shutdown.store(true, Ordering::Relaxed);
+        let _ = handle.join();
+        runtime.shutdown();
+    }
+
+    /// Long-stream regression through the actual HTTP SSE endpoint with an
+    /// isolated worker (Gate B review finding 1): more than 256 streamed
+    /// chunks must arrive progressively while generation is still running —
+    /// the consumer must never block on the generating worker. Then a
+    /// disconnect must cancel promptly, and the worker must stay reused.
+    #[test]
+    fn long_sse_stream_never_waits_on_the_generating_worker() {
+        let Some(worker_exe) = crate::test_worker_bin() else {
+            return;
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let layout = StoreLayout::open(dir.path().join("store"));
+        let src = dir.path().join("m.gguf");
+        write_synthetic(&src, &SyntheticConfig::tiny_qwen3()).unwrap();
+        let registry = tuckmill_manifest::adapter::AdapterRegistry::builtin().unwrap();
+        tuckmill_store::import::import_local(
+            &layout,
+            &registry,
+            &src,
+            &tuckmill_store::import::ImportOptions {
+                alias: Some("local".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        // Test aid: a slow producer (2 ms/token) so "streaming while
+        // generating" is observable, not a burst after completion.
+        let execution = crate::options::ExecutionOptions {
+            per_token_delay_ms: Some(2),
+            ..Default::default()
+        };
+        let runtime = Runtime::open(RuntimeOptions {
+            data_dir: Some(layout.root().to_path_buf()),
+            engine_mode: crate::runtime::EngineMode::Isolated,
+            worker_exe: Some(worker_exe),
+            queue_capacity: 4,
+            default_budget: Some(Bytes::parse("2GiB").unwrap()),
+            default_context: 2048,
+            default_max_output: 64,
+            governor_poll: Duration::from_millis(200),
+            monitor: true,
+            allow_test_engine: true,
+            execution,
+            ..Default::default()
+        })
+        .unwrap();
+        let server = ApiServer::bind(runtime.clone(), 0, None).unwrap();
+        let token = server.token.clone();
+        let addr = server.local_addr();
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let s2 = shutdown.clone();
+        let handle = std::thread::spawn(move || server.serve(s2));
+
+        let status_text = |token: &str| -> String {
+            let req = format!(
+                "GET /control/status HTTP/1.1\r\nHost: 127.0.0.1\r\nAuthorization: Bearer {token}\r\nConnection: close\r\n\r\n"
+            );
+            let resp = raw_request(addr, &req);
+            resp.split("\r\n\r\n")
+                .nth(1)
+                .unwrap_or_default()
+                .to_string()
+        };
+
+        // 700 chunks per stream: far beyond the 256-event channel capacity.
+        let body = serde_json::json!({
+            "model": "local",
+            "messages": [{"role": "user", "content": "long stream"}],
+            "max_tokens": 700,
+            "stream": true,
+        })
+        .to_string();
+        let request = format!(
+            "POST /v1/chat/completions HTTP/1.1\r\nHost: 127.0.0.1\r\nAuthorization: Bearer {token}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+
+        let mut stream = TcpStream::connect(addr).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(30)))
+            .unwrap();
+        stream.write_all(request.as_bytes()).unwrap();
+        let mut reader = BufReader::new(stream);
+
+        let mut collected = String::new();
+        let mut saw_content_while_active = false;
+        loop {
+            let mut line = String::new();
+            let n = reader.read_line(&mut line).unwrap_or(0);
+            if n == 0 {
+                break;
+            }
+            collected.push_str(&line);
+            if !saw_content_while_active
+                && line.starts_with("data: ")
+                && line.contains("\"content\"")
+            {
+                // Generation is still running (700 tokens at >=2 ms each,
+                // the first chunk arrives after a few milliseconds): the
+                // status must report the request active while its content
+                // already flows.
+                let status: serde_json::Value =
+                    serde_json::from_str(&status_text(&token)).expect("status json");
+                assert!(
+                    status["active_request"].as_str().is_some(),
+                    "content arrived only at completion; status: {status}"
+                );
+                assert_eq!(status["active_state"].as_str(), Some("generating"));
+                saw_content_while_active = true;
+            }
+            if line.trim_end() == "data: [DONE]" {
+                break;
+            }
+        }
+        assert!(
+            saw_content_while_active,
+            "the stream produced no content chunks: {collected}"
+        );
+        assert!(
+            collected.contains("\"finish_reason\":\"length\""),
+            "stream must finish with length: {collected}"
+        );
+        assert!(
+            collected.contains("\"committed_tokens\":700"),
+            "all 700 tokens committed: {collected}"
+        );
+
+        // Disconnect responsiveness: read one chunk, drop the connection.
+        let mut stream = TcpStream::connect(addr).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(30)))
+            .unwrap();
+        stream.write_all(request.as_bytes()).unwrap();
+        let mut reader = BufReader::new(stream);
+        loop {
+            let mut line = String::new();
+            let n = reader.read_line(&mut line).unwrap_or(0);
+            if n == 0 || (line.starts_with("data: ") && line.contains("\"content\"")) {
+                break;
+            }
+        }
+        drop(reader);
+        let deadline = std::time::Instant::now() + Duration::from_secs(15);
+        loop {
+            let status: serde_json::Value =
+                serde_json::from_str(&status_text(&token)).expect("status json");
+            if status["active_request"].is_null() {
+                assert_eq!(status["worker_generation"], 1, "{status}");
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "cancellation not honoured: {status}"
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        // Server remains healthy and the worker stayed reused.
+        let health = raw_request(
+            addr,
+            "GET /healthz HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n",
+        );
+        assert!(health.contains("200"), "{health}");
 
         shutdown.store(true, Ordering::Relaxed);
         let _ = handle.join();

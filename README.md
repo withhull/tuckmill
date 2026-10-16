@@ -37,11 +37,19 @@ quality.
 > execute with the artifact's own template and typed sampling through the
 > worker: prompts are rendered by a byte-exact recognized Qwen3 template and
 > tokenized reference-first; completed stop sequences and EOS markers never
-> reach visible output, with visible (`committed`) and sampled (`generated`)
-> token counts tracked separately; the worker refuses to load when its live
+> reach visible output — including a stop completing inside a token's text
+> with trailing bytes — with visible (`committed`) and sampled (`generated`)
+> token counts tracked separately and byte provenance preserved for UTF-8
+> characters split across tokens; the worker refuses to load when its live
 > arenas exceed the plan's reservations (KV is priced at the executed
 > representation, 4 bytes per element in TuckCore); and equivalent requests
-> reuse one loaded model with isolated per-request state. See
+> reuse one loaded model with isolated per-request state — a reused request
+> allocates KV for its own admitted need, never for a larger prepared
+> capacity. HTTP streaming reads a request-scoped identity snapshot and can
+> never block on the generating worker; governor commands are scoped to the
+> request that was active when they were decided; benchmark throughput
+> counts model tokens from the worker's Done frame (record schema v4), with
+> visible-chunk cadence reported separately. See
 > [docs/certification-matrix.md](docs/certification-matrix.md) and
 > [docs/claims.md](docs/claims.md).
 
@@ -176,11 +184,18 @@ scripts/            build.sh, test.sh, demo.sh
 ## Verification and benchmarks
 
 `scripts/test.sh` runs formatting, `clippy -D warnings`, and the full test
-suite (336 tests),
+suite (351 tests),
 including adversarial GGUF/Safetensors fixtures, planner math, governor
 semantics, import/pack fault injection, worker-protocol framing, HTTP
-auth/SSE, CLI end-to-end runs (isolated worker, crash injection, SIGINT
-cancel, truncated/replaced payloads refused), and TuckCore equivalence.
+auth/SSE (including long streams through the real endpoint), CLI end-to-end
+runs (isolated worker, crash injection, SIGINT cancel, truncated/replaced
+payloads refused), and TuckCore equivalence. Test labels are explicit:
+portable tests always run; isolated-worker tests spawn the built binary and
+are mandatory in the gate (`TUCKMILL_TEST_WORKER_BIN`, with
+`TUCKMILL_REQUIRE_ISOLATED_WORKER=1` making a missing binary a failure, not
+a skip); real-weight reference tests (pinned llama.cpp library,
+`TUCKMILL_REAL_GGUF`) and physical-Mac qualification are separate,
+machine-local gates.
 `rust-toolchain.toml` pins Rust 1.96.0 and CI runs that same pinned
 toolchain — a floating stable once failed the remote gate on lints the local
 toolchain could not reproduce (run 38910541208). `scripts/demo.sh` exercises

@@ -41,9 +41,13 @@ payload := UTF-8 JSON, one message object
   `generated` alongside `committed`: `committed` counts tokens with visible
   bytes (stop/EOS-trimmed tokens are excluded), `generated` counts every
   sampled token id. `StatsAck` backend stats include `kv_state_bytes`, the
-  prepared KV-state bytes in the backend's actual representation; the
-  supervisor checks that number against the plan's KV reservation after
-  every load and fails closed on an understated plan.
+  prepared KV-state bytes in the backend's actual representation, plus
+  `session_kv_bytes`, the KV bytes allocated for the most recent request's
+  own admitted need; the supervisor checks the prepared number against the
+  plan's KV reservation after every load and fails closed on an understated
+  plan. `Control` frames are request-scoped on the supervisor side: a
+  command whose request already ended is dropped (counted), never replayed
+  into a later request.
 - Clean EOF before the first byte of a frame closes the session. EOF mid-frame
   is `WORKER_FAILED`.
 - All fields are validated before use; unknown message tags are protocol
