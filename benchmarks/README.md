@@ -62,8 +62,18 @@ fixture weights, context 2048:
 | TuckCore (scalar f32 oracle) | 72 ms | 314 tok/s | 7.2 MiB |
 | llama.cpp b11695 (CPU via tm shim) | 1.6 ms | 6412 tok/s | 86.8 MiB |
 
-These exercise the harness and provide a kernel-work baseline; they say
-nothing about real-model behavior (untrained fixture weights, tiny shapes).
+Real-model Stage A smoke (same machine, release, Qwen3-0.6B Q8_0, 16 in /
+8 out, ctx 2048):
+
+| Engine | ttft | throughput | footprint peak |
+| --- | --- | --- | --- |
+| TuckCore (scalar oracle, llama-cpu profile) | 18.4 s | 0.3 tok/s | 1.1 GiB |
+| llama.cpp b11695 (CPU via tm shim) | 1.2 s | 6.5 tok/s | 964 MiB |
+
+These exercise the harness and measure the kernel gap that K01–K03 must close;
+they are single-run smoke numbers, not controlled comparisons (no ABBA, no
+warm/cold controls, no foreground matching). Fixture numbers say nothing about
+real-model behavior (untrained tiny weights).
 Repetition 1 includes worker spawn and model load, which shows up in the p95
 values; `serve` keeps workers warm. Kernel work (K01–K09) is accepted only
 against measured gaps on real models, not against these numbers.

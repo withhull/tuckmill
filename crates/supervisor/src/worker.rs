@@ -327,19 +327,49 @@ impl IsolatedWorker {
             positions: positions.to_vec(),
         }
         .write_to(&mut self.stream)?;
-        let mut out = Vec::with_capacity(positions.len());
+        let mut out: Vec<(u64, Vec<f32>)> = Vec::with_capacity(positions.len());
         loop {
             match self.read_frame_timed(FRAME_TIMEOUT)? {
-                Some(WorkerFrame::ScoreChunk { position, logits }) => {
-                    out.push((position, logits));
-                }
+                Some(WorkerFrame::ScoreChunk {
+                    position,
+                    offset,
+                    logits,
+                }) => match out.last_mut() {
+                    Some((last_position, buffer)) if *last_position == position => {
+                        if offset as usize != buffer.len() {
+                            return Err(TuckmillError::new(
+                                    ErrorCode::WorkerFailed,
+                                    format!(
+                                        "score chunk gap for position {position}: offset {offset} after {} values",
+                                        buffer.len()
+                                    ),
+                                ));
+                        }
+                        buffer.extend_from_slice(&logits);
+                    }
+                    _ => {
+                        if offset != 0 {
+                            return Err(TuckmillError::new(
+                                    ErrorCode::WorkerFailed,
+                                    format!(
+                                        "score chunks for position {position} started at offset {offset}"
+                                    ),
+                                ));
+                        }
+                        out.push((position, logits));
+                    }
+                },
+                Some(WorkerFrame::Heartbeat { .. }) => {}
                 Some(WorkerFrame::ScoreDone { scored }) => {
-                    if scored as usize != out.len() && scored as usize != positions.len() {
+                    let matches_request = out.len() == scored as usize
+                        && out.iter().map(|(p, _)| *p).eq(positions.iter().copied());
+                    if !matches_request {
                         return Err(TuckmillError::new(
                             ErrorCode::WorkerFailed,
                             format!(
-                                "worker scored {scored} positions but streamed {}",
-                                out.len()
+                                "worker scored {scored} positions but streamed {} (expected {:?})",
+                                out.len(),
+                                positions
                             ),
                         ));
                     }

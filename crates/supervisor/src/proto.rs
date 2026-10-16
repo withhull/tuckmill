@@ -80,9 +80,13 @@ pub enum WorkerFrame {
         tokens: Vec<u32>,
         positions: Vec<u64>,
     },
-    /// Logits for one scored position (vocabulary-order, f32).
+    /// Logits for one scored position (vocabulary-order, f32). A position's
+    /// logits may arrive as several frames: `offset` is the element index of
+    /// the first value in this frame, so real vocabularies (150k+) stay under
+    /// the 1 MiB frame cap.
     ScoreChunk {
         position: u64,
+        offset: u32,
         logits: Vec<f32>,
     },
     ScoreDone {
@@ -251,6 +255,7 @@ mod tests {
             },
             WorkerFrame::ScoreChunk {
                 position: 1,
+                offset: 0,
                 logits: vec![0.5, -1.0, 2.0],
             },
             WorkerFrame::ScoreDone { scored: 2 },

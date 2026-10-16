@@ -23,6 +23,10 @@ const HEARTBEAT_INTERVAL: Duration = Duration::from_millis(500);
 /// Bounds for scoring requests (PRD §15: bounded evaluation interface).
 const MAX_SCORE_TOKENS: usize = 16384;
 const MAX_SCORE_POSITIONS: usize = 64;
+/// Logits per ScoreChunk frame. JSON floats worst-case ~24 bytes each, so
+/// 16k floats stay far under the 1 MiB cap while a 150k+ vocabulary streams
+/// in a handful of frames.
+const SCORE_CHUNK_FLOATS: usize = 16_384;
 
 fn make_backend(kind: EngineKind) -> Box<dyn InferenceBackend> {
     match kind {
@@ -217,6 +221,10 @@ fn serve(mut stream: UnixStream, kind: EngineKind) -> Result<()> {
                     tokens,
                     positions,
                 } => {
+                    // Scoring can hold one position in compute for a long
+                    // time (a real model through the scalar oracle); emit a
+                    // heartbeat before each frame so supervisor liveness
+                    // tracking stays honest without loosening the timeout.
                     if !loaded {
                         WorkerFrame::Error {
                             code: ErrorCode::WorkerFailed.as_str().into(),
@@ -242,18 +250,25 @@ fn serve(mut stream: UnixStream, kind: EngineKind) -> Result<()> {
                     }
                     let mut write_failed = false;
                     let result = engine.score(&tokens, &positions, &mut |position, logits| {
-                        match (WorkerFrame::ScoreChunk {
-                            position,
-                            logits: logits.to_vec(),
-                        })
-                        .write_to(&mut stream)
-                        {
-                            Ok(()) => true,
-                            Err(_) => {
+                        let heartbeat = WorkerFrame::Heartbeat {
+                            uptime_ms: started.elapsed().as_millis() as u64,
+                        };
+                        if heartbeat.write_to(&mut stream).is_err() {
+                            write_failed = true;
+                            return false;
+                        }
+                        for (i, chunk) in logits.chunks(SCORE_CHUNK_FLOATS).enumerate() {
+                            let frame = WorkerFrame::ScoreChunk {
+                                position,
+                                offset: (i * SCORE_CHUNK_FLOATS) as u32,
+                                logits: chunk.to_vec(),
+                            };
+                            if frame.write_to(&mut stream).is_err() {
                                 write_failed = true;
-                                false
+                                return false;
                             }
                         }
+                        true
                     });
                     match result {
                         Ok(scored) => {
@@ -613,6 +628,36 @@ mod tests {
             WorkerFrame::Error { code, .. } => assert_eq!(code, "UNAVAILABLE"),
             other => panic!("expected Error, got {other:?}"),
         }
+
+        // Chunked score frames: a 152k-logit row must serialize in bounded
+        // frames (the Stage A vocabulary bug this split fixes).
+        let big: Vec<f32> = (0..152_000).map(|i| i as f32 * 1e-3).collect();
+        let chunks: Vec<WorkerFrame> = big
+            .chunks(SCORE_CHUNK_FLOATS)
+            .enumerate()
+            .map(|(i, c)| WorkerFrame::ScoreChunk {
+                position: 7,
+                offset: (i * SCORE_CHUNK_FLOATS) as u32,
+                logits: c.to_vec(),
+            })
+            .collect();
+        assert!(chunks.len() >= 9, "152k floats split into >=9 frames");
+        for frame in &chunks {
+            let encoded = frame.encode().unwrap();
+            assert!(
+                encoded.len() as u32 <= crate::proto::MAX_FRAME_BYTES,
+                "frame of {} bytes must stay under the cap",
+                encoded.len()
+            );
+        }
+        let total: usize = chunks
+            .iter()
+            .map(|f| match f {
+                WorkerFrame::ScoreChunk { logits, .. } => logits.len(),
+                _ => 0,
+            })
+            .sum();
+        assert_eq!(total, big.len(), "no logits lost in chunking");
 
         WorkerFrame::Shutdown.write_to(&mut stream).unwrap();
         match WorkerFrame::read_from(&mut stream).unwrap() {

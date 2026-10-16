@@ -523,6 +523,74 @@ mod tests {
     }
 
     #[test]
+    fn q8_row_decodes_identically_to_the_llama_quantized_f16_twin() {
+        // Cross-decoder probe: llama-quantize produced the F16 file by
+        // decoding the Q8_0 file with llama.cpp's own reader. If our Q8_0
+        // decode matches the F16 twin row-for-row (within f16 rounding),
+        // our interpretation of real Q8_0 blocks is correct.
+        let (Ok(q8_path), Ok(f16_path)) = (
+            std::env::var("TUCKMILL_Q8_GGUF"),
+            std::env::var("TUCKMILL_F16_GGUF"),
+        ) else {
+            eprintln!("skipping: set TUCKMILL_Q8_GGUF and TUCKMILL_F16_GGUF");
+            return;
+        };
+        let open = |path: &str| -> BlockLoader {
+            let insp = tuckmill_manifest::gguf::inspect(
+                std::path::Path::new(path),
+                &tuckmill_manifest::gguf::Limits::default(),
+            )
+            .unwrap();
+            let policy = BlockPolicy::default();
+            let tensors: Vec<TensorEntry> = insp
+                .tensors
+                .iter()
+                .map(|t| {
+                    let row = tensor::row_geometry(t.type_id, &t.dims, policy.block_bytes);
+                    let chunks = match &row {
+                        Some(r) => r.rows.div_ceil(r.rows_per_chunk),
+                        None => t.byte_size.div_ceil(policy.block_bytes),
+                    };
+                    TensorEntry {
+                        name: t.name.clone(),
+                        type_id: t.type_id,
+                        dims: t.dims.clone(),
+                        rel_offset: t.offset,
+                        byte_size: t.byte_size,
+                        row,
+                        chunks,
+                    }
+                })
+                .collect();
+            BlockLoader::open(std::path::Path::new(path), insp.data_start, tensors, policy).unwrap()
+        };
+        let q8 = open(&q8_path);
+        let f16 = open(&f16_path);
+        let q8_idx = q8.tensor_index("token_embd.weight").unwrap();
+        let f16_idx = f16.tensor_index("token_embd.weight").unwrap();
+        assert_eq!(q8.entry(q8_idx).type_id, 8, "expected Q8_0 source");
+        assert_eq!(f16.entry(f16_idx).type_id, 1, "expected F16 twin");
+
+        let mut worst = 0.0f32;
+        for row in [0u64, 1, 1000, 12345, 151935] {
+            let raw = q8.read_rows_direct(q8_idx, row, 1).unwrap();
+            let mut q8_vals = Vec::new();
+            tensor::dequant_into(8, &raw, &mut q8_vals).unwrap();
+            let raw16 = f16.read_rows_direct(f16_idx, row, 1).unwrap();
+            let mut f16_vals = Vec::new();
+            tensor::dequant_into(1, &raw16, &mut f16_vals).unwrap();
+            assert_eq!(q8_vals.len(), f16_vals.len());
+            for (a, b) in q8_vals.iter().zip(f16_vals.iter()) {
+                worst = worst.max((a - b).abs());
+            }
+        }
+        assert!(
+            worst < 1e-2,
+            "Q8_0 decode diverges from llama.cpp's own decode: worst |Δ| = {worst}"
+        );
+    }
+
+    #[test]
     fn bounds_are_validated() {
         let policy = BlockPolicy {
             block_bytes: 1,

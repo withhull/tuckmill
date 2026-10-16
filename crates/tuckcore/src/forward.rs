@@ -14,7 +14,7 @@ use tuckmill_manifest::gguf::GgufInspection;
 use crate::completion::CompletionTracker;
 use crate::loader::{BlockLoader, TensorEntry};
 use crate::model::{Qwen3Config, TensorNames};
-use crate::tensor;
+use crate::tensor::{self, f16_to_f32, f32_to_f16_bits, quantize_row_q8_0};
 
 /// Small tensors dequantized once at load: norms and the RoPE table.
 #[derive(Debug)]
@@ -225,11 +225,44 @@ impl KvState {
     }
 }
 
+/// Declared numerical profile for weight×activation products.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum NumericalProfile {
+    /// Exact f32 scalar arithmetic: activations stay f32, weights are
+    /// dequantized exactly. The most precise path; the oracle.
+    OracleF32,
+    /// Mirrors llama.cpp CPU kernels (pinned b11695): activations are
+    /// quantized per weight dtype — q8_0 (amax/127, f16 scale, nearest-even)
+    /// for Q8_0 weights, f16 rounding for F16 weights — and dots accumulate
+    /// per block. This is the profile under which TuckCore and llama.cpp can
+    /// be compared as the same declared numerical contract.
+    LlamaCpu,
+}
+
+impl NumericalProfile {
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "oracle-f32" => Some(Self::OracleF32),
+            "llama-cpu" => Some(Self::LlamaCpu),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::OracleF32 => "oracle-f32",
+            Self::LlamaCpu => "llama-cpu",
+        }
+    }
+}
+
 /// The forward executor: streams weights, computes one token at a time.
 pub struct Forward<'a> {
     pub loader: &'a BlockLoader,
     pub tracker: &'a CompletionTracker,
     pub weights: &'a ModelWeights,
+    pub profile: NumericalProfile,
 }
 
 /// Cancellation hook checked between layers and chunks.
@@ -421,6 +454,33 @@ impl<'a> Forward<'a> {
             ));
         }
         out.resize(row.rows as usize, 0.0);
+        if self.profile == NumericalProfile::LlamaCpu {
+            match entry.type_id {
+                8 => {
+                    return self.matvec_q8_0_llama_cpu(
+                        tensor,
+                        x,
+                        out,
+                        row.elems_per_row as usize,
+                        row.bytes_per_row as usize,
+                        row.rows_per_chunk,
+                        cancelled,
+                    )
+                }
+                1 => {
+                    return self.matvec_f16_llama_cpu(
+                        tensor,
+                        x,
+                        out,
+                        row.elems_per_row as usize,
+                        row.bytes_per_row as usize,
+                        row.rows_per_chunk,
+                        cancelled,
+                    )
+                }
+                _ => {}
+            }
+        }
         let mut scratch: Vec<f32> = Vec::new();
         for chunk in 0..entry.chunks {
             if cancelled() {
@@ -451,6 +511,145 @@ impl<'a> Forward<'a> {
             self.loader.unpin(tensor, chunk as u32);
             result?;
         }
+        Ok(())
+    }
+
+    /// Per-block Q8_0 dot body (kept as a method: borrow discipline around
+    /// the completion fence is easier to audit without a closure).
+    #[allow(clippy::too_many_arguments)]
+    fn q8_block_dot(
+        &self,
+        bytes: &[u8],
+        bytes_per_row: usize,
+        rows_per_chunk: u64,
+        chunk: u64,
+        x_qs: &[[i8; 32]],
+        x_d: &[f32],
+        out: &mut [f32],
+    ) -> Result<()> {
+        let rows_in_block = bytes.len() / bytes_per_row;
+        let first_row = (chunk * rows_per_chunk) as usize;
+        for r in 0..rows_in_block {
+            let row_bytes = &bytes[r * bytes_per_row..(r + 1) * bytes_per_row];
+            let mut acc = 0.0f32;
+            for (blk, b) in row_bytes.chunks_exact(34).enumerate() {
+                let d_w = f16_to_f32(u16::from_le_bytes([b[0], b[1]]));
+                let qx = &x_qs[blk];
+                let mut sumi: i32 = 0;
+                for i in 0..32 {
+                    sumi += (b[2 + i] as i8 as i32) * (qx[i] as i32);
+                }
+                let d = d_w * x_d[blk];
+                acc += d * (sumi as f32);
+            }
+            out[first_row + r] = acc;
+        }
+        Ok(())
+    }
+
+    /// Per-block F16 dot body (f16-rounded activations, f32 accumulation).
+    fn f16_block_dot(
+        &self,
+        bytes: &[u8],
+        bytes_per_row: usize,
+        rows_per_chunk: u64,
+        chunk: u64,
+        x16: &[f32],
+        out: &mut [f32],
+    ) -> Result<()> {
+        let rows_in_block = bytes.len() / bytes_per_row;
+        let first_row = (chunk * rows_per_chunk) as usize;
+        for r in 0..rows_in_block {
+            let row_bytes = &bytes[r * bytes_per_row..(r + 1) * bytes_per_row];
+            let mut acc = 0.0f32;
+            for (i, pair) in row_bytes.chunks_exact(2).enumerate() {
+                let w = f16_to_f32(u16::from_le_bytes([pair[0], pair[1]]));
+                acc += w * x16[i];
+            }
+            out[first_row + r] = acc;
+        }
+        Ok(())
+    }
+
+    /// Q8_0 weights × q8_0-quantized activations, mirroring ggml's
+    /// `quantize_row_q8_0` + int32 block dot with an f16-rounded scale.
+    #[allow(clippy::too_many_arguments)]
+    fn matvec_q8_0_llama_cpu(
+        &self,
+        tensor: usize,
+        x: &[f32],
+        out: &mut [f32],
+        elems_per_row: usize,
+        bytes_per_row: usize,
+        rows_per_chunk: u64,
+        cancelled: CancelledFn<'_>,
+    ) -> Result<()> {
+        let mut x_qs: Vec<[i8; 32]> = Vec::new();
+        let mut x_d: Vec<f32> = Vec::new();
+        quantize_row_q8_0(x, &mut x_qs, &mut x_d);
+        let entry = self.loader.entry(tensor);
+        for chunk in 0..entry.chunks {
+            if cancelled() {
+                return Err(cancelled_error());
+            }
+            let block = self.loader.block(tensor, chunk as u32)?;
+            self.loader.pin(tensor, chunk as u32);
+            let fence = self.tracker.submit(vec![block.clone()]);
+            let result = self.q8_block_dot(
+                &block.bytes,
+                bytes_per_row,
+                rows_per_chunk,
+                chunk,
+                &x_qs,
+                &x_d,
+                out,
+            );
+            let released = self.tracker.complete(fence);
+            debug_assert!(released.is_some());
+            self.loader.unpin(tensor, chunk as u32);
+            result?;
+        }
+        let _ = elems_per_row;
+        Ok(())
+    }
+
+    /// F16 weights × f16-rounded activations with f32 accumulation, mirroring
+    /// ggml's F16 CPU dot (activations are converted to the weight's
+    /// `vec_dot_type` before the dot).
+    #[allow(clippy::too_many_arguments)]
+    fn matvec_f16_llama_cpu(
+        &self,
+        tensor: usize,
+        x: &[f32],
+        out: &mut [f32],
+        elems_per_row: usize,
+        bytes_per_row: usize,
+        rows_per_chunk: u64,
+        cancelled: CancelledFn<'_>,
+    ) -> Result<()> {
+        let x16: Vec<f32> = x.iter().map(|v| f16_to_f32(f32_to_f16_bits(*v))).collect();
+        let entry = self.loader.entry(tensor);
+        for chunk in 0..entry.chunks {
+            if cancelled() {
+                return Err(cancelled_error());
+            }
+            let block = self.loader.block(tensor, chunk as u32)?;
+            self.loader.pin(tensor, chunk as u32);
+            let fence = self.tracker.submit(vec![block.clone()]);
+            let result = self.f16_block_dot(
+                &block.bytes,
+                bytes_per_row,
+                rows_per_chunk,
+                chunk,
+                &x16,
+                out,
+            );
+            let released = self.tracker.complete(fence);
+            debug_assert!(released.is_some());
+            self.loader.unpin(tensor, chunk as u32);
+            result?;
+        }
+        let _ = elems_per_row;
         Ok(())
     }
 
@@ -642,6 +841,7 @@ mod tests {
             loader: &f.loader,
             tracker: &f.tracker,
             weights: &f.weights,
+            profile: NumericalProfile::OracleF32,
         };
         let tokens = [1u32, 2, 3];
         let a = fwd.logits_at(&tokens, 2, &|| false).unwrap();
@@ -669,6 +869,7 @@ mod tests {
             loader: &resident.loader,
             tracker: &resident.tracker,
             weights: &resident.weights,
+            profile: NumericalProfile::OracleF32,
         }
         .logits_at(&tokens, 3, &|| false)
         .unwrap();
@@ -676,6 +877,7 @@ mod tests {
             loader: &streamed.loader,
             tracker: &streamed.tracker,
             weights: &streamed.weights,
+            profile: NumericalProfile::OracleF32,
         }
         .logits_at(&tokens, 3, &|| false)
         .unwrap();
@@ -701,10 +903,47 @@ mod tests {
             loader: &f.loader,
             tracker: &f.tracker,
             weights: &f.weights,
+            profile: NumericalProfile::OracleF32,
         };
         let err = fwd.logits_at(&[1, 2, 3], 2, &|| true).unwrap_err();
         assert_eq!(err.code(), ErrorCode::Cancelled);
         assert_eq!(f.tracker.in_flight(), 0, "no leases leak on cancellation");
+    }
+
+    #[test]
+    fn llama_cpu_profile_stays_close_to_the_oracle_on_the_fixture() {
+        let f = fixture(BlockPolicy {
+            block_bytes: 64 * 1024,
+            cache_bytes: 4 << 20,
+        });
+        let tokens = [5u32, 9, 13];
+        let oracle = Forward {
+            loader: &f.loader,
+            tracker: &f.tracker,
+            weights: &f.weights,
+            profile: NumericalProfile::OracleF32,
+        }
+        .logits_at(&tokens, 2, &|| false)
+        .unwrap();
+        let llama = Forward {
+            loader: &f.loader,
+            tracker: &f.tracker,
+            weights: &f.weights,
+            profile: NumericalProfile::LlamaCpu,
+        }
+        .logits_at(&tokens, 2, &|| false)
+        .unwrap();
+        assert_eq!(oracle.len(), llama.len());
+        let max_diff = oracle
+            .iter()
+            .zip(llama.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            max_diff < 0.05,
+            "profiles must agree on the fixture: {max_diff}"
+        );
+        assert_eq!(f.tracker.in_flight(), 0);
     }
 
     #[test]
@@ -714,6 +953,7 @@ mod tests {
             loader: &f.loader,
             tracker: &f.tracker,
             weights: &f.weights,
+            profile: NumericalProfile::OracleF32,
         };
         let err = fwd.logits_at(&[999_999], 0, &|| false).unwrap_err();
         assert_eq!(err.code(), ErrorCode::InvalidRequest);
@@ -726,6 +966,7 @@ mod tests {
             loader: &f.loader,
             tracker: &f.tracker,
             weights: &f.weights,
+            profile: NumericalProfile::OracleF32,
         };
         assert!(fwd.logits_at(&[1, 2], 5, &|| false).is_err());
         assert!(fwd.logits_at(&[], 0, &|| false).is_err());

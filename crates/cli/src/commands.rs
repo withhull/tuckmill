@@ -99,6 +99,7 @@ pub fn dispatch(cmd: &Cmd, json: bool, data_dir: Option<&Path>) -> Result<ExitCo
             generate,
             reference,
             tolerance,
+            tuckcore_profile,
         } => verify(
             model,
             memory_budget.as_deref(),
@@ -107,6 +108,7 @@ pub fn dispatch(cmd: &Cmd, json: bool, data_dir: Option<&Path>) -> Result<ExitCo
             *generate,
             *reference,
             *tolerance,
+            tuckcore_profile,
             json,
             data_dir,
         ),
@@ -1106,6 +1108,7 @@ fn verify(
     generate: u64,
     reference: bool,
     tolerance: f64,
+    tuckcore_profile: &str,
     json: bool,
     data_dir: Option<&Path>,
 ) -> Result<ExitCode> {
@@ -1119,10 +1122,24 @@ fn verify(
         &runtime.layout.artifact_payload_path(&artifact.artifact_id),
     );
     let report = if reference {
+        let profile = tuckmill_tuckcore::forward::NumericalProfile::parse(tuckcore_profile)
+            .ok_or_else(|| {
+                TuckmillError::new(
+                    ErrorCode::InvalidRequest,
+                    format!(
+                        "unknown tuckcore profile {tuckcore_profile:?}; use \"llama-cpu\" or \"oracle-f32\""
+                    ),
+                )
+            })?;
         let options = tuckmill_supervisor::verify::ReferenceCompareOptions {
             max_score_positions: positions,
             generate_tokens: generate,
-            max_abs_tolerance: tolerance,
+            max_abs_tolerance: if tolerance > 0.0 {
+                Some(tolerance)
+            } else {
+                None
+            },
+            tuckcore_profile: profile,
             ..Default::default()
         };
         runtime.run_reference_comparison(&plan, &artifact_ref, &options)?

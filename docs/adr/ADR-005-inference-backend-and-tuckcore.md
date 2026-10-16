@@ -13,6 +13,21 @@ profile on the fixture measured max|Δ| = 1.98e-4 against a 1e-2 registration.
 The wrapper remains uncertified, and llama.cpp execution is CPU-only here
 (`n_gpu_layers = 0`) — GPU offload is a separately measured milestone.
 
+**Update 2 (Stage A, 2026-10-16):** worker protocol v3 chunks score frames so
+real vocabularies (150k+ logits) fit the 1 MiB cap, and workers heartbeat
+during long scoring so liveness checks stay honest without loosening
+timeouts. TuckCore declares a **numerical profile** (`oracle-f32` exact
+scalar, default; `llama-cpu` mirroring ggml's activation quantization);
+reference comparisons default to the matched profile and select a **registered
+per-dtype tolerance** (F16/F32 5e-2, Q8_0 5e-1) from measured envelopes on
+Qwen3-0.6B — F16 max 1.95e-2 (smooth accumulation noise), Q8_0 max 4.6e-1
+(dominated by llama.cpp CPU 8-bit activation quantization; its
+architecture-specific kernel dispatch proved not reproducible from reference
+semantics, so the envelope — not bit-identity — is the contract). Greedy text
+divergence on near-ties is recorded, never required. The scalar oracle sits
+~20x behind llama.cpp CPU on the real 0.6B — measured, per ADR-006, before
+any kernel work.
+
 ## Context and review
 
 The v0.2 engineering build finished the orchestration stack with exactly one

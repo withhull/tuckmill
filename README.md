@@ -11,16 +11,18 @@ quality.
 
 > **Build status (read this first).** The orchestration stack is implemented
 > and tested: inspection, planning, admission, storage, packing, worker
-> isolation, the local API, and the benchmark harness. Two backends exist
-> (ADR-005): the *reference test engine* (synthetic output, `--allow-test-engine`)
-> and **TuckCore**, an experimental executor with a versioned backend
-> interface that runs **real weights** for dense Qwen3 GGUF through scalar f32
-> reference kernels — bounded block streaming, explicit buffer ownership,
-> completion-fenced release, artifact identity verified before execution.
-> TuckCore is **uncertified**: no Metal kernels (K01–K09 are specified), no
-> performance claim, no text tokenizer yet (prompts map deterministically into
-> the artifact's vocabulary; the limitation is labeled everywhere it applies).
-> Nothing in this repository is certified; see
+> isolation, the local API, and the benchmark harness. Three backends exist
+> (ADR-005): the *reference test engine* (synthetic output,
+> `--allow-test-engine`), **TuckCore** (experimental executor for dense Qwen3:
+> bounded block streaming, explicit buffer ownership, completion-fenced
+> release, artifact identity verified before execution, real byte-level BPE
+> tokenization), and the **pinned llama.cpp reference** (`--engine llama`,
+> runtime-loaded, never vendored). Stage A is underway: Qwen3-0.6B executes
+> end-to-end on real weights, `verify --reference` records teacher-forced
+> logits under registered per-dtype tolerances, and the scalar oracle's gap
+> to llama.cpp CPU is measured (that gap, not vibes, names the kernel work).
+> Nothing is certified; no Metal kernels exist (K01–K09 specified); no
+> performance comparative claim is made. See
 > [docs/certification-matrix.md](docs/certification-matrix.md) and
 > [docs/claims.md](docs/claims.md).
 
@@ -38,7 +40,8 @@ tuckmill import model.gguf --alias my-model      # atomic, resumable, verified
 tuckmill plan my-model                           # R+U+H<=B admission, mode, assumptions
 tuckmill run my-model --prompt "explain RoPE" --engine tuckcore   # real weights
 tuckmill verify my-model                         # residency/streaming equivalence
-tuckmill verify my-model --reference             # llama.cpp vs TuckCore logits (needs TUCKMILL_LLAMA_LIB)
+tuckmill verify my-model --reference             # llama.cpp vs TuckCore logits (needs TUCKMILL_LLAMA_LIB);
+                                                 # registered per-dtype tolerances
 tuckmill run my-model --allow-test-engine        # synthetic pipeline run
 tuckmill bench my-model --engine tuckcore        # machine-readable record
 tuckmill serve --allow-test-engine               # loopback API (127.0.0.1:8378)

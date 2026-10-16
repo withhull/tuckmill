@@ -38,5 +38,9 @@ pub const BACKEND_ABI_VERSION: u32 = 1;
 /// Version of the worker control protocol frames (native/executor/PROTOCOL.md).
 /// v2: Load carries an ArtifactRef + backend options; Score/ScoreChunk/
 /// ScoreDone provide bounded teacher-forced logits; StatsAck carries backend
-/// statistics (ADR-005). Plans recorded against v1 are PLAN_STALE.
-pub const WORKER_PROTOCOL_VERSION: u16 = 2;
+/// statistics (ADR-005).
+/// v3: ScoreChunk carries an `offset` and one position's logits stream in
+/// multiple frames sized for the 1 MiB cap — real vocabularies (150k+ logits)
+/// cannot fit a single JSON frame. Plans recorded against older versions are
+/// PLAN_STALE.
+pub const WORKER_PROTOCOL_VERSION: u16 = 3;

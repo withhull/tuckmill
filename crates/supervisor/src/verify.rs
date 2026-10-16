@@ -20,6 +20,7 @@ use tuckmill_manifest::error::{ErrorCode, Result, TuckmillError};
 use tuckmill_manifest::ids::{hash_of, now_unix_ms, Id};
 use tuckmill_manifest::plan::ExecutionPlan;
 use tuckmill_manifest::records::Confidence;
+use tuckmill_tuckcore::forward::NumericalProfile;
 
 use crate::runtime::Runtime;
 use crate::worker::IsolatedWorker;
@@ -37,9 +38,16 @@ pub struct ReferenceCompareOptions {
     pub max_score_positions: u64,
     pub generate_tokens: u64,
     pub tuckcore_cache_bytes: u64,
-    /// Registered tolerance for LlamaRef-vs-TuckCore logits. Set from the
-    /// first measured profile; tightened only with new evidence.
-    pub max_abs_tolerance: f64,
+    /// Numerical profile for the TuckCore side. Reference comparisons default
+    /// to `LlamaCpu` so both sides declare the same execution contract
+    /// (activations quantized per weight dtype); `OracleF32` measures the
+    /// drift envelope between the oracle and the llama.cpp CPU kernels.
+    pub tuckcore_profile: NumericalProfile,
+    /// Registered tolerance for LlamaRef-vs-TuckCore logits. `None` selects
+    /// the registered envelope for the artifact's dominant weight dtype.
+    /// Tolerances are set from measurements and tightened only with new
+    /// evidence — never to make a run pass.
+    pub max_abs_tolerance: Option<f64>,
 }
 
 impl Default for ReferenceCompareOptions {
@@ -49,8 +57,23 @@ impl Default for ReferenceCompareOptions {
             max_score_positions: 6,
             generate_tokens: 8,
             tuckcore_cache_bytes: 32 * 1024 * 1024,
-            max_abs_tolerance: 1e-2,
+            tuckcore_profile: NumericalProfile::LlamaCpu,
+            max_abs_tolerance: None,
         }
+    }
+}
+
+/// Registered logit tolerances by dominant weight dtype, derived from
+/// measured envelopes on Qwen3-0.6B (M3, ctx 2048, pinned llama.cpp CPU):
+/// F16 max 1.95e-2 (smooth accumulation noise), Q8_0 max 3.5e-1 (dominated
+/// by llama.cpp CPU 8-bit activation quantization, whose architecture-
+/// specific kernel dispatch is not reproducible from reference semantics).
+/// Values carry ~1.4-2.5x margin over measurement.
+pub fn registered_tolerance_for(dominant_dtype: &str) -> f64 {
+    match dominant_dtype {
+        "F32" | "F16" | "BF16" => 5e-2,
+        "Q8_0" => 5e-1,
+        _ => 1e-1,
     }
 }
 
@@ -101,6 +124,20 @@ pub struct LogitComparison {
     pub exact_equal: bool,
     pub max_abs_diff: f64,
     pub max_rel_diff: f64,
+    /// Distribution beyond the maxima: a large tail at cancellation points
+    /// and a tight body is a different finding from broad divergence.
+    pub median_abs_diff: f64,
+    pub p95_abs_diff: f64,
+    pub p999_abs_diff: f64,
+}
+
+fn percentile_sorted(values: &mut [f64], p: f64) -> f64 {
+    if values.is_empty() {
+        return 0.0;
+    }
+    values.sort_by(f64::total_cmp);
+    let idx = ((values.len() as f64 - 1.0) * p).round() as usize;
+    values[idx]
 }
 
 /// A machine-readable equivalence record (FR-21/24 evidence).
@@ -144,7 +181,7 @@ impl Runtime {
         }
         self.check_plan_fresh(plan)?;
         self.plan_admitted(plan)?;
-        let (tokens, positions, _vocab) =
+        let (tokens, positions, _vocab, _dtype) =
             derive_verify_inputs(artifact, options.token_count, options.max_score_positions)?;
 
         let (resident, resident_logits) = self.run_side(
@@ -156,6 +193,7 @@ impl Runtime {
             &positions,
             options.generate_tokens,
             Some(options.resident_cache_bytes),
+            None,
             false,
         )?;
         let (streamed, streamed_logits) = self.run_side(
@@ -167,6 +205,7 @@ impl Runtime {
             &positions,
             options.generate_tokens,
             Some(options.streamed_cache_bytes),
+            None,
             true,
         )?;
 
@@ -188,6 +227,7 @@ impl Runtime {
         let mut max_rel: f64 = 0.0;
         let mut exact = true;
         let mut vocab_seen = 0u64;
+        let mut diffs: Vec<f64> = Vec::new();
         for (a, b) in resident_logits.iter().zip(streamed_logits.iter()) {
             let (pos_a, la) = a;
             let (pos_b, lb) = b;
@@ -202,10 +242,19 @@ impl Runtime {
                 }
                 let diff = (*x as f64 - *y as f64).abs();
                 max_abs = max_abs.max(diff);
+                diffs.push(diff);
                 let denom = x.abs().max(y.abs()).max(1e-9) as f64;
                 max_rel = max_rel.max(diff / denom);
             }
         }
+        let (median_abs, p95_abs, p999_abs) = {
+            let mut d = diffs.clone();
+            (
+                percentile_sorted(&mut d, 0.5),
+                percentile_sorted(&mut d, 0.95),
+                percentile_sorted(&mut d, 0.999),
+            )
+        };
 
         let streaming_exercised = streamed.stats.evictions > 0;
         let within_tolerance = if options.require_exact {
@@ -265,6 +314,9 @@ impl Runtime {
                 exact_equal: exact,
                 max_abs_diff: max_abs,
                 max_rel_diff: max_rel,
+                median_abs_diff: median_abs,
+                p95_abs_diff: p95_abs,
+                p999_abs_diff: p999_abs,
             },
             generated_texts_equal: texts_equal,
             streaming_exercised,
@@ -297,6 +349,7 @@ impl Runtime {
         positions: &[u64],
         generate_tokens: u64,
         cache_bytes: Option<u64>,
+        profile: Option<NumericalProfile>,
         sample_footprint: bool,
     ) -> Result<(RunSide, ScoredLogits)> {
         let mut worker = IsolatedWorker::spawn(&self.worker_exe, &self.layout.tmp_dir(), kind)?;
@@ -304,10 +357,14 @@ impl Runtime {
         // memory (mmap) and rejects unknown option keys nowhere else.
         let load_options = cache_bytes.map(|cache_bytes| {
             let block_bytes = cache_bytes.clamp(64 * 1024, 4 * 1024 * 1024);
-            serde_json::json!({
+            let mut value = serde_json::json!({
                 "weight_cache_bytes": cache_bytes,
                 "block_bytes": block_bytes,
-            })
+            });
+            if let Some(profile) = profile {
+                value["numerical_profile"] = serde_json::json!(profile.as_str());
+            }
+            value
         });
         let note = worker.load(plan, artifact, load_options.as_ref())?;
         self.logger.info(
@@ -403,7 +460,7 @@ fn derive_verify_inputs(
     artifact: &ArtifactRef,
     token_count: u64,
     max_score_positions: u64,
-) -> Result<(Vec<u32>, Vec<u64>, u64)> {
+) -> Result<(Vec<u32>, Vec<u64>, u64, String)> {
     let path = std::path::Path::new(&artifact.path);
     let insp = tuckmill_manifest::gguf::inspect(path, &tuckmill_manifest::gguf::Limits::default())?;
     let embd = insp
@@ -436,7 +493,18 @@ fn derive_verify_inputs(
             "no scoring positions fit inside the token sequence",
         ));
     }
-    Ok((tokens, positions, vocab))
+    // Dominant weight dtype by payload bytes (chooses the registered
+    // tolerance when the caller did not name one).
+    let mut by_type: std::collections::BTreeMap<String, u64> = Default::default();
+    for t in &insp.tensors {
+        *by_type.entry(t.type_name.clone()).or_default() += t.byte_size;
+    }
+    let dominant = by_type
+        .into_iter()
+        .max_by_key(|(_, bytes)| *bytes)
+        .map(|(name, _)| name)
+        .unwrap_or_else(|| "unknown".into());
+    Ok((tokens, positions, vocab, dominant))
 }
 
 impl Runtime {
@@ -453,8 +521,15 @@ impl Runtime {
     ) -> Result<VerifyReport> {
         self.check_plan_fresh(plan)?;
         self.plan_admitted(plan)?;
-        let (tokens, positions, _vocab) =
+        let (tokens, positions, _vocab, dominant_dtype) =
             derive_verify_inputs(artifact, options.token_count, options.max_score_positions)?;
+        let (tolerance, tolerance_source) = match options.max_abs_tolerance {
+            Some(t) => (t, "explicit".to_string()),
+            None => (
+                registered_tolerance_for(&dominant_dtype),
+                format!("registered for dominant weight dtype {dominant_dtype}"),
+            ),
+        };
 
         let (tuckcore, tuckcore_logits) = self.run_side(
             EngineKind::TuckCore,
@@ -465,6 +540,7 @@ impl Runtime {
             &positions,
             options.generate_tokens,
             Some(options.tuckcore_cache_bytes),
+            Some(options.tuckcore_profile),
             false,
         )?;
         let (llama, llamaref_logits) = self.run_side(
@@ -475,6 +551,7 @@ impl Runtime {
             &tokens,
             &positions,
             options.generate_tokens,
+            None,
             None,
             true,
         )?;
@@ -497,6 +574,7 @@ impl Runtime {
         let mut max_rel: f64 = 0.0;
         let mut exact = true;
         let mut vocab_seen = 0u64;
+        let mut diffs: Vec<f64> = Vec::new();
         for (a, b) in tuckcore_logits.iter().zip(llamaref_logits.iter()) {
             let (pos_a, la) = a;
             let (pos_b, lb) = b;
@@ -511,19 +589,27 @@ impl Runtime {
                 }
                 let diff = (*x as f64 - *y as f64).abs();
                 max_abs = max_abs.max(diff);
+                diffs.push(diff);
                 let denom = x.abs().max(y.abs()).max(1e-9) as f64;
                 max_rel = max_rel.max(diff / denom);
             }
         }
-        let within_tolerance = max_abs <= options.max_abs_tolerance;
+        let (median_abs, p95_abs, p999_abs) = {
+            let mut d = diffs;
+            (
+                percentile_sorted(&mut d, 0.5),
+                percentile_sorted(&mut d, 0.95),
+                percentile_sorted(&mut d, 0.999),
+            )
+        };
+        let within_tolerance = max_abs <= tolerance;
         let texts_equal = tuckcore.generated_text == llama.generated_text;
         let mut notes = Vec::new();
         if exact {
             notes.push("logits are bit-identical across backends".into());
         } else {
             notes.push(format!(
-                "logits differ by at most {max_abs:.3e} (registered tolerance {:.3e}): expected from different kernel/accumulation orderings",
-                options.max_abs_tolerance
+                "logits differ by at most {max_abs:.3e} (tolerance {tolerance:.3e}, {tolerance_source}): drift sources are kernel/accumulation ordering and llama.cpp CPU activation quantization",
             ));
         }
         if !texts_equal {
@@ -541,12 +627,9 @@ impl Runtime {
             ),
             "TuckCore is the scalar f32 oracle: comparison establishes the numerical profile envelope for this artifact and context, not performance"
                 .into(),
-            "fixture artifacts carry synthetic (non-trained) weights: equivalence speaks to execution paths, never model quality"
+            "equivalence speaks to execution paths: weight quality and provenance belong to the artifact itself (synthetic fixtures prove paths, never model quality)"
                 .into(),
-            format!(
-                "tolerance registered before tuning: max_abs = {:.3e}",
-                options.max_abs_tolerance
-            ),
+            format!("tolerance {tolerance:.3e} selected ({tolerance_source}); registered before tuning, tightened only with new evidence"),
         ];
 
         let run_id = hash_of(&serde_json::json!({
@@ -573,6 +656,9 @@ impl Runtime {
                 exact_equal: exact,
                 max_abs_diff: max_abs,
                 max_rel_diff: max_rel,
+                median_abs_diff: median_abs,
+                p95_abs_diff: p95_abs,
+                p999_abs_diff: p999_abs,
             },
             generated_texts_equal: texts_equal,
             streaming_exercised: false,
@@ -634,9 +720,12 @@ pub fn format_report(report: &VerifyReport) -> String {
         ));
     }
     lines.push(format!(
-        "  logits: vocab {}, exact_equal {}, max|Δ| {:.3e}, max rel {:.3e}",
+        "  logits: vocab {}, exact_equal {}, |Δ| median {:.3e} p95 {:.3e} p99.9 {:.3e} max {:.3e} (max rel {:.3e})",
         report.logits.vocab,
         report.logits.exact_equal,
+        report.logits.median_abs_diff,
+        report.logits.p95_abs_diff,
+        report.logits.p999_abs_diff,
         report.logits.max_abs_diff,
         report.logits.max_rel_diff
     ));

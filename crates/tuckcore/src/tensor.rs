@@ -115,6 +115,72 @@ pub fn dequant_into(type_id: u32, bytes: &[u8], out: &mut Vec<f32>) -> Result<us
     Ok(elems)
 }
 
+/// IEEE binary16 encoding with round-to-nearest-even (mirrors ggml's
+/// `GGML_CPU_FP32_TO_FP16` conversion used for activation scales and the
+/// llama.cpp-CPU numerical profile).
+pub fn f32_to_f16_bits(value: f32) -> u16 {
+    let bits = value.to_bits();
+    let sign = ((bits >> 16) & 0x8000) as u16;
+    let exp = ((bits >> 23) & 0xff) as i32 - 127 + 15;
+    let mant = bits & 0x7f_ffff;
+    if exp >= 0x1f {
+        // Overflow to inf (f16 range is exceeded): saturate like hardware.
+        return sign | 0x7c00;
+    }
+    if exp <= 0 {
+        if exp < -10 {
+            return sign; // underflow to zero
+        }
+        let m = mant | 0x80_0000;
+        let shift = (14 - exp) as u32;
+        let half = (m >> shift) & 0x3ff;
+        // Round-to-nearest-even on the dropped bits.
+        let rem = m & ((1 << shift) - 1);
+        let halfway = 1 << (shift - 1);
+        let round_up = rem > halfway || (rem == halfway && (half & 1) == 1);
+        let half = half + round_up as u32;
+        return sign | half as u16;
+    }
+    // Normal range: round-to-nearest-even on the 13 dropped mantissa bits.
+    let rounded = mant + 0x0fff + ((mant >> 13) & 1);
+    if rounded & 0x80_0000 != 0 {
+        let exp = exp + 1;
+        if exp >= 0x1f {
+            return sign | 0x7c00;
+        }
+        return sign | ((exp as u16) << 10);
+    }
+    sign | ((exp as u16) << 10) | ((rounded >> 13) as u16)
+}
+
+/// Quantize a row of activations to Q8_0 exactly as ggml's
+/// `quantize_row_q8_0` does: per 32-element block, `d = amax/127`, the
+/// stored scale is the f16 rounding of `d`, and values are
+/// round-to-nearest-even of `x * (1/d)`.
+pub fn quantize_row_q8_0(x: &[f32], blocks_qs: &mut Vec<[i8; 32]>, blocks_d: &mut Vec<f32>) {
+    blocks_qs.clear();
+    blocks_d.clear();
+    for chunk in x.chunks(32) {
+        let mut amax = 0.0f32;
+        for v in chunk {
+            amax = amax.max(v.abs());
+        }
+        let d = amax / 127.0;
+        let id = if d != 0.0 { 1.0 / d } else { 0.0 };
+        let d_f16 = f16_to_f32(f32_to_f16_bits(d));
+        let mut qs = [0i8; 32];
+        for (i, v) in chunk.iter().enumerate() {
+            let q = (v * id).round_ties_even().clamp(-127.0, 127.0) as i8;
+            qs[i] = q;
+        }
+        // Blocks shorter than 32 cannot occur for supported geometries (rows
+        // are validated block-aligned); if they did, callers would see the
+        // zero tail rather than corrupted data.
+        blocks_qs.push(qs);
+        blocks_d.push(d_f16);
+    }
+}
+
 fn unsupported(type_id: u32) -> TuckmillError {
     TuckmillError::new(
         ErrorCode::UnsupportedQuantization,
@@ -262,6 +328,43 @@ mod tests {
         let err = dequant_into(12, &[0u8; 144], &mut Vec::new()).unwrap_err();
         assert_eq!(err.code(), ErrorCode::UnsupportedQuantization);
         assert!(err.message().contains("F16"), "{}", err.message());
+    }
+
+    #[test]
+    fn f32_to_f16_matches_known_values() {
+        assert_eq!(f32_to_f16_bits(0.0), 0x0000);
+        assert_eq!(f32_to_f16_bits(1.0), 0x3c00);
+        assert_eq!(f32_to_f16_bits(-2.0), 0xc000);
+        assert_eq!(f32_to_f16_bits(65504.0), 0x7bff);
+        assert_eq!(f32_to_f16_bits(100000.0), 0x7c00, "saturates to inf");
+        assert_eq!(f32_to_f16_bits(5.96e-8), 0x0001, "smallest subnormal");
+        // Round-to-nearest-even: 1 + 2^-11 exactly halfway -> even mantissa.
+        let halfway = 1.0 + 2.0f32.powi(-11);
+        assert_eq!(f32_to_f16_bits(halfway), 0x3c00);
+        let above = 1.0 + 2.0f32.powi(-11) + 2.0f32.powi(-13);
+        assert_eq!(f32_to_f16_bits(above), 0x3c01);
+    }
+
+    #[test]
+    fn q8_0_activation_quantization_matches_ggml_rules() {
+        let mut x = vec![0.0f32; 32];
+        x[0] = 127.0;
+        x[1] = -63.5;
+        x[2] = 1.0;
+        let mut qs = Vec::new();
+        let mut ds = Vec::new();
+        quantize_row_q8_0(&x, &mut qs, &mut ds);
+        assert_eq!(qs.len(), 1);
+        assert_eq!(ds, vec![1.0f32], "d = amax/127 = 1.0");
+        assert_eq!(qs[0][0], 127);
+        assert_eq!(qs[0][1], -64, "(-63.5).round_ties_even() = -64");
+        assert_eq!(qs[0][2], 1);
+        assert_eq!(qs[0][3], 0);
+        // Two blocks quantize independently.
+        let x2: Vec<f32> = (0..64).map(|i| (i as f32 - 32.0) / 10.0).collect();
+        quantize_row_q8_0(&x2, &mut qs, &mut ds);
+        assert_eq!(qs.len(), 2);
+        assert_eq!(ds.len(), 2);
     }
 
     #[test]

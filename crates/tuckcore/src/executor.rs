@@ -21,7 +21,7 @@ use tuckmill_manifest::records::EngineIdentity;
 use tuckmill_manifest::{BACKEND_ABI_VERSION, WORKER_PROTOCOL_VERSION};
 
 use crate::completion::CompletionTracker;
-use crate::forward::{self, Forward, KvState, ModelWeights};
+use crate::forward::{self, Forward, KvState, ModelWeights, NumericalProfile};
 use crate::loader::{BlockLoader, BlockPolicy};
 use crate::model;
 use crate::sampling::{self, Rng, SamplingConfig};
@@ -37,6 +37,9 @@ pub const DEFAULT_BLOCK_BYTES: u64 = 4 * 1024 * 1024;
 struct TuckCoreOptions {
     weight_cache_bytes: Option<u64>,
     block_bytes: Option<u64>,
+    /// "oracle-f32" (default) or "llama-cpu" (mirrors pinned llama.cpp CPU
+    /// kernels; used for reference comparisons).
+    numerical_profile: Option<String>,
 }
 
 struct Loaded {
@@ -45,6 +48,7 @@ struct Loaded {
     weights: Arc<ModelWeights>,
     tokenizer: Tokenizer,
     context_total: u64,
+    profile: NumericalProfile,
 }
 
 /// The experimental custom native executor.
@@ -139,6 +143,18 @@ impl InferenceBackend for TuckCore {
             cache_bytes: opts.weight_cache_bytes.unwrap_or(DEFAULT_CACHE_BYTES),
         };
         policy.validate()?;
+        let profile = match opts.numerical_profile.as_deref() {
+            None | Some("oracle-f32") => NumericalProfile::OracleF32,
+            Some("llama-cpu") => NumericalProfile::LlamaCpu,
+            Some(other) => {
+                return Err(TuckmillError::new(
+                    ErrorCode::InvalidRequest,
+                    format!(
+                        "unknown numerical profile {other:?}; use \"oracle-f32\" or \"llama-cpu\""
+                    ),
+                ))
+            }
+        };
 
         // ---- identity verification before anything executes ----
         let path = std::path::Path::new(&artifact.path);
@@ -214,9 +230,10 @@ impl InferenceBackend for TuckCore {
         let payload: u64 = insp.tensors.iter().map(|t| t.byte_size).sum();
 
         let mut note = format!(
-            "tuckcore (experimental, uncertified): dense Qwen3, {} layers, vocab {}, byte-level BPE tokenizer, scalar f32 reference kernels; real weights from {} ({} payload), weight cache {}, block {}",
+            "tuckcore (experimental, uncertified): dense Qwen3, {} layers, vocab {}, byte-level BPE tokenizer, scalar kernels [{}]; real weights from {} ({} payload), weight cache {}, block {}",
             cfg.layers,
             cfg.vocab,
+            profile.as_str(),
             artifact.path,
             tuckmill_manifest::units::Bytes(payload),
             tuckmill_manifest::units::Bytes(policy.cache_bytes),
@@ -232,6 +249,7 @@ impl InferenceBackend for TuckCore {
             weights,
             tokenizer,
             context_total: plan.context.total_context,
+            profile,
         });
         Ok(note)
     }
@@ -272,6 +290,7 @@ impl InferenceBackend for TuckCore {
             loader: &loaded.loader,
             tracker: &loaded.tracker,
             weights: &loaded.weights,
+            profile: loaded.profile,
         };
 
         (ctl.on_state)(RunState::Warming);
@@ -381,6 +400,7 @@ impl InferenceBackend for TuckCore {
             loader: &loaded.loader,
             tracker: &loaded.tracker,
             weights: &loaded.weights,
+            profile: loaded.profile,
         };
         let mut scored = 0u64;
         for position in positions {
@@ -532,7 +552,7 @@ mod tests {
             )
             .unwrap();
         assert!(note.contains("uncertified"));
-        assert!(note.contains("scalar f32"));
+        assert!(note.contains("scalar kernels [oracle-f32]"));
         let identity = engine.identity();
         assert_eq!(identity.engine, "tuckcore");
         assert!(!identity.certified);

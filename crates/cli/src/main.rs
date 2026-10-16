@@ -171,9 +171,16 @@ enum Cmd {
         /// TUCKMILL_LLAMA_LIB; see scripts/fetch-llama.sh).
         #[arg(long)]
         reference: bool,
-        /// Registered logit tolerance for --reference comparisons.
-        #[arg(long, default_value_t = 1e-2)]
+        /// Override the registered logit tolerance for --reference
+        /// comparisons (default: registered per dominant weight dtype —
+        /// 5e-2 for F16/F32, 5e-1 for Q8_0).
+        #[arg(long, default_value_t = 0.0)]
         tolerance: f64,
+        /// TuckCore numerical profile for --reference comparisons:
+        /// "llama-cpu" (mirrors pinned llama.cpp CPU kernels; default) or
+        /// "oracle-f32" (exact scalar arithmetic).
+        #[arg(long, default_value = "llama-cpu")]
+        tuckcore_profile: String,
     },
 
     /// Run the standard benchmark suite and write a machine-readable record.
