@@ -101,3 +101,21 @@ never accepted by any real artifact.
   the previous group-based product, which only held because the pinned
   model has groups == time_step_rank). `ssm_norm` resolves against
   head_v, not inner/groups.
+
+## Addendum 3 (Q35-1B)
+
+- Scalar reference operators for the Gated DeltaNet layers live in
+  `crates/tuckcore/src/qwen35_ops.rs`, with semantics taken from the
+  pinned build: `ggml_ssm_conv` (windowed per-channel dot, no flip,
+  `(kernel - 1)`-row history), `build_gdn_l2_norm` (`x / sqrt(sum(x^2) +
+  eps)`, exactly `rms_norm(x, eps/n) / sqrt(n)`), the autoregressive
+  delta rule (decay `exp(g)` applied to the state before the delta
+  correction; `d = beta (v - s~^T k)`; `s = s~ + k d^T`; `o = s^T
+  (q / sqrt(S_k))`), and ggml's `silu`/`softplus` (threshold at 20)
+  scalars.
+- Evidence: hand-computed first/second-token and 2-D cases; a transposed
+  f64 algebraic cross-check over multiple steps; conv chunked-vs-single
+  pass equivalence (state handoff exact); determinism; beta-0 /
+  decay-1 identities; state sizes tie exactly to the contract's pricing
+  (18 x (1,048,576 + 73,728) = 20,201,472 B). Still not wired into the
+  loader.
