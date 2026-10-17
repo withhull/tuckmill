@@ -55,12 +55,21 @@ impl Qwen35Gpu {
         &self.ctx
     }
 
-    /// Allocate a shared-storage buffer of `bytes` (zeroed explicitly:
-    /// no inference result may depend on unspecified initial contents).
+    /// Allocate a shared-storage buffer of `bytes`, zeroed without any
+    /// host staging allocation (in-place zero for shared storage): no
+    /// state or scratch result may depend on unspecified initial
+    /// contents.
     pub fn buffer(&self, bytes: usize) -> Result<MetalBuffer> {
         let buffer = self.ctx.buffer(bytes, true)?;
-        buffer.upload(0, &vec![0u8; bytes])?;
+        buffer.zero(0, bytes)?;
         Ok(buffer)
+    }
+
+    /// Allocate WITHOUT initialization. Only for buffers whose every
+    /// byte is written before any read (weight uploads) — zeroing 800 MB
+    /// of weights would be pure extra traffic.
+    pub fn buffer_uninit(&self, bytes: usize) -> Result<MetalBuffer> {
+        self.ctx.buffer(bytes, true)
     }
 
     /// Buffer-to-buffer GDN operators (GdnGpu's methods delegate here;
@@ -1127,7 +1136,7 @@ mod attention_tests {
 // ---------------------------------------------------------------------------
 
 use crate::qwen35::Qwen35Layer;
-use crate::qwen35_forward::Qwen35Model;
+use crate::qwen35_forward::TensorSource;
 
 /// Geometry the device layer dispatch needs, captured from the resolved
 /// config at load time (one source of truth for both layer kinds).
@@ -1151,8 +1160,8 @@ struct LayerGeometry {
 }
 
 impl LayerGeometry {
-    fn from_model(model: &Qwen35Model) -> Self {
-        let cfg = model.config();
+    fn from_source(src: &dyn TensorSource) -> Self {
+        let cfg = src.config();
         Self {
             hidden: cfg.hidden as usize,
             ffn: cfg.ffn as usize,
@@ -1171,6 +1180,10 @@ impl LayerGeometry {
     }
 }
 
+/// Host staging bound for weight uploads: tensors stream to the device
+/// in chunks of at most this many bytes (peak host staging per upload).
+pub const STAGING_CHUNK_BYTES: usize = 4 << 20;
+
 /// One uploaded weight tensor; matrices stay raw (F16 halves are
 /// uploaded verbatim) and 1-D vectors are raw f32.
 pub struct DeviceTensor {
@@ -1181,10 +1194,10 @@ pub struct DeviceTensor {
 }
 
 impl DeviceTensor {
-    fn load(gpu: &Qwen35Gpu, model: &Qwen35Model, index: usize) -> Result<Self> {
-        let bytes = model.raw_tensor_bytes(index)?;
-        let type_id = model.tensor_type_id(index)?;
-        let (in_dim, out_dim) = model.tensor_dims(index)?;
+    fn load(gpu: &Qwen35Gpu, src: &dyn TensorSource, index: usize) -> Result<Self> {
+        let total = src.tensor_bytes(index)? as usize;
+        let type_id = src.tensor_type_id(index)?;
+        let (in_dim, out_dim) = src.tensor_dims(index)?;
         if out_dim <= 1 {
             return Err(TuckmillError::new(
                 ErrorCode::Internal,
@@ -1197,8 +1210,17 @@ impl DeviceTensor {
                 format!("device matrices must be F16 or Q8_0; tensor {index} is type {type_id}"),
             ));
         }
-        let buf = gpu.buffer(bytes.len())?;
-        buf.upload(0, &bytes)?;
+        // Weights are fully overwritten: skip the zero pass and stream
+        // in bounded chunks (host staging peaks at STAGING_CHUNK_BYTES).
+        let buf = gpu.buffer_uninit(total)?;
+        let mut stage = vec![0u8; STAGING_CHUNK_BYTES.min(total).max(1)];
+        let mut off = 0usize;
+        while off < total {
+            let n = STAGING_CHUNK_BYTES.min(total - off);
+            src.read_tensor_into(index, off as u64, &mut stage[..n])?;
+            buf.upload(off, &stage[..n])?;
+            off += n;
+        }
         Ok(Self {
             buf,
             type_id,
@@ -1261,16 +1283,16 @@ struct LayerCommon {
 }
 
 impl LayerCommon {
-    fn load(gpu: &Qwen35Gpu, model: &Qwen35Model, layer: &Qwen35Layer) -> Result<Self> {
-        let geom = LayerGeometry::from_model(model);
+    fn load(gpu: &Qwen35Gpu, src: &dyn TensorSource, layer: &Qwen35Layer) -> Result<Self> {
+        let geom = LayerGeometry::from_source(src);
         Ok(Self {
-            attn_norm: vec_buf(gpu, &model.read_vector(layer.attn_norm.index)?)?,
-            post_norm: vec_buf(gpu, &model.read_vector(layer.post_attn_norm.index)?)?,
+            attn_norm: vec_buf(gpu, &src.read_vector(layer.attn_norm.index)?)?,
+            post_norm: vec_buf(gpu, &src.read_vector(layer.post_attn_norm.index)?)?,
             h: zero_buf(gpu, geom.hidden)?,
             h2: zero_buf(gpu, geom.hidden)?,
-            ffn_gate: DeviceTensor::load(gpu, model, layer.ffn_gate.index)?,
-            ffn_up: DeviceTensor::load(gpu, model, layer.ffn_up.index)?,
-            ffn_down: DeviceTensor::load(gpu, model, layer.ffn_down.index)?,
+            ffn_gate: DeviceTensor::load(gpu, src, layer.ffn_gate.index)?,
+            ffn_up: DeviceTensor::load(gpu, src, layer.ffn_up.index)?,
+            ffn_down: DeviceTensor::load(gpu, src, layer.ffn_down.index)?,
             ffn_g: zero_buf(gpu, geom.ffn)?,
             ffn_u: zero_buf(gpu, geom.ffn)?,
             ffn_d: zero_buf(gpu, geom.hidden)?,
@@ -1356,10 +1378,15 @@ pub enum LayerGpu {
 
 impl LayerGpu {
     /// Upload one served layer's weights and allocate its state and
-    /// scratch (fixture scale: F16 matrices, F32 vectors).
-    pub fn load(gpu: &Qwen35Gpu, model: &Qwen35Model, l: usize, capacity: usize) -> Result<Self> {
-        let layer = &model.layout().layers[l];
-        let common = LayerCommon::load(gpu, model, layer)?;
+    /// scratch (matrices F16/Q8_0, vectors F32).
+    pub fn load(
+        gpu: &Qwen35Gpu,
+        src: &dyn TensorSource,
+        l: usize,
+        capacity: usize,
+    ) -> Result<Self> {
+        let layer = &src.layout().layers[l];
+        let common = LayerCommon::load(gpu, src, layer)?;
         let geom = common.geom;
         match &layer.attention {
             crate::qwen35::Qwen35AttentionTensors::Linear {
@@ -1373,15 +1400,15 @@ impl LayerGpu {
                 norm,
                 out,
             } => Ok(LayerGpu::Gdn(Box::new(GdnLayerGpu {
-                qkv: DeviceTensor::load(gpu, model, qkv.index)?,
-                z: DeviceTensor::load(gpu, model, gate.index)?,
-                alpha: DeviceTensor::load(gpu, model, alpha.index)?,
-                beta: DeviceTensor::load(gpu, model, beta.index)?,
-                out_proj: DeviceTensor::load(gpu, model, out.index)?,
-                ssm_a: vec_buf(gpu, &model.read_vector(a.index)?)?,
-                ssm_dt: vec_buf(gpu, &model.read_vector(dt.index)?)?,
-                ssm_norm: vec_buf(gpu, &model.read_vector(norm.index)?)?,
-                conv_w: vec_buf(gpu, &model.read_vector(conv1d.index)?)?,
+                qkv: DeviceTensor::load(gpu, src, qkv.index)?,
+                z: DeviceTensor::load(gpu, src, gate.index)?,
+                alpha: DeviceTensor::load(gpu, src, alpha.index)?,
+                beta: DeviceTensor::load(gpu, src, beta.index)?,
+                out_proj: DeviceTensor::load(gpu, src, out.index)?,
+                ssm_a: vec_buf(gpu, &src.read_vector(a.index)?)?,
+                ssm_dt: vec_buf(gpu, &src.read_vector(dt.index)?)?,
+                ssm_norm: vec_buf(gpu, &src.read_vector(norm.index)?)?,
+                conv_w: vec_buf(gpu, &src.read_vector(conv1d.index)?)?,
                 state: zero_buf(gpu, geom.groups * geom.state_size * geom.head_v)?,
                 hist: zero_buf(
                     gpu,
@@ -1409,17 +1436,17 @@ impl LayerGpu {
                 q_norm,
                 k_norm,
             } => Ok(LayerGpu::Attention(Box::new(AttentionLayerGpu {
-                q_w: DeviceTensor::load(gpu, model, q.index)?,
-                k_w: DeviceTensor::load(gpu, model, k.index)?,
-                v_w: DeviceTensor::load(gpu, model, v.index)?,
-                o_w: DeviceTensor::load(gpu, model, output.index)?,
-                q_norm: vec_buf(gpu, &model.read_vector(q_norm.index)?)?,
-                k_norm: vec_buf(gpu, &model.read_vector(k_norm.index)?)?,
+                q_w: DeviceTensor::load(gpu, src, q.index)?,
+                k_w: DeviceTensor::load(gpu, src, k.index)?,
+                v_w: DeviceTensor::load(gpu, src, v.index)?,
+                o_w: DeviceTensor::load(gpu, src, output.index)?,
+                q_norm: vec_buf(gpu, &src.read_vector(q_norm.index)?)?,
+                k_norm: vec_buf(gpu, &src.read_vector(k_norm.index)?)?,
                 inv_freq: vec_buf(
                     gpu,
                     &crate::qwen35_ops::rope_inv_freq_partial(
                         geom.rope_dims,
-                        model.config().rope_base,
+                        src.config().rope_base,
                     ),
                 )?,
                 k_cache: gpu.buffer(geom.kv_heads * capacity * geom.head_dim * 2)?,
@@ -1470,11 +1497,153 @@ pub enum Stage {
     Layer(usize),
 }
 
+/// Exact GPU allocation plan for one admitted context, computed from the
+/// tensor source BEFORE anything allocates. This is the production
+/// admission check: the loader refuses a plan whose total exceeds the
+/// admitted bytes, component by component, and never creates a buffer
+/// first. Tests assert plan total equals the actual ledger after load.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GpuAllocPlan {
+    pub weights: u64,
+    pub state: u64,
+    pub scratch: u64,
+}
+
+impl GpuAllocPlan {
+    pub fn total(&self) -> u64 {
+        self.weights
+            .saturating_add(self.state)
+            .saturating_add(self.scratch)
+    }
+}
+
+fn tensor_bytes_sum(src: &dyn TensorSource, indices: &[usize]) -> Result<u64> {
+    let mut total = 0u64;
+    for index in indices {
+        total = total.saturating_add(src.tensor_bytes(*index)?);
+    }
+    Ok(total)
+}
+
+/// Preflight every GPU allocation for `capacity` positions. Weights are
+/// the served tensors uploaded raw (plus the derived RoPE tables); state
+/// is the packed KV planes and the recurrent/convolution state; scratch
+/// mirrors the per-layer work buffers and the model-level activations.
+pub fn gpu_alloc_plan(src: &dyn TensorSource, capacity: usize) -> Result<GpuAllocPlan> {
+    let layout = src.layout();
+    let geom = LayerGeometry::from_source(src);
+    let cap = capacity as u64;
+    let mut weights = 0u64;
+    let mut state = 0u64;
+    let mut scratch = 0u64;
+
+    for layer in &layout.layers {
+        let indices: Vec<usize> = match &layer.attention {
+            crate::qwen35::Qwen35AttentionTensors::Linear {
+                qkv,
+                gate,
+                a,
+                dt,
+                alpha,
+                beta,
+                conv1d,
+                norm,
+                out,
+            } => vec![
+                layer.attn_norm.index,
+                layer.post_attn_norm.index,
+                qkv.index,
+                gate.index,
+                a.index,
+                dt.index,
+                alpha.index,
+                beta.index,
+                conv1d.index,
+                norm.index,
+                out.index,
+                layer.ffn_gate.index,
+                layer.ffn_up.index,
+                layer.ffn_down.index,
+            ],
+            crate::qwen35::Qwen35AttentionTensors::Full {
+                q,
+                k,
+                v,
+                output,
+                q_norm,
+                k_norm,
+            } => vec![
+                layer.attn_norm.index,
+                layer.post_attn_norm.index,
+                q.index,
+                k.index,
+                v.index,
+                output.index,
+                q_norm.index,
+                k_norm.index,
+                layer.ffn_gate.index,
+                layer.ffn_up.index,
+                layer.ffn_down.index,
+            ],
+        };
+        weights = weights.saturating_add(tensor_bytes_sum(src, &indices)?);
+
+        let bytes4 = 4u64;
+        scratch = scratch
+            .saturating_add(bytes4 * (2 * geom.hidden + 2 * geom.ffn + 2 * geom.hidden) as u64);
+        match &layer.attention {
+            crate::qwen35::Qwen35AttentionTensors::Linear { .. } => {
+                let per_head = (geom.head_v * geom.dt_rank) as u64;
+                scratch = scratch.saturating_add(
+                    bytes4
+                        * (2 * geom.channels
+                            + 2 * geom.groups * geom.state_size
+                            + 4 * geom.head_v * geom.dt_rank
+                            + 4 * geom.dt_rank) as u64,
+                );
+                let _ = per_head;
+                state = state
+                    .saturating_add(bytes4 * (geom.groups * geom.state_size * geom.head_v) as u64);
+                state = state.saturating_add(
+                    bytes4 * (geom.conv_kernel.saturating_sub(1).max(1) * geom.channels) as u64,
+                );
+            }
+            crate::qwen35::Qwen35AttentionTensors::Full { .. } => {
+                // qg(2) + q + gate + attn = 5 x heads*head_dim, plus
+                // k + v (kv_heads*head_dim each) and the attention scratch.
+                scratch = scratch.saturating_add(
+                    bytes4
+                        * (5 * geom.heads * geom.head_dim
+                            + 2 * geom.kv_heads * geom.head_dim
+                            + geom.heads * capacity) as u64,
+                );
+                state = state
+                    .saturating_add(2 * (geom.kv_heads as u64 * cap * geom.head_dim as u64 * 2));
+                // Derived RoPE table (weights-side data).
+                weights = weights.saturating_add(4 * (geom.rope_dims / 2) as u64);
+            }
+        }
+    }
+    weights = weights.saturating_add(src.tensor_bytes(layout.token_embd.index)?);
+    weights = weights.saturating_add(src.tensor_bytes(layout.output_norm.index)?);
+    scratch = scratch.saturating_add(4 * (2 * geom.hidden + geom_vocab(src)) as u64);
+    Ok(GpuAllocPlan {
+        weights,
+        state,
+        scratch,
+    })
+}
+
+fn geom_vocab(src: &dyn TensorSource) -> usize {
+    src.config().vocab as usize
+}
+
 /// The complete served stack on the device: per-layer weights, state and
 /// scratch on one shared owner, a single embedding lookup path and the
-/// tied head. Weights are uploaded raw from the verified artifact; the
+/// tied head. Weights are streamed raw from the tensor source; the
 /// shared ledger (`allocated_bytes`) is the number the plan admission
-/// must cover.
+/// must cover, and loading refuses an inadequate admission before any
+/// buffer is created.
 pub struct Qwen35GpuModel {
     gpu: Qwen35Gpu,
     layers: Vec<LayerGpu>,
@@ -1488,21 +1657,43 @@ pub struct Qwen35GpuModel {
     eps: f32,
     capacity: usize,
     positions: std::cell::Cell<usize>,
+    session_valid: std::cell::Cell<bool>,
 }
 
 impl Qwen35GpuModel {
     /// Upload every served tensor and allocate all state and scratch.
-    /// Takes ownership of the shared GPU owner so the ledger covers the
-    /// whole model.
-    pub fn load(gpu: Qwen35Gpu, model: &Qwen35Model, capacity: usize) -> Result<Self> {
-        let hidden = model.config().hidden as usize;
-        let vocab = model.config().vocab as usize;
-        let eps = model.config().rms_eps;
-        let layers = (0..model.layout().layers.len())
-            .map(|l| LayerGpu::load(&gpu, model, l, capacity))
+    /// Both the preflight plan and the admission check run first: no GPU
+    /// buffer of this model exists before `admitted_gpu_bytes` covers
+    /// the exact plan total.
+    pub fn load(
+        gpu: Qwen35Gpu,
+        src: &dyn TensorSource,
+        capacity: usize,
+        admitted_gpu_bytes: u64,
+    ) -> Result<Self> {
+        let plan = gpu_alloc_plan(src, capacity)?;
+        let total = plan.total();
+        if total > admitted_gpu_bytes {
+            return Err(TuckmillError::new(
+                ErrorCode::InvalidPlan,
+                format!(
+                    "GPU admission of {admitted_gpu_bytes} B does not cover the exact plan of {total} B (weights {} + state {} + scratch {}); nothing was allocated",
+                    plan.weights, plan.state, plan.scratch
+                ),
+            )
+            .with_action(
+                "Raise the GPU admission (memory budget or plan reservations) so it covers the preflighted model allocation.",
+            ));
+        }
+
+        let hidden = src.config().hidden as usize;
+        let vocab = src.config().vocab as usize;
+        let eps = src.config().rms_eps;
+        let layers = (0..src.layout().layers.len())
+            .map(|l| LayerGpu::load(&gpu, src, l, capacity))
             .collect::<Result<Vec<_>>>()?;
-        let output_norm = vec_buf(&gpu, &model.read_vector(model.layout().output_norm.index)?)?;
-        let tied = DeviceTensor::load(&gpu, model, model.layout().token_embd.index)?;
+        let output_norm = vec_buf(&gpu, &src.read_vector(src.layout().output_norm.index)?)?;
+        let tied = DeviceTensor::load(&gpu, src, src.layout().token_embd.index)?;
         let x = zero_buf(&gpu, hidden)?;
         let h = zero_buf(&gpu, hidden)?;
         let logits_buf = zero_buf(&gpu, vocab)?;
@@ -1519,6 +1710,7 @@ impl Qwen35GpuModel {
             eps,
             capacity,
             positions: std::cell::Cell::new(0),
+            session_valid: std::cell::Cell::new(true),
         })
     }
 
@@ -1541,13 +1733,35 @@ impl Qwen35GpuModel {
         &self.x
     }
 
-    /// Zero every session state and the position counter.
+    /// Zero every session state and the position counter; the session
+    /// becomes valid again.
     pub fn reset(&self) -> Result<()> {
         for layer in &self.layers {
             layer.reset()?;
         }
         self.positions.set(0);
+        self.session_valid.set(true);
         Ok(())
+    }
+
+    fn ensure_valid(&self) -> Result<()> {
+        if !self.session_valid.get() {
+            return Err(TuckmillError::new(
+                ErrorCode::InvalidRequest,
+                "qwen35 GPU session was interrupted and its partial state was discarded",
+            )
+            .with_action(
+                "Reset the session before continuing; interrupted recurrent state is never reused.",
+            ));
+        }
+        Ok(())
+    }
+
+    fn finish(&self, result: Result<()>) -> Result<()> {
+        if result.is_err() {
+            self.session_valid.set(false);
+        }
+        result
     }
 
     /// One decode step; the full vocabulary logits are downloaded for
@@ -1557,54 +1771,59 @@ impl Qwen35GpuModel {
     }
 
     /// Same step with a per-stage callback (embedding row, then after
-    /// every layer) on the device activations — the layer-by-layer
-    /// qualification surface.
+    /// every layer). Any failure — including a callback failure —
+    /// invalidates the session (partial recurrent/KV state is never
+    /// reused until reset).
     pub fn forward_token_traced(
         &self,
         token: u32,
         logits: &mut Vec<f32>,
         mut on_stage: impl FnMut(Stage, &MetalBuffer) -> Result<()>,
     ) -> Result<()> {
-        if token as usize >= self.vocab {
-            return Err(TuckmillError::new(
-                ErrorCode::InvalidRequest,
-                format!(
-                    "token id {token} is outside the {}-entry vocabulary",
-                    self.vocab
-                ),
-            ));
-        }
-        let pos = self.positions.get();
-        if pos >= self.capacity {
-            return Err(TuckmillError::new(
-                ErrorCode::InvalidPlan,
-                format!(
-                    "token {pos} exceeds the admitted {}-position context",
-                    self.capacity
-                ),
-            ));
-        }
-        self.tied.row_into(&self.gpu, token, &self.x, 0)?;
-        on_stage(Stage::Embedding, &self.x)?;
-        for (l, layer) in self.layers.iter().enumerate() {
-            layer.forward(&self.gpu, &self.x, pos as u32)?;
-            on_stage(Stage::Layer(l), &self.x)?;
-        }
-        self.gpu.context().rmsnorm(
-            &self.x,
-            &self.output_norm,
-            &self.h,
-            1,
-            self.hidden as u32,
-            self.eps,
-        )?;
-        self.tied.gemv(&self.gpu, &self.h, &self.logits_buf)?;
-        logits.resize(self.vocab, 0.0);
-        let mut bytes = vec![0u8; self.vocab * 4];
-        self.logits_buf.download(0, &mut bytes)?;
-        logits.copy_from_slice(&bytes_f32(&bytes));
-        self.positions.set(pos + 1);
-        Ok(())
+        self.ensure_valid()?;
+        let result = (|| {
+            if token as usize >= self.vocab {
+                return Err(TuckmillError::new(
+                    ErrorCode::InvalidRequest,
+                    format!(
+                        "token id {token} is outside the {}-entry vocabulary",
+                        self.vocab
+                    ),
+                ));
+            }
+            let pos = self.positions.get();
+            if pos >= self.capacity {
+                return Err(TuckmillError::new(
+                    ErrorCode::InvalidPlan,
+                    format!(
+                        "token {pos} exceeds the admitted {}-position context",
+                        self.capacity
+                    ),
+                ));
+            }
+            self.tied.row_into(&self.gpu, token, &self.x, 0)?;
+            on_stage(Stage::Embedding, &self.x)?;
+            for (l, layer) in self.layers.iter().enumerate() {
+                layer.forward(&self.gpu, &self.x, pos as u32)?;
+                on_stage(Stage::Layer(l), &self.x)?;
+            }
+            self.gpu.context().rmsnorm(
+                &self.x,
+                &self.output_norm,
+                &self.h,
+                1,
+                self.hidden as u32,
+                self.eps,
+            )?;
+            self.tied.gemv(&self.gpu, &self.h, &self.logits_buf)?;
+            logits.resize(self.vocab, 0.0);
+            let mut bytes = vec![0u8; self.vocab * 4];
+            self.logits_buf.download(0, &mut bytes)?;
+            logits.copy_from_slice(&bytes_f32(&bytes));
+            self.positions.set(pos + 1);
+            Ok(())
+        })();
+        self.finish(result)
     }
 }
 
@@ -1772,6 +1991,7 @@ impl AttentionLayerGpu {
 #[cfg(test)]
 mod layer_tests {
     use super::*;
+    use crate::qwen35_forward::Qwen35Model;
     use crate::qwen35_kv::KvPrecision;
     use tuckmill_manifest::testing::{synthetic_qwen3_bytes, SyntheticConfig};
 
@@ -1834,7 +2054,9 @@ mod layer_tests {
         let capacity = 8usize;
         let mut cpu = Qwen35Model::open(&path, capacity, KvPrecision::F16).unwrap();
         let hidden = cpu.config().hidden as usize;
-        let model = Qwen35GpuModel::load(Qwen35Gpu::open().unwrap(), &cpu, capacity).unwrap();
+        let plan = gpu_alloc_plan(&cpu, capacity).unwrap();
+        let model =
+            Qwen35GpuModel::load(Qwen35Gpu::open().unwrap(), &cpu, capacity, plan.total()).unwrap();
 
         let tokens = [3u32, 11, 29];
         let mut worst_hidden = 0.0f32;
@@ -1882,11 +2104,11 @@ mod layer_tests {
         assert!(worst_logits <= LOGITS_TOL, "registered logits tolerance");
     }
 
-    /// Q35-2C machine-local gate: the complete pinned 0.8B executes on
-    /// the GPU through the single assembled model and its logits match
-    /// the CPU oracle; the device ledger stays within the accounted
-    /// budget (weights payload + state + per-layer scratch). Run with
-    /// --release for speed.
+    /// Q35-2C/2C.1 machine-local gate: the complete pinned 0.8B executes
+    /// on the GPU from a lightweight artifact tensor source (no CPU
+    /// session), the exact preflight plan equals the device ledger, and
+    /// logits plus selected-layer hidden states match the CPU oracle.
+    /// Run with --release for speed.
     #[test]
     fn real_artifact_gpu_model_matches_cpu_when_available() {
         let Some(path) = std::env::var("TUCKMILL_QWEN35_GGUF")
@@ -1902,33 +2124,191 @@ mod layer_tests {
         }
         let capacity = 16usize;
         let mut cpu = Qwen35Model::open(&path, capacity, KvPrecision::F16).unwrap();
+        let source = crate::qwen35_forward::ArtifactTensorSource::open(&path).unwrap();
 
-        // Preflight ledger bound from inspected geometry.
-        let insp =
-            tuckmill_manifest::gguf::inspect(&path, &tuckmill_manifest::gguf::Limits::default())
+        // Preflight: nothing allocates before the admission check passes.
+        let plan = gpu_alloc_plan(&source, capacity).unwrap();
+        let model =
+            Qwen35GpuModel::load(Qwen35Gpu::open().unwrap(), &source, capacity, plan.total())
                 .unwrap();
-        let budget =
-            crate::qwen35_forward::required_bytes(&insp, capacity as u64, KvPrecision::F16)
-                .unwrap();
-        let layers = cpu.layout().layers.len() as u64;
-        let accounted = budget
-            .weights_payload
-            .saturating_add(budget.state_total())
-            .saturating_add(budget.scratch.saturating_mul(layers + 4));
-
-        let model = Qwen35GpuModel::load(Qwen35Gpu::open().unwrap(), &cpu, capacity).unwrap();
-        assert!(
-            model.allocated_bytes() <= accounted,
-            "GPU ledger {} exceeds the accounted {} (weights {} + state {} + scratch {} x {} layers)",
+        assert_eq!(
             model.allocated_bytes(),
-            accounted,
-            budget.weights_payload,
-            budget.state_total(),
-            budget.scratch,
-            layers
+            plan.total(),
+            "exact preflight plan equals the device ledger"
         );
 
-        let tokens = [9707u32, 11, 1879, 1000];
+        finish_real_gpu_checks(&mut cpu, &model, plan, &tokens_for_real_gpu())
+    }
+
+    fn tokens_for_real_gpu() -> Vec<u32> {
+        vec![9707u32, 11, 1879, 1000]
+    }
+
+    fn finish_real_gpu_checks(
+        cpu: &mut Qwen35Model,
+        model: &Qwen35GpuModel,
+        plan: GpuAllocPlan,
+        tokens: &[u32],
+    ) {
+        let hidden = cpu.config().hidden as usize;
+        let selected: [usize; 4] = [0, 3, 11, 23];
+        let mut worst = 0.0f32;
+        let mut worst_hidden = 0.0f32;
+        for (step, token) in tokens.iter().enumerate() {
+            let mut cpu_logits = Vec::new();
+            let mut trace = Vec::new();
+            cpu.forward_token_traced(*token, &mut cpu_logits, &mut trace)
+                .unwrap();
+            let mut gpu_logits = Vec::new();
+            model
+                .forward_token_traced(*token, &mut gpu_logits, |stage, act| {
+                    if let Stage::Layer(l) = stage {
+                        if selected.contains(&l) {
+                            let gx = device_f32(act, hidden);
+                            for (g, c) in gx.iter().zip(trace[l + 1].iter()) {
+                                worst_hidden = worst_hidden.max(assert_close(
+                                    *g,
+                                    *c,
+                                    REAL_HIDDEN_TOL,
+                                    REAL_HIDDEN_TOL,
+                                    &format!("token {token} layer {l}"),
+                                ));
+                            }
+                        }
+                    }
+                    Ok(())
+                })
+                .unwrap();
+            for (g, c) in gpu_logits.iter().zip(cpu_logits.iter()) {
+                worst = worst.max((g - c).abs());
+            }
+            assert_eq!(
+                top1(&gpu_logits),
+                top1(&cpu_logits),
+                "step {step} token {token}: GPU top-1 matches the CPU oracle"
+            );
+        }
+        eprintln!(
+            "real artifact GPU model: ledger {} B == exact plan (weights {} + state {} + scratch {}); worst hidden|diff| {worst_hidden:.6} at layers {selected:?}, worst logits|diff| {worst:.6} over {tokens:?}",
+            model.allocated_bytes(),
+            plan.weights,
+            plan.state,
+            plan.scratch
+        );
+        assert!(
+            worst_hidden <= REAL_HIDDEN_TOL,
+            "registered GPU-vs-oracle hidden tolerance (observed {worst_hidden:.6})"
+        );
+        assert!(worst <= 2e-3, "registered GPU-vs-oracle logits tolerance");
+    }
+
+    /// Registered hidden-state tolerance for the real artifact (observed
+    /// worst 6.4e-5 at layers [0, 3, 11, 23] over 4 tokens; recorded in
+    /// the matrix with the commit).
+    const REAL_HIDDEN_TOL: f32 = 5e-4;
+
+    /// An insufficient admission is refused BEFORE any GPU buffer of the
+    /// model is created: the shared ledger does not move.
+    #[test]
+    fn preflight_refuses_insufficient_admission_before_allocating() {
+        if gpu_or_skip().is_none() {
+            return;
+        }
+        let bytes = synthetic_qwen3_bytes(&SyntheticConfig::tiny_qwen35());
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("q35.gguf");
+        std::fs::write(&path, &bytes).unwrap();
+        let source = crate::qwen35_forward::ArtifactTensorSource::open(&path).unwrap();
+        let gpu = Qwen35Gpu::open().unwrap();
+        let plan = gpu_alloc_plan(&source, 4).unwrap();
+        let before = gpu.context().allocated_bytes();
+        let err = match Qwen35GpuModel::load(gpu.clone(), &source, 4, plan.total() - 1) {
+            Ok(_) => panic!("an under-admitted load must refuse"),
+            Err(e) => e,
+        };
+        assert_eq!(err.code(), ErrorCode::InvalidPlan);
+        assert!(
+            err.message().contains("nothing was allocated"),
+            "{}",
+            err.message()
+        );
+        assert_eq!(
+            gpu.context().allocated_bytes(),
+            before,
+            "refusal happens before any model buffer exists"
+        );
+    }
+
+    /// Fail-closed session lifecycle: a step that fails part-way
+    /// invalidates the session; reset restores bitwise-identical output.
+    #[test]
+    fn gpu_session_invalidates_and_reset_restores() {
+        if gpu_or_skip().is_none() {
+            return;
+        }
+        let bytes = synthetic_qwen3_bytes(&SyntheticConfig::tiny_qwen35());
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("q35.gguf");
+        std::fs::write(&path, &bytes).unwrap();
+        let source = crate::qwen35_forward::ArtifactTensorSource::open(&path).unwrap();
+
+        let baseline = {
+            let plan = gpu_alloc_plan(&source, 4).unwrap();
+            let model =
+                Qwen35GpuModel::load(Qwen35Gpu::open().unwrap(), &source, 2, plan.total()).unwrap();
+            let mut logits = Vec::new();
+            model.forward_token(3, &mut logits).unwrap();
+            model.forward_token(11, &mut logits).unwrap();
+            logits
+        };
+        let _ = &baseline;
+
+        let plan = gpu_alloc_plan(&source, 4).unwrap();
+        let model =
+            Qwen35GpuModel::load(Qwen35Gpu::open().unwrap(), &source, 2, plan.total()).unwrap();
+        let mut logits = Vec::new();
+        model.forward_token(3, &mut logits).unwrap();
+        model.forward_token(11, &mut logits).unwrap();
+        let err = model.forward_token(29, &mut logits).unwrap_err();
+        assert_eq!(
+            err.code(),
+            ErrorCode::InvalidPlan,
+            "capacity exhausted mid-step"
+        );
+
+        let err = model.forward_token(3, &mut logits).unwrap_err();
+        assert_eq!(err.code(), ErrorCode::InvalidRequest);
+        assert!(err.message().contains("interrupted"), "{}", err.message());
+
+        model.reset().unwrap();
+        let mut restored = Vec::new();
+        model.forward_token(3, &mut restored).unwrap();
+        model.forward_token(11, &mut restored).unwrap();
+        assert_eq!(
+            restored, baseline,
+            "reset restores bitwise-identical output"
+        );
+    }
+
+    /// The lightweight artifact source loads and runs without any CPU
+    /// inference session, and produces the same logits as the oracle.
+    #[test]
+    fn artifact_source_loads_without_a_cpu_model() {
+        if gpu_or_skip().is_none() {
+            return;
+        }
+        let bytes = synthetic_qwen3_bytes(&SyntheticConfig::tiny_qwen35());
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("q35.gguf");
+        std::fs::write(&path, &bytes).unwrap();
+
+        let source = crate::qwen35_forward::ArtifactTensorSource::open(&path).unwrap();
+        let plan = gpu_alloc_plan(&source, 4).unwrap();
+        let model =
+            Qwen35GpuModel::load(Qwen35Gpu::open().unwrap(), &source, 4, plan.total()).unwrap();
+
+        let mut cpu = Qwen35Model::open(&path, 4, KvPrecision::F16).unwrap();
+        let tokens = [5u32, 17];
         let mut worst = 0.0f32;
         for token in tokens {
             let mut cpu_logits = Vec::new();
@@ -1940,21 +2320,11 @@ mod layer_tests {
             for (g, c) in gpu_logits.iter().zip(cpu_logits.iter()) {
                 worst = worst.max((g - c).abs());
             }
-            assert_eq!(
-                top1(&gpu_logits),
-                top1(&cpu_logits),
-                "token {token}: GPU top-1 matches the CPU oracle"
-            );
+            assert_eq!(top1(&gpu_logits), top1(&cpu_logits));
         }
-        eprintln!(
-            "real artifact GPU model: ledger {} B (accounted {accounted} B: weights {} + state {} + scratch {}/layer), worst logits|diff| {worst:.6} over {tokens:?}",
-            model.allocated_bytes(),
-            budget.weights_payload,
-            budget.state_total(),
-            budget.scratch
+        assert!(
+            worst <= LOGITS_TOL,
+            "registered logits tolerance ({worst:.3e})"
         );
-        // Registered GPU-vs-oracle tolerance (observed 4.88e-4 on the
-        // pinned artifact over 4 tokens; recorded in the matrix).
-        assert!(worst <= 2e-3, "registered GPU-vs-oracle logits tolerance");
     }
 }

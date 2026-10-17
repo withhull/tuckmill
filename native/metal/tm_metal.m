@@ -1839,3 +1839,40 @@ int tm_metal_qwen35_split_qkv(tm_metal_ctx *ctx, tm_metal_buffer *y, tm_metal_bu
         return tm_frame_commit(ctx, &f, err, err_cap, "qwen35_split_qkv");
     }
 }
+
+int tm_metal_buffer_zero(tm_metal_ctx *ctx, tm_metal_buffer *buffer, size_t off, size_t len,
+                         char *err, size_t err_cap) {
+    if (tm_check_ctx(ctx, err, err_cap, "buffer_zero") != TM_METAL_OK) {
+        return TM_METAL_ERR_UNSUPPORTED;
+    }
+    if (buffer == NULL || buffer->owner != ctx) {
+        return tm_fail(err, err_cap, TM_METAL_ERR_BOUNDS, @"buffer_zero: foreign buffer");
+    }
+    if (len == 0) {
+        return tm_fail(err, err_cap, TM_METAL_ERR_BOUNDS, @"buffer_zero: zero length");
+    }
+    if (off + len > buffer->len) {
+        return tm_fail(err, err_cap, TM_METAL_ERR_BOUNDS, @"buffer_zero: range outside the buffer");
+    }
+    @autoreleasepool {
+        if (buffer->shared) {
+            /* Shared storage is host-coherent: zero in place, no staging. */
+            memset((char *)buffer->buffer.contents + off, 0, len);
+            return TM_METAL_OK;
+        }
+        /* Private storage: GPU-side fill (cold path, synchronous). */
+        id<MTLCommandBuffer> cb = [ctx->queue commandBuffer];
+        if (cb == nil) {
+            return tm_fail(err, err_cap, TM_METAL_ERR_INTERNAL, @"buffer_zero: no command buffer");
+        }
+        id<MTLBlitCommandEncoder> blit = [cb blitCommandEncoder];
+        [blit fillBuffer:buffer->buffer range:NSMakeRange(off, len) value:0];
+        [blit endEncoding];
+        [cb commit];
+        [cb waitUntilCompleted];
+        if (cb.status == MTLCommandBufferStatusError) {
+            return tm_fail(err, err_cap, TM_METAL_ERR_INTERNAL, @"buffer_zero: GPU fill failed");
+        }
+        return TM_METAL_OK;
+    }
+}

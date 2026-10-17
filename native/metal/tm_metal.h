@@ -72,6 +72,12 @@ void *tm_metal_buffer_contents(tm_metal_ctx *ctx, tm_metal_buffer *buffer);
 /* Length of the buffer in bytes (0 when the handle is invalid). */
 size_t tm_metal_buffer_len(const tm_metal_ctx *ctx, const tm_metal_buffer *buffer);
 
+/* Zero `len` bytes of a buffer at byte offset `off`, without a host
+ * staging allocation: shared storage is zeroed in place, private storage
+ * uses a GPU fill. */
+int tm_metal_buffer_zero(tm_metal_ctx *ctx, tm_metal_buffer *buffer, size_t off, size_t len,
+                         char *err, size_t err_cap);
+
 /* Host -> device and device -> host copies through shared storage. */
 int tm_metal_upload(tm_metal_ctx *ctx, tm_metal_buffer *dst, size_t off,
                     const void *src, size_t len, char *err, size_t err_cap);

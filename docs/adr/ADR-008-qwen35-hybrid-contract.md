@@ -301,3 +301,31 @@ never accepted by any real artifact.
 - Scope: sequential per-token decode; prefill batching (Q35-2D) stays
   gated behind this qualification, and text/chat enablement still
   waits on Q35-1E.2 plus tokenizer/template support.
+
+## Addendum 12 (Q35-2C.1: GPU integration hardening)
+
+- **Preflight admission, before any allocation.** `gpu_alloc_plan`
+  computes the exact device allocation (raw served weights + derived
+  RoPE tables, packed KV + recurrent/convolution state, per-layer
+  scratch + model activations) from the tensor source, and
+  `Qwen35GpuModel::load` refuses an admission below the plan total
+  with the component breakdown — no model buffer exists when the check
+  fails (regression: the shared ledger does not move on refusal). After
+  load, the plan total equals the ledger exactly (tested on the
+  fixture; on the pinned artifact 825,411,072 B == weights 800,882,688
+  + state 20,398,080 + scratch 4,130,304); the earlier 49,152-byte
+  formula drift (one missing `heads x head_dim` scratch buffer per
+  attention layer) was caught by exactly this equality.
+- **Fail-closed GPU sessions.** Any failure inside a traced forward —
+  including a verification-callback failure — invalidates the session;
+  further forwards refuse typed until `reset()`, which restores
+  bitwise-identical output (tests mirror the CPU oracle's lifecycle).
+- **No large host staging.** Buffers are zeroed in place (shared
+  storage) or via a GPU fill for private storage (new ABI
+  `tm_metal_buffer_zero`); weights stream to the device in bounded
+  4 MiB chunks from a lightweight `ArtifactTensorSource` that holds
+  only the file handle, inspection and resolved contract — device
+  clients no longer need a CPU inference session (tested).
+- **Real-artifact trace qualification.** Beyond logits, the pinned
+  model's hidden states now compare at layers [0, 3, 11, 23] and every
+  position: worst |diff| 6.4e-5 (registered 5e-4); logits 4.88e-4.

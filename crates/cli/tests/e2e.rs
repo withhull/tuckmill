@@ -1120,8 +1120,12 @@ fn qwen35_teacher_forced_logits_match_reference_when_available() {
     // when no Metal device is available.
     match tuckmill_tuckcore::qwen35_gpu::Qwen35Gpu::open() {
         Ok(gpu) => {
+            let source =
+                tuckmill_tuckcore::qwen35_forward::ArtifactTensorSource::open(&gguf).unwrap();
+            let plan = tuckmill_tuckcore::qwen35_gpu::gpu_alloc_plan(&source, 16).unwrap();
             let model =
-                tuckmill_tuckcore::qwen35_gpu::Qwen35GpuModel::load(gpu, &model, 16).unwrap();
+                tuckmill_tuckcore::qwen35_gpu::Qwen35GpuModel::load(gpu, &source, 16, plan.total())
+                    .unwrap();
             let mut gpu_logits = Vec::new();
             model.forward_token(tokens[0], &mut gpu_logits).unwrap();
             for token in &tokens[1..] {

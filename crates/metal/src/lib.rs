@@ -71,6 +71,14 @@ mod imp {
             err: *mut c_char,
             err_cap: usize,
         ) -> c_int;
+        pub fn tm_metal_buffer_zero(
+            ctx: *mut TmMetalCtx,
+            buffer: *mut TmMetalBuffer,
+            off: usize,
+            len: usize,
+            err: *mut c_char,
+            err_cap: usize,
+        ) -> c_int;
         pub fn tm_metal_download(
             ctx: *mut TmMetalCtx,
             src: *mut TmMetalBuffer,
@@ -1893,6 +1901,36 @@ impl MetalBuffer {
     }
 
     /// Host -> device copy (shared buffers only).
+    /// Zero `len` bytes at `offset` without a host staging allocation:
+    /// shared storage is zeroed in place, private storage uses a GPU fill.
+    pub fn zero(&self, offset: usize, len: usize) -> Result<()> {
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = (offset, len);
+            return Err(TuckmillError::new(ErrorCode::Unavailable, "no Metal"));
+        }
+        #[cfg(target_os = "macos")]
+        {
+            let _guard = self.ctx.lock.lock().expect("metal lock");
+            let mut err = [0 as c_char; ERR_CAP];
+            // SAFETY: raw handle was validated against this context.
+            let code = unsafe {
+                imp::tm_metal_buffer_zero(
+                    self.ctx.raw,
+                    self.raw,
+                    offset,
+                    len,
+                    err.as_mut_ptr(),
+                    ERR_CAP,
+                )
+            };
+            if code != 0 {
+                return Err(metal_error(code, err_text(&err), "buffer_zero"));
+            }
+            Ok(())
+        }
+    }
+
     pub fn upload(&self, offset: usize, data: &[u8]) -> Result<()> {
         #[cfg(not(target_os = "macos"))]
         {

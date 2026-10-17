@@ -40,6 +40,14 @@ struct TensorMeta {
     byte_size: u64,
 }
 
+fn build_tensor_meta(insp: &tuckmill_manifest::gguf::GgufInspection) -> Result<Vec<TensorMeta>> {
+    let mut meta = Vec::with_capacity(insp.tensors.len());
+    for t in &insp.tensors {
+        meta.push(TensorMeta::from_tensor(t, insp.data_start, insp.file_len)?);
+    }
+    Ok(meta)
+}
+
 impl TensorMeta {
     fn from_tensor(t: &GgufTensor, data_start: u64, file_len: u64) -> Result<Self> {
         let (in_dim, out_dim) = match t.dims.len() {
@@ -115,6 +123,140 @@ struct LayerVectors {
 enum LayerState {
     Linear { gdn: GdnState, conv: ConvState },
     Full { kv_slot: usize },
+}
+
+/// Read-only tensor source for device clients: tensor geometry plus
+/// bounded chunk reads over a verified artifact handle — no KV cache, no
+/// recurrent state, no CPU inference allocations.
+pub trait TensorSource {
+    fn config(&self) -> &Qwen35Config;
+    fn layout(&self) -> &Qwen35Layout;
+    fn tensor_type_id(&self, tensor_index: usize) -> Result<u32>;
+    fn tensor_dims(&self, tensor_index: usize) -> Result<(u64, u64)>;
+    fn tensor_bytes(&self, tensor_index: usize) -> Result<u64>;
+    /// Fill `dst` with `dst.len()` bytes of the tensor starting at
+    /// `offset` (bounded staging; the caller sizes `dst`).
+    fn read_tensor_into(&self, tensor_index: usize, offset: u64, dst: &mut [u8]) -> Result<()>;
+    /// Whole small vector, dequantized (norms, gates, conv kernels).
+    fn read_vector(&self, tensor_index: usize) -> Result<Vec<f32>>;
+}
+
+/// Lightweight tensor source over an opened artifact file: inspection
+/// and the resolved contract only. Used by device clients so they never
+/// depend on a CPU inference session.
+pub struct ArtifactTensorSource {
+    file: File,
+    meta: Vec<TensorMeta>,
+    cfg: Qwen35Config,
+    layout: Qwen35Layout,
+}
+
+impl ArtifactTensorSource {
+    pub fn open(path: &Path) -> Result<Self> {
+        let file = File::open(path).map_err(|e| {
+            TuckmillError::new(
+                ErrorCode::StorageLost,
+                format!("cannot open artifact {}: {e}", path.display()),
+            )
+        })?;
+        Self::from_open_file(&file)
+    }
+
+    /// Build from an already-opened (potentially already-verified) file
+    /// handle; inspection reads through the same handle.
+    pub fn from_open_file(file: &File) -> Result<Self> {
+        let len = file
+            .metadata()
+            .map_err(|e| {
+                TuckmillError::new(ErrorCode::StorageLost, format!("cannot stat artifact: {e}"))
+            })?
+            .len();
+        let mut reader = file;
+        let insp = gguf::inspect_reader(&mut reader, len, &Limits::default(), None)?;
+        let registry = AdapterRegistry::builtin()?;
+        let (cfg, layout) = resolve(&insp, &registry)?;
+        Ok(Self {
+            file: file.try_clone().map_err(|e| {
+                TuckmillError::new(
+                    ErrorCode::StorageLost,
+                    format!("cannot clone the verified artifact handle: {e}"),
+                )
+            })?,
+            meta: build_tensor_meta(&insp)?,
+            cfg,
+            layout,
+        })
+    }
+}
+
+impl TensorSource for ArtifactTensorSource {
+    fn config(&self) -> &Qwen35Config {
+        &self.cfg
+    }
+
+    fn layout(&self) -> &Qwen35Layout {
+        &self.layout
+    }
+
+    fn tensor_type_id(&self, tensor_index: usize) -> Result<u32> {
+        Ok(self.meta_of(tensor_index)?.type_id)
+    }
+
+    fn tensor_dims(&self, tensor_index: usize) -> Result<(u64, u64)> {
+        let m = self.meta_of(tensor_index)?;
+        Ok((m.in_dim, m.out_dim))
+    }
+
+    fn tensor_bytes(&self, tensor_index: usize) -> Result<u64> {
+        Ok(self.meta_of(tensor_index)?.byte_size)
+    }
+
+    fn read_tensor_into(&self, tensor_index: usize, offset: u64, dst: &mut [u8]) -> Result<()> {
+        let m = *self.meta_of(tensor_index)?;
+        if offset + dst.len() as u64 > m.byte_size {
+            return Err(TuckmillError::new(
+                ErrorCode::Internal,
+                format!("tensor {tensor_index} read past its {} bytes", m.byte_size),
+            ));
+        }
+        let mut done = 0usize;
+        while done < dst.len() {
+            let n = self
+                .file
+                .read_at(&mut dst[done..], m.offset + offset + done as u64)
+                .map_err(|e| {
+                    TuckmillError::new(ErrorCode::StorageLost, format!("artifact read failed: {e}"))
+                })?;
+            if n == 0 {
+                return Err(TuckmillError::new(
+                    ErrorCode::StorageLost,
+                    "artifact ended early while reading a tensor",
+                ));
+            }
+            done += n;
+        }
+        Ok(())
+    }
+
+    fn read_vector(&self, tensor_index: usize) -> Result<Vec<f32>> {
+        let m = *self.meta_of(tensor_index)?;
+        let mut bytes = vec![0u8; m.byte_size as usize];
+        self.read_tensor_into(tensor_index, 0, &mut bytes)?;
+        let mut out = Vec::new();
+        tensor::dequant_into(m.type_id, &bytes, &mut out)?;
+        Ok(out)
+    }
+}
+
+impl ArtifactTensorSource {
+    fn meta_of(&self, tensor_index: usize) -> Result<&TensorMeta> {
+        self.meta.get(tensor_index).ok_or_else(|| {
+            TuckmillError::new(
+                ErrorCode::Internal,
+                format!("tensor index {tensor_index} is outside the inspected range"),
+            )
+        })
+    }
 }
 
 /// The reference model: config, layout, file access, state and scratch.
@@ -980,6 +1122,62 @@ struct FullTensors {
     k: usize,
     v: usize,
     output: usize,
+}
+
+impl TensorSource for Qwen35Model {
+    fn config(&self) -> &Qwen35Config {
+        &self.cfg
+    }
+
+    fn layout(&self) -> &Qwen35Layout {
+        &self.layout
+    }
+
+    fn tensor_type_id(&self, tensor_index: usize) -> Result<u32> {
+        Qwen35Model::tensor_type_id(self, tensor_index)
+    }
+
+    fn tensor_dims(&self, tensor_index: usize) -> Result<(u64, u64)> {
+        Qwen35Model::tensor_dims(self, tensor_index)
+    }
+
+    fn tensor_bytes(&self, tensor_index: usize) -> Result<u64> {
+        Ok(self.meta_of(tensor_index)?.byte_size)
+    }
+
+    fn read_tensor_into(&self, tensor_index: usize, offset: u64, dst: &mut [u8]) -> Result<()> {
+        let m = *self.meta_of(tensor_index)?;
+        if offset + dst.len() as u64 > m.byte_size {
+            return Err(TuckmillError::new(
+                ErrorCode::Internal,
+                format!("tensor {tensor_index} read past its {} bytes", m.byte_size),
+            ));
+        }
+        let mut done = 0usize;
+        while done < dst.len() {
+            let n = self
+                .file
+                .read_at(&mut dst[done..], m.offset + offset + done as u64)
+                .map_err(|e| {
+                    TuckmillError::new(
+                        ErrorCode::StorageLost,
+                        format!("artifact read failed at offset {}: {e}", m.offset + offset),
+                    )
+                })?;
+            if n == 0 {
+                return Err(TuckmillError::new(
+                    ErrorCode::StorageLost,
+                    "artifact ended early while reading a tensor",
+                ));
+            }
+            done += n;
+        }
+        Ok(())
+    }
+
+    fn read_vector(&self, tensor_index: usize) -> Result<Vec<f32>> {
+        Qwen35Model::read_vector(self, tensor_index)
+    }
 }
 
 #[cfg(test)]
