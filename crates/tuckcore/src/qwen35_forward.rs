@@ -129,6 +129,94 @@ pub struct Qwen35Model {
     cache: Qwen35KvCache,
     state: Vec<LayerState>,
     positions: usize,
+    scratch_bound: u64,
+    /// A step that failed part-way may have advanced some layer state and
+    /// not others; such a session is invalid until reset. Interrupted
+    /// state is never reused (Q35-1E).
+    session_valid: bool,
+}
+
+/// Preflight byte budget of the reference executor for one admitted
+/// context: the weights payload (streamed row-on-demand, never resident),
+/// the packed KV state, the recurrent/convolution state and a
+/// conservative bound of the f32 scratch the forward pass allocates.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Qwen35Budget {
+    pub weights_payload: u64,
+    pub kv_state: u64,
+    pub recurrent_state: u64,
+    pub scratch: u64,
+}
+
+impl Qwen35Budget {
+    pub fn state_total(&self) -> u64 {
+        self.kv_state.saturating_add(self.recurrent_state)
+    }
+}
+
+/// Conservative upper bound of f32 scratch the per-token forward pass
+/// allocates (elements x 4 bytes), including the capacity-sized attention
+/// slabs that decode the packed cache per layer.
+fn scratch_bound(cfg: &Qwen35Config, capacity: u64) -> Result<u64> {
+    let hidden = cfg.hidden;
+    let ffn = cfg.ffn;
+    let inner = cfg.gdn.inner;
+    let dt = cfg.gdn.dt_rank;
+    let hd = cfg.head_dim;
+    let hq = cfg.heads;
+    let kvh = cfg.kv_heads;
+    let qkv_rows = cfg.qkv_rows();
+    let elems = hidden // x
+        .saturating_add(hidden) // h
+        .saturating_add(hidden) // h2
+        .saturating_add(hidden) // proj
+        .saturating_add(qkv_rows) // projection
+        .saturating_add(qkv_rows) // conv_out
+        .saturating_add(inner) // z
+        .saturating_add(inner) // o
+        .saturating_add(2 * dt)
+        .saturating_add(ffn * 2)
+        .saturating_add(hidden) // ffn down
+        .saturating_add(2 * hq * hd) // qg
+        .saturating_add(hq * hd) // q
+        .saturating_add(hq * hd) // gate
+        .saturating_add(2 * kvh * hd) // k + v
+        .saturating_add(hq * hd) // attn_out
+        .saturating_add(hd) // probe row
+        .saturating_add(2 * kvh * capacity * hd) // decoded slabs (K and V)
+        .saturating_add(hidden * 2); // dequant row buffers (generous)
+    elems
+        .checked_mul(4)
+        .ok_or_else(|| TuckmillError::new(ErrorCode::InvalidPlan, "qwen35 scratch bound overflows"))
+}
+
+/// Preflight the byte budget for a context before anything allocates.
+pub fn required_bytes(
+    insp: &tuckmill_manifest::gguf::GgufInspection,
+    capacity: u64,
+    precision: KvPrecision,
+) -> Result<Qwen35Budget> {
+    let registry = AdapterRegistry::builtin()?;
+    let (cfg, layout) = resolve(insp, &registry)?;
+    let per_token = layout
+        .state
+        .attention_layers
+        .checked_mul(cfg.kv_heads)
+        .and_then(|v| v.checked_mul(cfg.head_dim))
+        .and_then(|v| v.checked_mul(2)) // key + value
+        .and_then(|v| v.checked_mul(precision.element_bytes() as u64))
+        .ok_or_else(|| TuckmillError::new(ErrorCode::InvalidPlan, "qwen35 KV budget overflows"))?;
+    let kv_state = per_token
+        .checked_mul(capacity)
+        .ok_or_else(|| TuckmillError::new(ErrorCode::InvalidPlan, "qwen35 KV budget overflows"))?;
+    let recurrent_state = layout.state.bytes_for(&cfg, 0, 0)?;
+    let weights_payload = insp.tensors.iter().map(|t| t.byte_size).sum();
+    Ok(Qwen35Budget {
+        weights_payload,
+        kv_state,
+        recurrent_state,
+        scratch: scratch_bound(&cfg, capacity)?,
+    })
 }
 
 impl Qwen35Model {
@@ -136,15 +224,38 @@ impl Qwen35Model {
     /// admitted state: KV planes for `capacity` positions at the declared
     /// precision, plus the recurrent/convolution state of every GDN layer.
     pub fn open(path: &Path, capacity: usize, precision: KvPrecision) -> Result<Self> {
-        let insp = gguf::inspect(path, &Limits::default())?;
-        let registry = AdapterRegistry::builtin()?;
-        let (cfg, layout) = resolve(&insp, &registry)?;
         let file = File::open(path).map_err(|e| {
             TuckmillError::new(
                 ErrorCode::StorageLost,
                 format!("cannot open artifact {}: {e}", path.display()),
             )
         })?;
+        let len = file
+            .metadata()
+            .map_err(|e| {
+                TuckmillError::new(
+                    ErrorCode::StorageLost,
+                    format!("cannot stat artifact {}: {e}", path.display()),
+                )
+            })?
+            .len();
+        let mut reader = &file;
+        let insp = gguf::inspect_reader(&mut reader, len, &Limits::default(), None)?;
+        Self::open_with_handle(&file, &insp, capacity, precision)
+    }
+
+    /// Build from an already-verified file handle and inspection: the
+    /// executor's load path digests this exact handle, so the bytes that
+    /// were verified are the bytes every weight read decodes (never a
+    /// pathname reopen).
+    pub fn open_with_handle(
+        file: &File,
+        insp: &tuckmill_manifest::gguf::GgufInspection,
+        capacity: usize,
+        precision: KvPrecision,
+    ) -> Result<Self> {
+        let registry = AdapterRegistry::builtin()?;
+        let (cfg, layout) = resolve(insp, &registry)?;
 
         let mut meta = Vec::with_capacity(insp.tensors.len());
         for t in &insp.tensors {
@@ -172,9 +283,16 @@ impl Qwen35Model {
                 capacity,
                 precision,
             )?,
+            scratch_bound: scratch_bound(&cfg, capacity as u64)?,
+            session_valid: true,
             cfg,
             layout,
-            file,
+            file: file.try_clone().map_err(|e| {
+                TuckmillError::new(
+                    ErrorCode::StorageLost,
+                    format!("cannot clone the verified artifact handle: {e}"),
+                )
+            })?,
             meta,
             vectors: Vec::new(),
             output_norm: Vec::new(),
@@ -183,6 +301,54 @@ impl Qwen35Model {
         };
         model.load_vectors()?;
         Ok(model)
+    }
+
+    /// Packed KV bytes currently allocated.
+    pub fn kv_bytes(&self) -> u64 {
+        self.cache.bytes()
+    }
+
+    /// Delta-rule plus convolution state bytes currently allocated.
+    pub fn recurrent_bytes(&self) -> u64 {
+        self.state
+            .iter()
+            .map(|state| match state {
+                LayerState::Linear { gdn, conv } => gdn.state_bytes() + conv.state_bytes(),
+                LayerState::Full { .. } => 0,
+            })
+            .sum()
+    }
+
+    /// All session state bytes (KV + recurrent), the number the plan's
+    /// KV-state reservation must cover.
+    pub fn state_bytes(&self) -> u64 {
+        self.kv_bytes() + self.recurrent_bytes()
+    }
+
+    /// Conservative scratch bound of this instance (matches
+    /// [`required_bytes`] for the same geometry).
+    pub fn scratch_bound_bytes(&self) -> u64 {
+        self.scratch_bound
+    }
+
+    fn ensure_valid(&self) -> Result<()> {
+        if !self.session_valid {
+            return Err(TuckmillError::new(
+                ErrorCode::InvalidRequest,
+                "qwen35 session was interrupted and its partial state was discarded",
+            )
+            .with_action(
+                "Reset the session before continuing; interrupted recurrent state is never reused.",
+            ));
+        }
+        Ok(())
+    }
+
+    fn finish(&mut self, result: Result<()>) -> Result<()> {
+        if result.is_err() {
+            self.session_valid = false;
+        }
+        result
     }
 
     pub fn config(&self) -> &Qwen35Config {
@@ -209,6 +375,7 @@ impl Qwen35Model {
             }
         }
         self.positions = 0;
+        self.session_valid = true;
     }
 
     /// FNV-1a over every stateful byte (KV planes, delta-rule state,
@@ -240,29 +407,56 @@ impl Qwen35Model {
     /// per chunk or once per token — both paths run the identical
     /// per-token arithmetic and must agree bitwise (tested).
     pub fn forward_tokens(&mut self, tokens: &[u32], logits: &mut Vec<f32>) -> Result<()> {
+        self.forward_tokens_with_poll(tokens, logits, &|| false)
+    }
+
+    /// Teacher-forced prefill with a cancellation poll: `cancel` is
+    /// checked before every served layer, so an interrupted step discards
+    /// the session (partial recurrent state is never reused) and reports
+    /// [`ErrorCode::Cancelled`].
+    pub fn forward_tokens_with_poll(
+        &mut self,
+        tokens: &[u32],
+        logits: &mut Vec<f32>,
+        cancel: &dyn Fn() -> bool,
+    ) -> Result<()> {
+        self.ensure_valid()?;
         if tokens.is_empty() {
-            return Err(TuckmillError::new(
+            return self.finish(Err(TuckmillError::new(
                 ErrorCode::InvalidRequest,
                 "forward needs at least one token id",
-            ));
+            )));
         }
-        for (i, token) in tokens.iter().enumerate() {
-            let last = i + 1 == tokens.len();
-            if last {
-                self.forward_one(*token, Some(logits))?;
-            } else {
-                self.forward_one(*token, None)?;
+        let result = (|| {
+            for (i, token) in tokens.iter().enumerate() {
+                if cancel() {
+                    return Err(cancelled_error());
+                }
+                let last = i + 1 == tokens.len();
+                if last {
+                    self.forward_one(*token, Some(logits), Some(cancel))?;
+                } else {
+                    self.forward_one(*token, None, Some(cancel))?;
+                }
             }
-        }
-        Ok(())
+            Ok(())
+        })();
+        self.finish(result)
     }
 
     /// Single-token step returning that token's logits.
     pub fn forward_token(&mut self, token: u32, logits: &mut Vec<f32>) -> Result<()> {
-        self.forward_one(token, Some(logits))
+        self.ensure_valid()?;
+        let result = self.forward_one(token, Some(logits), None);
+        self.finish(result)
     }
 
-    fn forward_one(&mut self, token: u32, logits: Option<&mut Vec<f32>>) -> Result<()> {
+    fn forward_one(
+        &mut self,
+        token: u32,
+        logits: Option<&mut Vec<f32>>,
+        cancel: Option<&dyn Fn() -> bool>,
+    ) -> Result<()> {
         let hidden = self.cfg.hidden as usize;
         let vocab = self.cfg.vocab as usize;
         if token as u64 >= self.cfg.vocab {
@@ -279,6 +473,11 @@ impl Qwen35Model {
         self.embedding_row(token, &mut x)?;
 
         for l in 0..self.layout.layers.len() {
+            if let Some(cancel) = cancel {
+                if cancel() {
+                    return Err(cancelled_error());
+                }
+            }
             self.layer(l, &mut x, pos)?;
         }
 
@@ -706,6 +905,14 @@ impl Qwen35Model {
     }
 }
 
+fn cancelled_error() -> TuckmillError {
+    TuckmillError::new(
+        ErrorCode::Cancelled,
+        "qwen35 forward cancelled; the session was discarded",
+    )
+    .with_action("Partial recurrent state is never reused; reset the session before continuing.")
+}
+
 /// Tensor indices of one Gated DeltaNet layer (into the inspection).
 #[derive(Debug, Clone, Copy)]
 struct GdnTensors {
@@ -804,6 +1011,85 @@ mod tests {
         assert_eq!(la, lb);
     }
 
+    /// The preflight budget equals what the model actually allocates for
+    /// state and scratch (planner-versus-allocation equality at the model
+    /// level).
+    #[test]
+    fn required_bytes_match_actual_allocations() {
+        let bytes = synthetic_qwen3_bytes(&SyntheticConfig::tiny_qwen35());
+        let (_dir, model) = fixture_model(12);
+        let mut cursor = std::io::Cursor::new(bytes.clone());
+        let insp = tuckmill_manifest::gguf::inspect_reader(
+            &mut cursor,
+            bytes.len() as u64,
+            &Limits::default(),
+            None,
+        )
+        .unwrap();
+        let budget = required_bytes(&insp, 12, KvPrecision::F16).unwrap();
+        assert_eq!(budget.kv_state, model.kv_bytes());
+        assert_eq!(budget.recurrent_state, model.recurrent_bytes());
+        assert_eq!(budget.scratch, model.scratch_bound_bytes());
+        assert_eq!(budget.state_total(), model.state_bytes());
+        let expected_payload: u64 = insp.tensors.iter().map(|t| t.byte_size).sum();
+        assert_eq!(budget.weights_payload, expected_payload);
+    }
+
+    /// A step that fails part-way invalidates the session; nothing of the
+    /// partial state is reused until reset.
+    #[test]
+    fn interrupted_steps_invalidate_the_session() {
+        let (_dir, mut model) = fixture_model(2);
+        let mut logits = Vec::new();
+        let err = model.forward_tokens(&[1, 2, 3], &mut logits).unwrap_err();
+        assert_eq!(
+            err.code(),
+            ErrorCode::InvalidPlan,
+            "capacity exhausted mid-step"
+        );
+
+        let err = model.forward_tokens(&[1], &mut logits).unwrap_err();
+        assert_eq!(err.code(), ErrorCode::InvalidRequest);
+        assert!(err.message().contains("interrupted"), "{}", err.message());
+        assert!(err.action().contains("Reset"), "{err}");
+
+        model.reset();
+        model.forward_tokens(&[1, 2], &mut logits).unwrap();
+        assert_eq!(model.positions(), 2);
+    }
+
+    /// Cancellation is polled before every served layer; a cancelled run
+    /// discards the session and a reset restores bitwise-identical output.
+    #[test]
+    fn cancellation_invalidates_and_reset_restores() {
+        let (_dir_a, mut baseline) = fixture_model(8);
+        let mut expected = Vec::new();
+        baseline.forward_tokens(&[5, 6, 7], &mut expected).unwrap();
+
+        let (_dir_b, mut model) = fixture_model(8);
+        let polls = std::cell::Cell::new(0usize);
+        let cancel = || {
+            polls.set(polls.get() + 1);
+            polls.get() > 3
+        };
+        let mut logits = Vec::new();
+        let err = model
+            .forward_tokens_with_poll(&[5, 6, 7], &mut logits, &cancel)
+            .unwrap_err();
+        assert_eq!(err.code(), ErrorCode::Cancelled);
+
+        let err = model.forward_token(5, &mut logits).unwrap_err();
+        assert_eq!(err.code(), ErrorCode::InvalidRequest, "session discarded");
+
+        model.reset();
+        let mut restored = Vec::new();
+        model.forward_tokens(&[5, 6, 7], &mut restored).unwrap();
+        assert_eq!(
+            restored, expected,
+            "reset restores bitwise-identical output"
+        );
+    }
+
     fn real_artifact_path() -> Option<std::path::PathBuf> {
         let p = std::env::var("TUCKMILL_QWEN35_GGUF").ok()?;
         let p = std::path::PathBuf::from(p);
@@ -819,8 +1105,22 @@ mod tests {
             eprintln!("skipping: TUCKMILL_QWEN35_GGUF not set (pinned Qwen3.5-0.8B Q8_0)");
             return;
         };
+        // Static budget on the pinned geometry, before any allocation.
+        let file = std::fs::File::open(&path).unwrap();
+        let len = file.metadata().unwrap().len();
+        let mut reader = &file;
+        let insp =
+            tuckmill_manifest::gguf::inspect_reader(&mut reader, len, &Limits::default(), None)
+                .unwrap();
+        let budget = required_bytes(&insp, 2048, KvPrecision::F16).unwrap();
+        assert_eq!(budget.kv_state, 25_165_824);
+        assert_eq!(budget.recurrent_state, 20_201_472);
+        assert_eq!(budget.state_total(), 45_367_296);
+
         let mut model = Qwen35Model::open(&path, 16, KvPrecision::F16).unwrap();
         assert_eq!(model.config().layers, 24);
+        assert_eq!(model.kv_bytes(), 6 * 2 * 256 * 2 * 2 * 16);
+        assert_eq!(model.recurrent_bytes(), 20_201_472);
         let tokens = [9707u32, 11, 1879, 1000, 358, 1079, 13, 1000];
         let mut logits = Vec::new();
         model.forward_tokens(&tokens, &mut logits).unwrap();

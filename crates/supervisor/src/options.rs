@@ -193,13 +193,33 @@ impl ExecutionOptions {
 
     /// Bytes per KV element in the engine's *actual* storage representation.
     /// This is the number the planner must price; a nominal precision is
-    /// never used. TuckCore's bounded KV state stores f32 values even in its
-    /// f16-rounded mode, so it is always 4 bytes; llama.cpp honors its
-    /// configured cache type (f16 default). The reference test engine
-    /// allocates no KV state and takes the declared fallback assumption.
-    pub fn kv_bytes_per_element(&self, kind: EngineKind, fallback: u32) -> u32 {
+    /// never used. The width is resolved by backend AND model family:
+    ///
+    /// - TuckCore + dense attention keeps f32 values even in its f16-rounded
+    ///   mode, so it is always 4 bytes;
+    /// - TuckCore + hybrid linear attention (qwen35) stores packed KV at the
+    ///   declared precision — f16 by default, f32 when selected — so the
+    ///   planner prices 2 or 4 exactly as the executor allocates;
+    /// - llama.cpp honors its configured cache type (f16 default);
+    /// - the reference test engine allocates no KV state and takes the
+    ///   declared fallback assumption.
+    pub fn kv_bytes_per_element(
+        &self,
+        kind: EngineKind,
+        hybrid_linear_attention: bool,
+        fallback: u32,
+    ) -> u32 {
         match kind {
-            EngineKind::TuckCore => 4,
+            EngineKind::TuckCore => {
+                if hybrid_linear_attention {
+                    match self.kv_precision.as_deref() {
+                        Some("f32") => 4,
+                        _ => 2,
+                    }
+                } else {
+                    4
+                }
+            }
             EngineKind::LlamaCpp => match self.kv_precision.as_deref() {
                 Some("f32") => 4,
                 _ => 2,
@@ -351,5 +371,52 @@ mod tests {
             ..Default::default()
         };
         assert!(llama.validate(EngineKind::LlamaCpp).is_err());
+    }
+}
+
+#[cfg(test)]
+mod kv_width_tests {
+    use super::*;
+
+    #[test]
+    fn kv_width_resolves_by_backend_and_model_family() {
+        // Dense TuckCore keeps f32 values regardless of the nominal profile.
+        let dense = ExecutionOptions::default();
+        assert_eq!(
+            dense.kv_bytes_per_element(EngineKind::TuckCore, false, 2),
+            4
+        );
+
+        // Hybrid (qwen35) packed KV prices the declared precision.
+        let default_hybrid = ExecutionOptions::default();
+        assert_eq!(
+            default_hybrid.kv_bytes_per_element(EngineKind::TuckCore, true, 2),
+            2,
+            "packed f16 is the default"
+        );
+        let f32_kv = ExecutionOptions {
+            kv_precision: Some("f32".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(
+            f32_kv.kv_bytes_per_element(EngineKind::TuckCore, true, 2),
+            4
+        );
+        assert_eq!(
+            f32_kv.kv_bytes_per_element(EngineKind::LlamaCpp, false, 2),
+            4
+        );
+
+        // llama.cpp honors its cache type; the reference test engine takes
+        // the declared fallback.
+        let llama = ExecutionOptions::default();
+        assert_eq!(
+            llama.kv_bytes_per_element(EngineKind::LlamaCpp, false, 4),
+            2
+        );
+        assert_eq!(
+            llama.kv_bytes_per_element(EngineKind::ReferenceTest, true, 3),
+            3
+        );
     }
 }

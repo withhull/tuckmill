@@ -533,9 +533,11 @@ impl Runtime {
                 context: tuckmill_manifest::plan::PlanContext::new(context_total, max_output),
                 requested_budget: budget,
                 policy: self.policy.clone(),
-                kv_bytes_per_element: self
-                    .execution
-                    .kv_bytes_per_element(self.engine_kind, self.policy.kv_bytes_per_element),
+                kv_bytes_per_element: self.execution.kv_bytes_per_element(
+                    self.engine_kind,
+                    adapter.traits.hybrid_linear_attention,
+                    self.policy.kv_bytes_per_element,
+                ),
             },
             &calibration,
         )

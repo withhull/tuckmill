@@ -187,3 +187,32 @@ never accepted by any real artifact.
   at reference logit scale 20.6 (registered tolerances 0.5 / 0.1). The
   profile difference is declared: the oracle keeps f32 activations while
   llama.cpp quantizes activations to Q8_0 on the Q8_0 weight path.
+
+## Addendum 7 (Q35-1E, session contract)
+
+- **Verified-handle open.** `Qwen35Model::open_with_handle` builds the
+  reference from the executor's already-digested file handle and
+  inspection; the path-based `open` now inspects through the opened file
+  itself. Weight reads and inspection always come from the exact bytes
+  that were (or will be) verified — never a pathname reopen.
+- **Session invalidation.** Any step that fails part-way marks the
+  session invalid; subsequent forwards refuse until `reset()`. Partial
+  recurrent/KV state is never reused (tested with a capacity-exhaustion
+  interruption).
+- **Cancellation polling.** `forward_tokens_with_poll` checks the
+  cancellation callback before every served layer; a cancelled forward
+  reports `Cancelled` and discards the session. Reset restores
+  bitwise-identical output (tested).
+- **KV storage contract hardened.** Writes are strictly sequential per
+  attention layer with typed refusals for invalid layer indices and
+  out-of-order tokens; reads refuse positions that were never written
+  (allocated capacity and initialized state are distinct facts;
+  checksum includes per-layer counts).
+- **Preflight budget and exact pricing.** `required_bytes` computes the
+  weights payload, packed KV, recurrent/conv state and a conservative
+  scratch bound from inspected geometry before anything allocates; the
+  model's actual allocations equal it (fixture and pinned numbers:
+  25,165,824 B KV at ctx 2048 f16, 20,201,472 B state). The supervisor's
+  KV width is now resolved by backend AND model family: dense TuckCore
+  stays 4 B/element (f32 store), hybrid TuckCore prices the declared
+  packed precision (2 default, 4 for f32), llama.cpp unchanged.

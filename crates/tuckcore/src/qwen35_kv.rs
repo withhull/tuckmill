@@ -81,6 +81,10 @@ pub struct Qwen35KvCache {
     capacity: usize,
     keys: Vec<Plane>,
     values: Vec<Plane>,
+    /// Per layer: how many tokens have been written. Writes are strictly
+    /// sequential and reads refuse positions that were never written —
+    /// allocated capacity is not the same fact as initialized state.
+    written: Vec<usize>,
 }
 
 impl Qwen35KvCache {
@@ -116,6 +120,7 @@ impl Qwen35KvCache {
             capacity,
             keys,
             values,
+            written: vec![0; attention_layers],
         })
     }
 
@@ -135,6 +140,12 @@ impl Qwen35KvCache {
                 Plane::F32(values) => values.fill(0.0),
             }
         }
+        self.written.fill(0);
+    }
+
+    /// Tokens written per layer (all equal during a well-formed session).
+    pub fn layer_positions(&self) -> &[usize] {
+        &self.written
     }
 
     pub fn attention_layers(&self) -> usize {
@@ -160,6 +171,9 @@ impl Qwen35KvCache {
                 hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
             }
         };
+        for count in &self.written {
+            mix(*count as u64);
+        }
         for plane in self.keys.iter().chain(self.values.iter()) {
             match plane {
                 Plane::F16(bits) => {
@@ -188,6 +202,24 @@ impl Qwen35KvCache {
         v_rows: &[f32],
     ) -> Result<()> {
         let (stride, plane_len) = self.shape()?;
+        if layer >= self.keys.len() {
+            return Err(TuckmillError::new(
+                ErrorCode::Internal,
+                format!(
+                    "KV write for attention layer {layer} with only {} layers allocated",
+                    self.keys.len()
+                ),
+            ));
+        }
+        if token != self.written[layer] {
+            return Err(TuckmillError::new(
+                ErrorCode::Internal,
+                format!(
+                    "KV writes must be sequential: layer {layer} has {} tokens written, got token {token}",
+                    self.written[layer]
+                ),
+            ));
+        }
         if token >= self.capacity {
             return Err(TuckmillError::new(
                 ErrorCode::InvalidPlan,
@@ -211,6 +243,7 @@ impl Qwen35KvCache {
             self.keys[layer].write(base + offset, *k);
             self.values[layer].write(base + offset, *v);
         }
+        self.written[layer] += 1;
         Ok(())
     }
 
@@ -253,6 +286,15 @@ impl Qwen35KvCache {
             return Err(TuckmillError::new(
                 ErrorCode::Internal,
                 format!("KV read out of range (layer {layer}, head {head}, token {token})"),
+            ));
+        }
+        if token >= self.written[layer] {
+            return Err(TuckmillError::new(
+                ErrorCode::Internal,
+                format!(
+                    "KV position {token} in layer {layer} was never written ({} initialized)",
+                    self.written[layer]
+                ),
             ));
         }
         if out.len() != self.head_dim {
@@ -482,5 +524,49 @@ mod tests {
         for (a, b) in out_f32.iter().zip(out_packed.iter()) {
             assert!((a - b).abs() <= 1e-3, "{a} vs {b}");
         }
+    }
+}
+
+#[cfg(test)]
+mod hardening_tests {
+    use super::*;
+
+    #[test]
+    fn invalid_layer_and_non_sequential_writes_refuse_without_panicking() {
+        let mut cache = Qwen35KvCache::new(1, 1, 2, 4, KvPrecision::F16).unwrap();
+        let rows = [1.0f32, 2.0];
+        let err = cache.write(1, 0, &rows, &rows).unwrap_err();
+        assert_eq!(err.code(), ErrorCode::Internal);
+        assert!(
+            err.message().contains("attention layer 1"),
+            "{}",
+            err.message()
+        );
+
+        cache.write(0, 0, &rows, &rows).unwrap();
+        let err = cache.write(0, 2, &rows, &rows).unwrap_err();
+        assert_eq!(err.code(), ErrorCode::Internal);
+        assert!(err.message().contains("sequential"), "{}", err.message());
+    }
+
+    #[test]
+    fn uninitialized_positions_refuse_reads() {
+        let mut cache = Qwen35KvCache::new(1, 1, 2, 4, KvPrecision::F16).unwrap();
+        let rows = [1.0f32, 2.0];
+        let mut out = [0.0f32; 2];
+        // Nothing written yet: even an allocated position is unreadable.
+        let err = cache.key_row(0, 0, 0, &mut out).unwrap_err();
+        assert!(err.message().contains("never written"), "{}", err.message());
+
+        cache.write(0, 0, &rows, &rows).unwrap();
+        cache.key_row(0, 0, 0, &mut out).unwrap();
+        let err = cache.value_row(0, 0, 1, &mut out).unwrap_err();
+        assert!(err.message().contains("never written"), "{}", err.message());
+        assert_eq!(cache.layer_positions(), &[1]);
+
+        cache.reset();
+        assert_eq!(cache.layer_positions(), &[0]);
+        let err = cache.key_row(0, 0, 0, &mut out).unwrap_err();
+        assert!(err.message().contains("never written"), "{}", err.message());
     }
 }
