@@ -2143,9 +2143,16 @@ mod tests {
         // First request loads the worker.
         run_once(4);
         assert_eq!(runtime.worker_generation(), 1);
-        let evictions_before = runtime.backend_stats().map(|s| s.evictions).unwrap_or(0);
+        let trims_before = runtime
+            .backend_stats()
+            .and_then(|s| s.trims_applied)
+            .unwrap_or(0);
 
-        // Warning pressure while the second (reused) request runs.
+        // Warning pressure while the second (reused) request runs. The
+        // observable is the engine applying the trim at a safe checkpoint
+        // (`trims_applied`), not an eviction count: evicting an empty
+        // expendable set is legitimately zero and must not decide this
+        // regression (CI run 39021538597 exposed exactly that flake).
         signals.set_pressure(crate::pressure::PressureLevel::Warning);
         run_once(24);
         signals.set_pressure(crate::pressure::PressureLevel::Normal);
@@ -2155,10 +2162,13 @@ mod tests {
             1,
             "the second request reused the worker"
         );
-        let evictions_after = runtime.backend_stats().map(|s| s.evictions).unwrap_or(0);
+        let trims_after = runtime
+            .backend_stats()
+            .and_then(|s| s.trims_applied)
+            .unwrap_or(0);
         assert!(
-            evictions_after > evictions_before,
-            "the trim command must reach the reused worker's backend: evictions {evictions_before} -> {evictions_after}"
+            trims_after > trims_before,
+            "the trim command must reach the reused worker's backend and be applied: trims {trims_before} -> {trims_after}"
         );
         runtime.shutdown();
     }

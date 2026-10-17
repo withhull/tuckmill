@@ -320,6 +320,10 @@ pub struct ProfileCounters {
     pub load_nanos: AtomicU64,
     pub content_verify_nanos: AtomicU64,
     pub tokens: AtomicU64,
+    /// Cache trims applied at safe checkpoints (governor `trim-caches`
+    /// commands). The honest "backend action" signal: an eviction count can
+    /// be zero when nothing expendable is cached, which is not a failure.
+    pub trims_applied: AtomicU64,
 }
 
 impl ProfileCounters {

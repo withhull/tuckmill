@@ -134,6 +134,10 @@ impl TuckCore {
             return 0;
         };
         let evicted = loaded.loader.evict_all();
+        loaded
+            .counters
+            .trims_applied
+            .fetch_add(1, Ordering::Relaxed);
         self.applied_trim_epoch.store(requested, Ordering::Relaxed);
         evicted
     }
@@ -790,6 +794,7 @@ impl InferenceBackend for TuckCore {
                         bytes => Some(bytes),
                     },
                     retained_weight_bytes: Some(loaded.retained_weight_bytes),
+                    trims_applied: Some(loaded.counters.trims_applied.load(Ordering::Relaxed)),
                     threads: Some(1), // scalar executor is single-threaded
                     kernel_impl: Some(loaded.kernels.as_str().to_string()),
                     numerical_profile: Some(loaded.profile.as_str().to_string()),

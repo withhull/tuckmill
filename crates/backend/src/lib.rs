@@ -415,6 +415,10 @@ pub struct BackendStats {
     /// the worker: model identity alone is not resource admission.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub retained_weight_bytes: Option<u64>,
+    /// Cache trims applied at safe checkpoints since load (governor
+    /// `trim-caches` commands that reached the engine and were acted on).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trims_applied: Option<u64>,
     /// Thread count in use for compute, when the backend is threaded.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub threads: Option<u32>,
