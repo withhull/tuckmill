@@ -43,9 +43,19 @@ pub struct HybridFixture {
     pub ssm_inner_size: u32,
     pub ssm_conv_kernel: u32,
     pub ssm_time_step_rank: u32,
-    /// When set, the fixture carries a per-layer boolean attention array
-    /// instead of relying on the interval alone.
-    pub recurrent_layers_array: Option<Vec<bool>>,
+    /// When set, the fixture carries a per-layer attention array instead of
+    /// relying on the interval alone. The `U32s` variant writes a malformed
+    /// array (non-boolean entries) for refusal tests.
+    pub recurrent_layers_array: Option<RecurrentLayerFlags>,
+}
+
+/// Per-layer array contents for the hybrid fixture.
+#[derive(Debug, Clone)]
+pub enum RecurrentLayerFlags {
+    /// llama.cpp semantics: true = recurrent (linear attention).
+    Bools(Vec<bool>),
+    /// Deliberately malformed: non-boolean entries.
+    U32s(Vec<u32>),
 }
 
 impl SyntheticConfig {
@@ -122,8 +132,20 @@ impl SyntheticConfig {
     pub fn tiny_qwen35_with_recurrent_array() -> Self {
         let mut cfg = Self::tiny_qwen35();
         if let Some(h) = cfg.hybrid.as_mut() {
-            h.recurrent_layers_array = Some(vec![true, true, true, false]);
+            h.recurrent_layers_array =
+                Some(RecurrentLayerFlags::Bools(vec![true, true, true, false]));
         }
+        cfg
+    }
+
+    /// A served stack that is not a multiple of the attention interval:
+    /// five layers with interval four still has exactly one full-attention
+    /// layer (the last of the only complete group), mirroring llama.cpp's
+    /// `(i + 1) % interval == 0` rule.
+    pub fn tiny_qwen35_non_divisible() -> Self {
+        let mut cfg = Self::tiny_qwen35();
+        cfg.layers = 5;
+        cfg.name = "tuckmill-fixture-qwen35-nondiv".into();
         cfg
     }
 }
@@ -172,11 +194,15 @@ fn build(cfg: &SyntheticConfig) -> Result<Vec<u8>> {
         1,
     )?);
     tensors.push(tensor("output_norm.weight", &[cfg.hidden as u64], 0)?);
-    tensors.push(tensor(
-        "output.weight",
-        &[cfg.hidden as u64, cfg.vocab as u64],
-        1,
-    )?);
+    // The pinned qwen35 artifact ties its output to the token embedding
+    // (no output.weight); dense qwen3 fixtures keep a separate head.
+    if cfg.hybrid.is_none() {
+        tensors.push(tensor(
+            "output.weight",
+            &[cfg.hidden as u64, cfg.vocab as u64],
+            1,
+        )?);
+    }
     fn push_attention_block(
         tensors: &mut Vec<Tensor>,
         p: &dyn Fn(&str) -> String,
@@ -386,9 +412,17 @@ fn build(cfg: &SyntheticConfig) -> Result<Vec<u8>> {
         ));
         kvs.push((format!("{arch}.ssm.inner_size"), KV::U32(hy.ssm_inner_size)));
         if let Some(flags) = &hy.recurrent_layers_array {
+            let (item_type, items) = match flags {
+                RecurrentLayerFlags::Bools(flags) => {
+                    (7, flags.iter().map(|b| KV::Bool(*b)).collect::<Vec<_>>())
+                }
+                RecurrentLayerFlags::U32s(values) => {
+                    (4, values.iter().map(|v| KV::U32(*v)).collect::<Vec<_>>())
+                }
+            };
             kvs.push((
                 format!("{arch}.attention.recurrent_layers"),
-                KV::Array(7, flags.iter().map(|b| KV::Bool(*b)).collect()),
+                KV::Array(item_type, items),
             ));
         }
     }

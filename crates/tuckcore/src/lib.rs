@@ -16,6 +16,7 @@ pub mod gpu;
 pub mod kernels;
 pub mod loader;
 pub mod model;
+pub mod qwen35;
 pub mod tensor;
 pub mod tokenizer;
 

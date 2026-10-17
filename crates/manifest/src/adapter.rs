@@ -312,19 +312,51 @@ impl AdapterSpec {
                 // carries it, states the fact per layer and wins over the
                 // interval. llama.cpp semantics: true = recurrent layer,
                 // so attention layers are the remaining served entries.
-                let recurrent_from_array =
-                    spec.layers_key
-                        .as_deref()
-                        .and_then(|key| match insp.get(key) {
-                            Some(GgufValue::Array(items)) if items.len() as u64 >= layers => Some(
-                                items
-                                    .iter()
-                                    .take(layers as usize)
-                                    .filter(|v| matches!(v, GgufValue::Bool(true)))
-                                    .count() as u64,
-                            ),
-                            _ => None,
-                        });
+                let recurrent_from_array = match spec.layers_key.as_deref() {
+                    None => None,
+                    Some(key) => match insp.get(key) {
+                        None => None,
+                        Some(GgufValue::Array(items)) => {
+                            if (items.len() as u64) < layers {
+                                return Err(TuckmillError::new(
+                                    ErrorCode::UnsupportedArchitecture,
+                                    format!(
+                                        "adapter {}: recurrent layer array {key:?} has {} entries for {layers} served layers",
+                                        self.id,
+                                        items.len()
+                                    ),
+                                ));
+                            }
+                            let mut recurrent = 0u64;
+                            for (i, v) in items.iter().take(layers as usize).enumerate() {
+                                match v {
+                                    GgufValue::Bool(true) => recurrent += 1,
+                                    GgufValue::Bool(false) => {}
+                                    other => {
+                                        return Err(TuckmillError::new(
+                                            ErrorCode::UnsupportedArchitecture,
+                                            format!(
+                                                "adapter {}: recurrent layer array {key:?} entry {i} is {} but a boolean is required",
+                                                self.id,
+                                                other.type_name()
+                                            ),
+                                        ));
+                                    }
+                                }
+                            }
+                            Some(recurrent)
+                        }
+                        Some(_) => {
+                            return Err(TuckmillError::new(
+                                ErrorCode::UnsupportedArchitecture,
+                                format!(
+                                    "adapter {}: recurrent layer key {key:?} is present but not an array",
+                                    self.id
+                                ),
+                            ));
+                        }
+                    },
+                };
                 match recurrent_from_array {
                     Some(recurrent) if recurrent < layers => layers - recurrent,
                     Some(recurrent) => {
@@ -338,7 +370,21 @@ impl AdapterSpec {
                     }
                     None => {
                         let interval = self.get_u64_required(insp, &spec.interval_key)?;
-                        layers / interval + u64::from(layers % interval != 0)
+                        // llama.cpp b11695 qwen35.cpp: a served layer is
+                        // full attention iff `(i + 1) % interval == 0` —
+                        // full groups only. A trailing partial group adds
+                        // no attention layer, so this is floor division.
+                        let attention = layers / interval;
+                        if attention == 0 {
+                            return Err(TuckmillError::new(
+                                ErrorCode::UnsupportedArchitecture,
+                                format!(
+                                    "adapter {}: full-attention interval {interval} exceeds the {layers}-layer served stack",
+                                    self.id
+                                ),
+                            ));
+                        }
+                        attention
                     }
                 }
             }
@@ -594,7 +640,7 @@ impl AdapterRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::testing::{synthetic_qwen3_bytes, SyntheticConfig};
+    use crate::testing::{synthetic_qwen3_bytes, RecurrentLayerFlags, SyntheticConfig};
 
     fn registry() -> AdapterRegistry {
         AdapterRegistry::builtin().unwrap()
@@ -736,11 +782,84 @@ mod tests {
         let r = registry();
         let adapter = r.find("qwen35").unwrap();
         let mut cfg = SyntheticConfig::tiny_qwen35();
-        cfg.hybrid.as_mut().unwrap().recurrent_layers_array = Some(vec![true; 4]);
+        cfg.hybrid.as_mut().unwrap().recurrent_layers_array =
+            Some(RecurrentLayerFlags::Bools(vec![true; 4]));
         let insp = inspect_fixture(&cfg);
         let err = adapter.kv_geometry(&insp).unwrap_err();
         assert_eq!(err.code(), ErrorCode::UnsupportedArchitecture);
         assert!(err.message().contains("no attention layer remains"));
+    }
+
+    /// llama.cpp b11695 qwen35.cpp selects attention layers with
+    /// `(i + 1) % interval == 0`: full groups only. A trailing partial
+    /// group adds no attention layer, so five layers at interval four have
+    /// exactly one — floor division, not ceiling.
+    #[test]
+    fn qwen35_non_divisible_stack_uses_full_groups_only() {
+        let r = registry();
+        let adapter = r.find("qwen35").unwrap();
+        let insp = inspect_fixture(&SyntheticConfig::tiny_qwen35_non_divisible());
+        adapter.validate_metadata(&insp).unwrap();
+        let kv = adapter.kv_geometry(&insp).unwrap();
+        assert_eq!(kv.layers, 5);
+        assert_eq!(
+            kv.attention_layers, 1,
+            "floor(5/4): the trailing partial group adds no attention layer"
+        );
+        assert_eq!(kv.state_bytes, (512 + 576) * 4, "four recurrent layers");
+    }
+
+    /// An interval larger than the served stack leaves no attention layer;
+    /// that is a malformed hybrid contract and must refuse.
+    #[test]
+    fn qwen35_interval_beyond_the_stack_is_refused() {
+        let r = registry();
+        let adapter = r.find("qwen35").unwrap();
+        let mut cfg = SyntheticConfig::tiny_qwen35();
+        cfg.layers = 2;
+        let insp = inspect_fixture(&cfg);
+        let err = adapter.kv_geometry(&insp).unwrap_err();
+        assert_eq!(err.code(), ErrorCode::UnsupportedArchitecture);
+        assert!(err.message().contains("exceeds the 2-layer served stack"));
+    }
+
+    /// A per-layer array with non-boolean entries is malformed; refusing is
+    /// the only honest option (counting it would silently invent an
+    /// attention-layer split).
+    #[test]
+    fn qwen35_malformed_recurrent_array_is_refused() {
+        let r = registry();
+        let adapter = r.find("qwen35").unwrap();
+        let mut cfg = SyntheticConfig::tiny_qwen35();
+        cfg.hybrid.as_mut().unwrap().recurrent_layers_array =
+            Some(RecurrentLayerFlags::U32s(vec![1, 1, 1, 1]));
+        let insp = inspect_fixture(&cfg);
+        let err = adapter.kv_geometry(&insp).unwrap_err();
+        assert_eq!(err.code(), ErrorCode::UnsupportedArchitecture);
+        assert!(
+            err.message().contains("boolean is required"),
+            "{}",
+            err.message()
+        );
+    }
+
+    /// An array shorter than the served stack cannot state the fact for
+    /// every layer; refusing beats silently guessing for the missing tail.
+    #[test]
+    fn qwen35_short_recurrent_array_is_refused() {
+        let r = registry();
+        let adapter = r.find("qwen35").unwrap();
+        let mut cfg = SyntheticConfig::tiny_qwen35();
+        cfg.hybrid.as_mut().unwrap().recurrent_layers_array =
+            Some(RecurrentLayerFlags::Bools(vec![true, true, true]));
+        let insp = inspect_fixture(&cfg);
+        let err = adapter.kv_geometry(&insp).unwrap_err();
+        assert_eq!(err.code(), ErrorCode::UnsupportedArchitecture);
+        assert!(
+            err.message().contains("3 entries for 4 served layers"),
+            "{}",
+            err.message()
+        );
     }
 
     #[test]

@@ -60,3 +60,25 @@ never accepted by any real artifact.
 - Execution types (a `Qwen35Config`, explicit linear/full attention layer
   types, recurrent state containers) land with the Q35-1 oracle instead of
   existing as unreachable code.
+
+## Addendum (Q35-1A)
+
+- **Attention-layer selection follows llama.cpp b11695 exactly.** A served
+  layer is full attention iff `(i + 1) % full_attention_interval == 0` —
+  full groups only, so the count is floor(served / interval); a trailing
+  partial group adds no attention layer. An interval or per-layer array
+  that leaves zero attention layers, an array shorter than the served
+  stack, or an array with non-boolean entries refuses the artifact — no
+  silent attention-layer split.
+- **KV precision stays the declared-precision contract.** The Q35-1
+  oracle stores attention KV at the declared width (packed f16 default,
+  priced at 2 B/element; f32 priced at 4 B/element) and must prove by
+  test that the admitted plan covers what it allocates. Recurrent and
+  convolution state are f32 as declared by `mamba_ssm_dtype`.
+- **Typed contract (Q35-1A).** `crates/tuckcore/src/qwen35.rs` resolves
+  `Qwen35Config`, the exact layer map, the tensor map (every served
+  tensor consumed exactly once with dimensions verified; unknown tensors
+  inside the served stack refuse; MTP blocks excluded) and the state
+  layout. The adapter's priced geometry and the typed layout are
+  cross-checked against each other at resolve time. The loader does not
+  call it yet: execution stays refused until the Q35-1 checklist passes.
