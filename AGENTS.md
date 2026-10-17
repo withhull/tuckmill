@@ -25,6 +25,13 @@ cargo run -p tuckmill-manifest --example gen_fixture -- /tmp/fixture.gguf
 Always run `scripts/test.sh` before calling work done. It is the same gate
 CI would run.
 
+## Git workflow
+
+Once the gate is green, commit and push directly — commit and push are part
+of "done", not a separate confirmation round trip. Match the repository's
+commit style (a `Gate C ...` / scoped subject plus the evidence in the body:
+what was verified, with which command, on which artifact).
+
 ## Non-negotiable rules
 
 1. **Honesty first.** Every displayed number is `estimated`,
