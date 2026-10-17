@@ -160,3 +160,30 @@ never accepted by any real artifact.
   rows are a no-op; a row without a finite maximum, a non-finite
   exponential, or a non-positive normalizer refuses with a typed error,
   and attention writes no output on refusal.
+
+## Addendum 6 (Q35-1D execution and reference qualification)
+
+- **Complete CPU reference forward pass.** `crates/tuckcore/src/
+  qwen35_forward.rs` executes the served 24-layer hybrid stack (18 GDN +
+  6 full attention; MTP excluded) over explicit token IDs: tied token
+  embedding; per layer the pre-attention norm, the kind-specific
+  attention path (GDN: QKV projection, GGUF-order causal convolution
+  with the `(kernel - 1)`-row state, SiLU, per-head L2, sigmoid beta,
+  `ssm_a * softplus(alpha + dt_bias)` decay, delta rule, gated
+  normalization with `ssm_norm` and `silu(z)`, `ssm_out`; full
+  attention: joint Q+gate projection, per-head QK norm, partial RoPE,
+  packed-cache GQA, sigmoid output gate, `attn_output`), the
+  post-attention norm, SwiGLU FFN and both residuals; final norm and
+  tied-head logits. Weights are read from the artifact rows on demand;
+  norms and other small vectors are cached at open. One layout fix rode
+  along: `ssm_conv1d` is consumed in GGUF memory order (taps fastest,
+  `weights[channel * kernel + tap]`), matching `ggml_ssm_conv`.
+- **Evidence (machine-local, pinned artifact, release build).**
+  Fixture: finite logits; chunked-versus-stepwise bitwise-equal logits
+  and state checksum; reset clears every stateful byte; determinism.
+  Pinned 0.8B: an 8-token teacher-forced pass with all 248,320 logits
+  finite; against the pinned llama.cpp reference under identical token
+  IDs and f16 KV — top-1 identical, max|diff| 0.325, mean|diff| 0.048
+  at reference logit scale 20.6 (registered tolerances 0.5 / 0.1). The
+  profile difference is declared: the oracle keeps f32 activations while
+  llama.cpp quantizes activations to Q8_0 on the Q8_0 weight path.

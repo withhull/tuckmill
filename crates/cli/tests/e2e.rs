@@ -1041,6 +1041,81 @@ fn qwen35_pinned_artifact_contract_when_available() {
     }
 }
 
+/// Q35-1D reference gate (machine-local): the complete TuckCore Qwen3.5
+/// CPU forward pass must agree with the pinned llama.cpp reference under
+/// identical token IDs and the declared f16 KV precision. Requires
+/// TUCKMILL_QWEN35_GGUF and TUCKMILL_LLAMA_LIB; run with --release (the
+/// scalar rows are slow in debug).
+#[test]
+fn qwen35_teacher_forced_logits_match_reference_when_available() {
+    let Some(gguf) = std::env::var("TUCKMILL_QWEN35_GGUF")
+        .ok()
+        .map(std::path::PathBuf::from)
+        .filter(|p| p.exists())
+    else {
+        eprintln!("skipping: TUCKMILL_QWEN35_GGUF not set (pinned Qwen3.5-0.8B Q8_0)");
+        return;
+    };
+    if std::env::var("TUCKMILL_LLAMA_LIB").is_err() {
+        eprintln!(
+            "skipping: TUCKMILL_LLAMA_LIB not set (reference comparison needs the pinned shim)"
+        );
+        return;
+    }
+    let tokens = [9707u32, 11, 1879, 1000, 358, 1079, 13, 1000];
+
+    let mut model = tuckmill_tuckcore::qwen35_forward::Qwen35Model::open(
+        &gguf,
+        16,
+        tuckmill_tuckcore::qwen35_kv::KvPrecision::F16,
+    )
+    .unwrap();
+    let mut ours = Vec::new();
+    model.forward_tokens(&tokens, &mut ours).unwrap();
+
+    let mut reference = tuckmill_llamaref::LlamaRef::new();
+    reference.open_reference_model(&gguf, true).unwrap();
+    let theirs = reference.teacher_forced_logits(&tokens).unwrap();
+
+    assert_eq!(ours.len(), theirs.len(), "identical vocabulary");
+    let mut max_abs = 0f64;
+    let mut sum_abs = 0f64;
+    let (mut ours_top, mut theirs_top) = (0usize, 0usize);
+    for (i, (a, b)) in ours.iter().zip(theirs.iter()).enumerate() {
+        let d = (*a as f64 - *b as f64).abs();
+        max_abs = max_abs.max(d);
+        sum_abs += d;
+        if ours[i] > ours[ours_top] {
+            ours_top = i;
+        }
+        if theirs[i] > theirs[theirs_top] {
+            theirs_top = i;
+        }
+    }
+    let mean_abs = sum_abs / ours.len() as f64;
+    let reference_scale = theirs.iter().fold(f64::MIN, |m, v| m.max(*v as f64));
+    eprintln!(
+        "qwen35 teacher-forced: {tokens:?} -> max|diff| {max_abs:.6}, mean|diff| {mean_abs:.6}, reference max logit {reference_scale:.3}, top1 ours {ours_top} theirs {theirs_top}"
+    );
+    assert_eq!(
+        ours_top, theirs_top,
+        "top-1 token matches the pinned reference"
+    );
+    // Registered tolerances for the cross-profile comparison (oracle-f32
+    // activations vs llama.cpp's Q8_0 activation quantization): observed
+    // max|diff| 0.325 and mean|diff| 0.048 over the 248,320-token vocab
+    // with reference logit scale 20.6; recorded in the certification
+    // matrix under the Q35-1D row.
+    assert!(
+        max_abs <= 0.5,
+        "registered max logits tolerance (observed {max_abs:.6})"
+    );
+    assert!(
+        mean_abs <= 0.1,
+        "registered mean agreement (observed {mean_abs:.6})"
+    );
+}
+
 #[test]
 fn worker_and_adapter_consistency() {
     // The fixture must resolve the builtin qwen3 adapter metadata fully; this

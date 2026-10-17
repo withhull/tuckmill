@@ -456,6 +456,125 @@ impl LlamaRef {
         }
     }
 
+    /// Open a model directly for reference comparisons (teacher-forced
+    /// logits during the Qwen3.5 Q35-1D verification). Mirrors the backend
+    /// load with default options: pinned library, CPU, f16 or f32 KV.
+    pub fn open_reference_model(
+        &mut self,
+        model_path: &std::path::Path,
+        kv_f16: bool,
+    ) -> Result<()> {
+        if !self.handle.is_null() {
+            return Err(TuckmillError::new(
+                ErrorCode::InvalidRequest,
+                "reference model is already loaded",
+            ));
+        }
+        let lib_path = resolve_lib_path(None)?;
+        let shim = Shim::open(&lib_path)?;
+        let threads = std::thread::available_parallelism()
+            .map(|n| (n.get() / 2).max(1) as c_int)
+            .unwrap_or(4);
+        let path_str = model_path.to_string_lossy().into_owned();
+        let c_path = CString::new(path_str.clone().into_bytes()).map_err(|_| {
+            TuckmillError::new(ErrorCode::InvalidConfiguration, "path contains NUL")
+        })?;
+        let mut err_buf = vec![0u8; 512];
+        // SAFETY: shim was version-checked at open; path and buffers are valid.
+        let handle = unsafe {
+            (shim.load)(
+                c_path.as_ptr(),
+                4096,
+                threads,
+                0, // the reference comparison runs on the CPU
+                kv_f16 as c_int,
+                0,
+                err_buf.as_mut_ptr() as *mut c_char,
+                err_buf.len() as c_int,
+            )
+        };
+        if handle.is_null() {
+            let len = err_buf
+                .iter()
+                .position(|b| *b == 0)
+                .unwrap_or(err_buf.len());
+            let msg = String::from_utf8_lossy(&err_buf[..len]).into_owned();
+            return Err(TuckmillError::new(
+                ErrorCode::InvalidArtifact,
+                format!("llama.cpp failed to load {path_str}: {msg}"),
+            ));
+        }
+        // SAFETY: `handle` is checked non-null and owned by this instance
+        // until Drop frees it; shim calls below only query or decode.
+        let vocab = unsafe { (shim.vocab_size)(handle) };
+        let eos = unsafe { (shim.eos)(handle) };
+        let ctx_tokens = unsafe { (shim.n_ctx)(handle) };
+        let actual_kv = unsafe { (shim.kv_type)(handle) };
+        let actual_threads = unsafe { (shim.n_threads)(handle) };
+        self.kv_precision = if actual_kv == 1 {
+            "f16".to_string()
+        } else if actual_kv == 0 {
+            "f32".to_string()
+        } else {
+            "unreported".to_string()
+        };
+        self.threads = actual_threads.max(1) as u32;
+        self.handle = handle;
+        self.vocab = vocab;
+        self.eos = eos;
+        self.ctx_tokens = if ctx_tokens > 0 { ctx_tokens } else { 4096 };
+        self.shim = shim;
+        self.note = format!(
+            "llama.cpp reference model for teacher-forced comparisons ({LLAMA_REVISION}, kv {})",
+            self.kv_precision
+        );
+        Ok(())
+    }
+
+    /// Teacher-forced logits: reset the context, decode the exact token
+    /// ids, and copy the last position's logits (full vocabulary). Used
+    /// by the Qwen3.5 reference verification under identical token IDs
+    /// and the declared precision.
+    pub fn teacher_forced_logits(&mut self, tokens: &[u32]) -> Result<Vec<f32>> {
+        if tokens.is_empty() {
+            return Err(TuckmillError::new(
+                ErrorCode::InvalidRequest,
+                "teacher forcing needs at least one token id",
+            ));
+        }
+        if tokens.len() > self.ctx_tokens as usize {
+            return Err(TuckmillError::new(
+                ErrorCode::ContextExceedsBudget,
+                format!(
+                    "{} tokens exceed the reference context {}",
+                    tokens.len(),
+                    self.ctx_tokens
+                ),
+            ));
+        }
+        let h = self.h()?;
+        // SAFETY: handle valid.
+        let rc = unsafe { (self.shim.reset)(h) };
+        if rc != 0 {
+            return Err(TuckmillError::new(
+                ErrorCode::WorkerFailed,
+                format!("llama context reset failed (rc {rc})"),
+            ));
+        }
+        self.decode_chunked(tokens)?;
+        let mut logits = vec![0f32; self.vocab.max(0) as usize];
+        // SAFETY: handle valid; buffer sized to the vocabulary.
+        let n = unsafe { (self.shim.logits)(h, logits.as_mut_ptr(), logits.len() as i32) };
+        if n < 0 {
+            return Err(TuckmillError::new(
+                ErrorCode::WorkerFailed,
+                format!("llama logits unavailable (rc {n})"),
+            ));
+        }
+        logits.truncate(n as usize);
+        Ok(logits)
+    }
+
     /// Beginning-of-sequence token id from llama.cpp (surface for callers).
     pub fn bos(&self) -> i32 {
         if self.handle.is_null() {

@@ -17,6 +17,7 @@ pub mod kernels;
 pub mod loader;
 pub mod model;
 pub mod qwen35;
+pub mod qwen35_forward;
 pub mod qwen35_kv;
 pub mod qwen35_ops;
 pub mod tensor;

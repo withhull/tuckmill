@@ -127,6 +127,16 @@ impl Qwen35KvCache {
         self.capacity
     }
 
+    /// Zero every packed plane (request reset; no state may leak).
+    pub fn reset(&mut self) {
+        for plane in self.keys.iter_mut().chain(self.values.iter_mut()) {
+            match plane {
+                Plane::F16(bits) => bits.fill(0),
+                Plane::F32(values) => values.fill(0.0),
+            }
+        }
+    }
+
     pub fn attention_layers(&self) -> usize {
         self.keys.len()
     }
@@ -137,6 +147,34 @@ impl Qwen35KvCache {
         let k: u64 = self.keys.iter().map(Plane::bytes).sum();
         let v: u64 = self.values.iter().map(Plane::bytes).sum();
         k + v
+    }
+
+    /// FNV-1a over the packed planes (f16 bits / f32 bits). Used by the
+    /// reference tests to prove that chunked and stepwise execution leave
+    /// identical state and that reset clears every plane.
+    pub fn checksum(&self) -> u64 {
+        let mut hash = 0xcbf2_9ce4_8422_2325u64;
+        let mut mix = |bytes: u64| {
+            for b in bytes.to_le_bytes() {
+                hash ^= b as u64;
+                hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+            }
+        };
+        for plane in self.keys.iter().chain(self.values.iter()) {
+            match plane {
+                Plane::F16(bits) => {
+                    for v in bits {
+                        mix(*v as u64);
+                    }
+                }
+                Plane::F32(values) => {
+                    for v in values {
+                        mix(v.to_bits() as u64);
+                    }
+                }
+            }
+        }
+        hash
     }
 
     /// Store one token's K/V rows (`kv_heads x head_dim` each) for one

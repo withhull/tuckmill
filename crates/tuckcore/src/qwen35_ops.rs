@@ -91,11 +91,18 @@ impl ConvState {
         self.history.fill(0.0);
     }
 
+    /// Read-only view of the retained history rows (oldest first).
+    pub fn history(&self) -> &[f32] {
+        &self.history
+    }
+
     /// Process `tokens` input rows (`tokens.len() == n * channels`)
     /// through the depthwise causal convolution, writing `n * channels`
-    /// outputs. `weights` is the `ssm_conv1d` tensor `[kernel,
-    /// channels]` (tap-major). Advancing the state across chunked calls
-    /// is exactly equivalent to one full pass (tested).
+    /// outputs. `weights` is the `ssm_conv1d` tensor in GGUF memory
+    /// order — `[kernel, channels]` with the kernel taps fastest, i.e.
+    /// `weights[channel * kernel + tap]`, the same order ggml's CPU
+    /// `ggml_ssm_conv` reads. Advancing the state across chunked calls is
+    /// exactly equivalent to one full pass (tested).
     pub fn step_sequence(&mut self, weights: &[f32], tokens: &[f32], out: &mut [f32]) {
         let k = self.kernel;
         let c = self.channels;
@@ -117,7 +124,7 @@ impl ConvState {
             for ch in 0..c {
                 let mut acc = 0.0f32;
                 for j in 0..k {
-                    acc += weights[j * c + ch] * window[(t + j) * c + ch];
+                    acc += weights[ch * k + j] * window[(t + j) * c + ch];
                 }
                 out[t * c + ch] = acc;
             }
@@ -469,8 +476,9 @@ mod tests {
 
     #[test]
     fn conv_matches_the_hand_computed_window() {
-        // k = 2, channels = 2, weights tap-major.
-        let weights = [1.0f32, 10.0, 100.0, 1000.0];
+        // k = 2, channels = 2, GGUF memory order (taps fastest per
+        // channel): channel 0 taps [1, 100], channel 1 taps [10, 1000].
+        let weights = [1.0f32, 100.0, 10.0, 1000.0];
         let tokens = [1.0f32, 2.0, 3.0, 4.0];
         let mut state = ConvState::new(2, 2);
         let mut out = [0.0f32; 4];

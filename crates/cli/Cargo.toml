@@ -25,6 +25,7 @@ libc.workspace = true
 [dev-dependencies]
 tempfile = "3"
 serde.workspace = true
+tuckmill-llamaref.workspace = true
 
 [lints]
 workspace = true
