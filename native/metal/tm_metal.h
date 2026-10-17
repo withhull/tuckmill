@@ -239,6 +239,39 @@ int tm_metal_qwen35_gated_norm(tm_metal_ctx *ctx, tm_metal_buffer *o, tm_metal_b
                                tm_metal_buffer *weight, tm_metal_buffer *out, uint32_t rows,
                                uint32_t cols, float eps, char *err, size_t err_cap);
 
+/* ---------------- Q35-2B: full-attention operators ---------------- */
+
+/* Split the joint Q projection [heads, 2*head_dim] (query then gate per
+ * head) into q and gate, both [heads, head_dim]. */
+int tm_metal_qwen35_q_gate_split(tm_metal_ctx *ctx, tm_metal_buffer *qg, tm_metal_buffer *q_out,
+                                 tm_metal_buffer *gate_out, uint32_t heads, uint32_t head_dim,
+                                 char *err, size_t err_cap);
+
+/* Partial split-half RoPE: rotate the first n_rot dims of every q/k head
+ * row, pairs (i, i + n_rot/2), at `pos`; inv_freq holds n_rot/2 entries. */
+int tm_metal_qwen35_rope_partial(tm_metal_ctx *ctx, tm_metal_buffer *q, tm_metal_buffer *k,
+                                 tm_metal_buffer *inv_freq, uint32_t pos, uint32_t n_q_heads,
+                                 uint32_t n_kv_heads, uint32_t head_dim, uint32_t n_rot,
+                                 char *err, size_t err_cap);
+
+/* Packed f16 KV store: k_cache[h][pos][d] = (half) k_src[h][d], two-byte
+ * entries (same for v). */
+int tm_metal_qwen35_kv_store_f16(tm_metal_ctx *ctx, tm_metal_buffer *k_src, tm_metal_buffer *v_src,
+                                 tm_metal_buffer *k_cache, tm_metal_buffer *v_cache, uint32_t pos,
+                                 uint32_t cap, uint32_t head_dim, uint32_t kv_heads, char *err,
+                                 size_t err_cap);
+
+/* Causal GQA attention over a packed f16 cache; scratch is heads*cap f32. */
+int tm_metal_qwen35_attention_f16(tm_metal_ctx *ctx, tm_metal_buffer *q, tm_metal_buffer *k_cache,
+                                  tm_metal_buffer *v_cache, tm_metal_buffer *out,
+                                  tm_metal_buffer *scratch, uint32_t heads, uint32_t pos,
+                                  uint32_t cap, uint32_t head_dim, uint32_t group, float scale,
+                                  char *err, size_t err_cap);
+
+/* attn[i] *= sigmoid(gate[i]). */
+int tm_metal_qwen35_attn_gate(tm_metal_ctx *ctx, tm_metal_buffer *attn, tm_metal_buffer *gate,
+                              uint32_t n, char *err, size_t err_cap);
+
 /* Block until every committed command buffer has completed. Safe to call
  * with no pending work. */
 int tm_metal_fence(tm_metal_ctx *ctx, char *err, size_t err_cap);

@@ -383,6 +383,70 @@ mod imp {
             err: *mut c_char,
             err_cap: usize,
         ) -> c_int;
+        #[allow(clippy::too_many_arguments)]
+        pub fn tm_metal_qwen35_q_gate_split(
+            ctx: *mut TmMetalCtx,
+            qg: *mut TmMetalBuffer,
+            q_out: *mut TmMetalBuffer,
+            gate_out: *mut TmMetalBuffer,
+            heads: u32,
+            head_dim: u32,
+            err: *mut c_char,
+            err_cap: usize,
+        ) -> c_int;
+        #[allow(clippy::too_many_arguments)]
+        pub fn tm_metal_qwen35_rope_partial(
+            ctx: *mut TmMetalCtx,
+            q: *mut TmMetalBuffer,
+            k: *mut TmMetalBuffer,
+            inv_freq: *mut TmMetalBuffer,
+            pos: u32,
+            n_q_heads: u32,
+            n_kv_heads: u32,
+            head_dim: u32,
+            n_rot: u32,
+            err: *mut c_char,
+            err_cap: usize,
+        ) -> c_int;
+        #[allow(clippy::too_many_arguments)]
+        pub fn tm_metal_qwen35_kv_store_f16(
+            ctx: *mut TmMetalCtx,
+            k_src: *mut TmMetalBuffer,
+            v_src: *mut TmMetalBuffer,
+            k_cache: *mut TmMetalBuffer,
+            v_cache: *mut TmMetalBuffer,
+            pos: u32,
+            cap: u32,
+            head_dim: u32,
+            kv_heads: u32,
+            err: *mut c_char,
+            err_cap: usize,
+        ) -> c_int;
+        #[allow(clippy::too_many_arguments)]
+        pub fn tm_metal_qwen35_attention_f16(
+            ctx: *mut TmMetalCtx,
+            q: *mut TmMetalBuffer,
+            k_cache: *mut TmMetalBuffer,
+            v_cache: *mut TmMetalBuffer,
+            out: *mut TmMetalBuffer,
+            scratch: *mut TmMetalBuffer,
+            heads: u32,
+            pos: u32,
+            cap: u32,
+            head_dim: u32,
+            group: u32,
+            scale: f32,
+            err: *mut c_char,
+            err_cap: usize,
+        ) -> c_int;
+        pub fn tm_metal_qwen35_attn_gate(
+            ctx: *mut TmMetalCtx,
+            attn: *mut TmMetalBuffer,
+            gate: *mut TmMetalBuffer,
+            n: u32,
+            err: *mut c_char,
+            err_cap: usize,
+        ) -> c_int;
         pub fn tm_metal_committed_dispatches(ctx: *const TmMetalCtx) -> u64;
         pub fn tm_metal_completed_dispatches(ctx: *const TmMetalCtx) -> u64;
         pub fn tm_metal_last_gpu_ms(ctx: *const TmMetalCtx) -> f64;
@@ -998,6 +1062,176 @@ impl MetalContext {
                     err.as_mut_ptr(),
                     ERR_CAP,
                 )
+            };
+            (code, err)
+        })
+    }
+
+    /// Q35-2B: split the joint Q projection into q and gate planes.
+    #[allow(clippy::too_many_arguments)] // mirrors the C ABI arity
+    pub fn qwen35_q_gate_split(
+        &self,
+        qg: &MetalBuffer,
+        q_out: &MetalBuffer,
+        gate_out: &MetalBuffer,
+        heads: u32,
+        head_dim: u32,
+    ) -> Result<()> {
+        for buffer in [qg, q_out, gate_out] {
+            self.check_buffer(buffer)?;
+        }
+        let (gc, qc, tc) = (qg.raw, q_out.raw, gate_out.raw);
+        self.operate("qwen35_q_gate_split", move |ctx| {
+            let mut err = [0 as c_char; ERR_CAP];
+            // SAFETY: raw handles were validated against this context.
+            let code = unsafe {
+                imp::tm_metal_qwen35_q_gate_split(
+                    ctx,
+                    gc,
+                    qc,
+                    tc,
+                    heads,
+                    head_dim,
+                    err.as_mut_ptr(),
+                    ERR_CAP,
+                )
+            };
+            (code, err)
+        })
+    }
+
+    /// Q35-2B: partial split-half RoPE over the first `n_rot` dims.
+    #[allow(clippy::too_many_arguments)] // mirrors the C ABI arity
+    pub fn qwen35_rope_partial(
+        &self,
+        q: &MetalBuffer,
+        k: &MetalBuffer,
+        inv_freq: &MetalBuffer,
+        pos: u32,
+        n_q_heads: u32,
+        n_kv_heads: u32,
+        head_dim: u32,
+        n_rot: u32,
+    ) -> Result<()> {
+        for buffer in [q, k, inv_freq] {
+            self.check_buffer(buffer)?;
+        }
+        let (qc, kc, fc) = (q.raw, k.raw, inv_freq.raw);
+        self.operate("qwen35_rope_partial", move |ctx| {
+            let mut err = [0 as c_char; ERR_CAP];
+            // SAFETY: raw handles were validated against this context.
+            let code = unsafe {
+                imp::tm_metal_qwen35_rope_partial(
+                    ctx,
+                    qc,
+                    kc,
+                    fc,
+                    pos,
+                    n_q_heads,
+                    n_kv_heads,
+                    head_dim,
+                    n_rot,
+                    err.as_mut_ptr(),
+                    ERR_CAP,
+                )
+            };
+            (code, err)
+        })
+    }
+
+    /// Q35-2B: store K/V rows as true packed f16 entries.
+    #[allow(clippy::too_many_arguments)] // mirrors the C ABI arity
+    pub fn qwen35_kv_store_f16(
+        &self,
+        k_src: &MetalBuffer,
+        v_src: &MetalBuffer,
+        k_cache: &MetalBuffer,
+        v_cache: &MetalBuffer,
+        pos: u32,
+        cap: u32,
+        head_dim: u32,
+        kv_heads: u32,
+    ) -> Result<()> {
+        for buffer in [k_src, v_src, k_cache, v_cache] {
+            self.check_buffer(buffer)?;
+        }
+        let (ks, vs, kc2, vc2) = (k_src.raw, v_src.raw, k_cache.raw, v_cache.raw);
+        self.operate("qwen35_kv_store_f16", move |ctx| {
+            let mut err = [0 as c_char; ERR_CAP];
+            // SAFETY: raw handles were validated against this context.
+            let code = unsafe {
+                imp::tm_metal_qwen35_kv_store_f16(
+                    ctx,
+                    ks,
+                    vs,
+                    kc2,
+                    vc2,
+                    pos,
+                    cap,
+                    head_dim,
+                    kv_heads,
+                    err.as_mut_ptr(),
+                    ERR_CAP,
+                )
+            };
+            (code, err)
+        })
+    }
+
+    /// Q35-2B: causal GQA attention over the packed f16 cache.
+    #[allow(clippy::too_many_arguments)] // mirrors the C ABI arity
+    pub fn qwen35_attention_f16(
+        &self,
+        q: &MetalBuffer,
+        k_cache: &MetalBuffer,
+        v_cache: &MetalBuffer,
+        out: &MetalBuffer,
+        scratch: &MetalBuffer,
+        heads: u32,
+        pos: u32,
+        cap: u32,
+        head_dim: u32,
+        group: u32,
+        scale: f32,
+    ) -> Result<()> {
+        for buffer in [q, k_cache, v_cache, out, scratch] {
+            self.check_buffer(buffer)?;
+        }
+        let (qc, kc, vc, oc, sc) = (q.raw, k_cache.raw, v_cache.raw, out.raw, scratch.raw);
+        self.operate("qwen35_attention_f16", move |ctx| {
+            let mut err = [0 as c_char; ERR_CAP];
+            // SAFETY: raw handles were validated against this context.
+            let code = unsafe {
+                imp::tm_metal_qwen35_attention_f16(
+                    ctx,
+                    qc,
+                    kc,
+                    vc,
+                    oc,
+                    sc,
+                    heads,
+                    pos,
+                    cap,
+                    head_dim,
+                    group,
+                    scale,
+                    err.as_mut_ptr(),
+                    ERR_CAP,
+                )
+            };
+            (code, err)
+        })
+    }
+
+    /// Q35-2B: apply the sigmoid output gate to the attention result.
+    pub fn qwen35_attn_gate(&self, attn: &MetalBuffer, gate: &MetalBuffer, n: u32) -> Result<()> {
+        self.check_pair(attn, gate)?;
+        let (ac, gc) = (attn.raw, gate.raw);
+        self.operate("qwen35_attn_gate", move |ctx| {
+            let mut err = [0 as c_char; ERR_CAP];
+            // SAFETY: raw handles were validated against this context.
+            let code = unsafe {
+                imp::tm_metal_qwen35_attn_gate(ctx, ac, gc, n, err.as_mut_ptr(), ERR_CAP)
             };
             (code, err)
         })

@@ -26,9 +26,207 @@ fn bytes_f32(bytes: &[u8]) -> Vec<f32> {
         .collect()
 }
 
-/// Device-resident GDN operator set for one layer.
-pub struct GdnGpu {
+/// Shared GPU owner for the Qwen3.5 execution paths: ONE Metal context
+/// (device/queue) for the whole model, with every operator buffer
+/// allocated through it — a single authoritative allocation ledger
+/// (`allocated_bytes`). All `*_dev` methods are buffer-to-buffer: model
+/// activations stay on the device; the slice-based adapters on
+/// [`GdnGpu`] exist only for operator-level tests.
+#[derive(Clone)]
+pub struct Qwen35Gpu {
     ctx: MetalContext,
+}
+
+impl Qwen35Gpu {
+    pub fn open() -> Result<Self> {
+        let probe = probe();
+        if !probe.available {
+            return Err(TuckmillError::new(
+                ErrorCode::Unavailable,
+                format!("no Metal device is available ({})", probe.info),
+            ));
+        }
+        Ok(Self {
+            ctx: MetalContext::open()?,
+        })
+    }
+
+    pub fn context(&self) -> &MetalContext {
+        &self.ctx
+    }
+
+    /// Allocate a shared-storage buffer of `bytes` (zeroed explicitly:
+    /// no inference result may depend on unspecified initial contents).
+    pub fn buffer(&self, bytes: usize) -> Result<MetalBuffer> {
+        let buffer = self.ctx.buffer(bytes, true)?;
+        buffer.upload(0, &vec![0u8; bytes])?;
+        Ok(buffer)
+    }
+
+    /// Buffer-to-buffer GDN operators (GdnGpu's methods delegate here;
+    /// the model paths call these directly).
+    pub fn conv_step_dev(
+        &self,
+        hist: &MetalBuffer,
+        x: &MetalBuffer,
+        w: &MetalBuffer,
+        y: &MetalBuffer,
+        channels: u32,
+        kernel: u32,
+    ) -> Result<()> {
+        self.ctx.begin_group()?;
+        let result = (|| {
+            self.ctx.qwen35_conv_step(hist, x, w, y, channels, kernel)?;
+            self.ctx.qwen35_conv_shift(hist, x, channels, kernel)
+        })();
+        match result {
+            Ok(()) => self.ctx.end_group(),
+            Err(e) => {
+                let _ = self.ctx.abort_group();
+                Err(e)
+            }
+        }
+    }
+
+    pub fn l2norm_dev(
+        &self,
+        x: &MetalBuffer,
+        y: &MetalBuffer,
+        rows: u32,
+        cols: u32,
+        eps: f32,
+    ) -> Result<()> {
+        self.ctx.qwen35_l2norm_heads(x, y, rows, cols, eps)
+    }
+
+    #[allow(clippy::too_many_arguments)] // mirrors the kernel arity
+    pub fn beta_decay_dev(
+        &self,
+        raw_beta: &MetalBuffer,
+        alpha: &MetalBuffer,
+        dt_bias: &MetalBuffer,
+        ssm_a: &MetalBuffer,
+        beta_out: &MetalBuffer,
+        gate_out: &MetalBuffer,
+        n: u32,
+    ) -> Result<()> {
+        self.ctx
+            .qwen35_beta_decay(raw_beta, alpha, dt_bias, ssm_a, beta_out, gate_out, n)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn gdn_step_dev(
+        &self,
+        q: &MetalBuffer,
+        k: &MetalBuffer,
+        v: &MetalBuffer,
+        gate: &MetalBuffer,
+        beta: &MetalBuffer,
+        state: &MetalBuffer,
+        out: &MetalBuffer,
+        heads: u32,
+        k_dim: u32,
+        v_dim: u32,
+        q_scale: f32,
+    ) -> Result<()> {
+        self.ctx.qwen35_gdn_step(
+            q, k, v, gate, beta, state, out, heads, k_dim, v_dim, q_scale,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)] // mirrors the kernel arity
+    pub fn gated_norm_dev(
+        &self,
+        o: &MetalBuffer,
+        z: &MetalBuffer,
+        weight: &MetalBuffer,
+        out: &MetalBuffer,
+        rows: u32,
+        cols: u32,
+        eps: f32,
+    ) -> Result<()> {
+        self.ctx
+            .qwen35_gated_norm(o, z, weight, out, rows, cols, eps)
+    }
+
+    // --- Q35-2B full-attention operators ---
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn q_gate_split_dev(
+        &self,
+        qg: &MetalBuffer,
+        q_out: &MetalBuffer,
+        gate_out: &MetalBuffer,
+        heads: u32,
+        head_dim: u32,
+    ) -> Result<()> {
+        self.ctx
+            .qwen35_q_gate_split(qg, q_out, gate_out, heads, head_dim)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn rope_partial_dev(
+        &self,
+        q: &MetalBuffer,
+        k: &MetalBuffer,
+        inv_freq: &MetalBuffer,
+        pos: u32,
+        n_q_heads: u32,
+        n_kv_heads: u32,
+        head_dim: u32,
+        n_rot: u32,
+    ) -> Result<()> {
+        self.ctx
+            .qwen35_rope_partial(q, k, inv_freq, pos, n_q_heads, n_kv_heads, head_dim, n_rot)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn kv_store_f16_dev(
+        &self,
+        k_src: &MetalBuffer,
+        v_src: &MetalBuffer,
+        k_cache: &MetalBuffer,
+        v_cache: &MetalBuffer,
+        pos: u32,
+        cap: u32,
+        head_dim: u32,
+        kv_heads: u32,
+    ) -> Result<()> {
+        self.ctx
+            .qwen35_kv_store_f16(k_src, v_src, k_cache, v_cache, pos, cap, head_dim, kv_heads)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn attention_f16_dev(
+        &self,
+        q: &MetalBuffer,
+        k_cache: &MetalBuffer,
+        v_cache: &MetalBuffer,
+        out: &MetalBuffer,
+        scratch: &MetalBuffer,
+        heads: u32,
+        pos: u32,
+        cap: u32,
+        head_dim: u32,
+        group: u32,
+        scale: f32,
+    ) -> Result<()> {
+        self.ctx.qwen35_attention_f16(
+            q, k_cache, v_cache, out, scratch, heads, pos, cap, head_dim, group, scale,
+        )
+    }
+
+    pub fn attn_gate_dev(&self, attn: &MetalBuffer, gate: &MetalBuffer, n: u32) -> Result<()> {
+        self.ctx.qwen35_attn_gate(attn, gate, n)
+    }
+}
+
+/// Device-resident GDN operator set for one layer, with slice-based
+/// convenience methods used by the operator-level tests. Interior state
+/// buffers are zeroed at construction (no result may depend on
+/// unspecified initial GPU contents).
+pub struct GdnGpu {
+    gpu: Qwen35Gpu,
     heads: usize,
     k_dim: usize,
     v_dim: usize,
@@ -60,15 +258,27 @@ impl GdnGpu {
         conv_kernel: usize,
         conv_channels: usize,
     ) -> Result<Self> {
-        let probe = probe();
-        if !probe.available {
-            return Err(TuckmillError::new(
-                ErrorCode::Unavailable,
-                format!("no Metal device is available ({})", probe.info),
-            ));
-        }
-        let ctx = MetalContext::open()?;
-        let buf = |elems: usize| -> Result<MetalBuffer> { ctx.buffer(elems * 4, true) };
+        Self::new_with(
+            &Qwen35Gpu::open()?,
+            heads,
+            k_dim,
+            v_dim,
+            conv_kernel,
+            conv_channels,
+        )
+    }
+
+    /// Build on a shared model-wide GPU owner (one device/queue for every
+    /// layer; buffers join the same allocation ledger).
+    pub fn new_with(
+        gpu: &Qwen35Gpu,
+        heads: usize,
+        k_dim: usize,
+        v_dim: usize,
+        conv_kernel: usize,
+        conv_channels: usize,
+    ) -> Result<Self> {
+        let buf = |elems: usize| -> Result<MetalBuffer> { gpu.buffer(elems * 4) };
         let scratch_len = conv_channels.max(heads * k_dim).max(heads * v_dim);
         Ok(Self {
             x_in: buf(scratch_len)?,
@@ -86,7 +296,7 @@ impl GdnGpu {
             w_conv: buf(conv_kernel * conv_channels)?,
             state: buf(heads * k_dim * v_dim)?,
             hist: buf((conv_kernel - 1).max(1) * conv_channels)?,
-            ctx,
+            gpu: gpu.clone(),
             heads,
             k_dim,
             v_dim,
@@ -129,30 +339,14 @@ impl GdnGpu {
             ));
         }
         self.x_in.upload(0, &f32_bytes(x))?;
-        self.ctx.begin_group()?;
-        let result = (|| {
-            self.ctx.qwen35_conv_step(
-                &self.hist,
-                &self.x_in,
-                &self.w_conv,
-                &self.y_out,
-                self.conv_channels as u32,
-                self.conv_kernel as u32,
-            )?;
-            self.ctx.qwen35_conv_shift(
-                &self.hist,
-                &self.x_in,
-                self.conv_channels as u32,
-                self.conv_kernel as u32,
-            )
-        })();
-        match result {
-            Ok(()) => self.ctx.end_group()?,
-            Err(e) => {
-                let _ = self.ctx.abort_group();
-                return Err(e);
-            }
-        }
+        self.gpu.conv_step_dev(
+            &self.hist,
+            &self.x_in,
+            &self.w_conv,
+            &self.y_out,
+            self.conv_channels as u32,
+            self.conv_kernel as u32,
+        )?;
         let mut bytes = vec![0u8; out.len() * 4];
         self.y_out.download(0, &mut bytes)?;
         out.copy_from_slice(&bytes_f32(&bytes));
@@ -169,7 +363,7 @@ impl GdnGpu {
         }
         let bytes = f32_bytes(x);
         self.x_in.upload(0, &bytes)?;
-        self.ctx.qwen35_l2norm_heads(
+        self.gpu.l2norm_dev(
             &self.x_in,
             &self.y_out,
             (x.len() / cols) as u32,
@@ -210,7 +404,7 @@ impl GdnGpu {
         self.alpha_in.upload(0, &f32_bytes(alpha))?;
         self.dt_in.upload(0, &f32_bytes(dt_bias))?;
         self.a_in.upload(0, &f32_bytes(ssm_a))?;
-        self.ctx.qwen35_beta_decay(
+        self.gpu.beta_decay_dev(
             &self.beta_in,
             &self.alpha_in,
             &self.dt_in,
@@ -259,7 +453,7 @@ impl GdnGpu {
         self.v_in.upload(0, &f32_bytes(v))?;
         self.beta_in.upload(0, &f32_bytes(beta))?;
         self.a_in.upload(0, &f32_bytes(gate))?;
-        self.ctx.qwen35_gdn_step(
+        self.gpu.gdn_step_dev(
             &self.q_in,
             &self.k_in,
             &self.v_in,
@@ -304,7 +498,7 @@ impl GdnGpu {
         self.x_in.upload(0, &f32_bytes(o))?;
         self.v_in.upload(0, &f32_bytes(z))?;
         self.norm_w.upload(0, &f32_bytes(weight))?;
-        self.ctx.qwen35_gated_norm(
+        self.gpu.gated_norm_dev(
             &self.x_in,
             &self.v_in,
             &self.norm_w,
@@ -572,5 +766,356 @@ mod tests {
         gpu.reset().unwrap();
         assert!(gpu.state_snapshot().unwrap().iter().all(|s| *s == 0.0));
         assert!(gpu.conv_history().unwrap().iter().all(|s| *s == 0.0));
+    }
+}
+
+#[cfg(test)]
+mod attention_tests {
+    use super::*;
+    use crate::qwen35_kv::{KvPrecision, Qwen35KvCache};
+    use crate::qwen35_ops::{
+        apply_sigmoid_gate, gqa_cache_attention, partial_rope_in_place, rope_inv_freq_partial,
+        sigmoid, GqaGeometry,
+    };
+    use crate::tensor::f32_to_f16_bits;
+
+    fn lcg(seed: &mut u64) -> f32 {
+        *seed = seed
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        ((*seed >> 33) as f32 / (1u64 << 31) as f32) - 1.0
+    }
+
+    fn assert_close(got: f32, want: f32, abs: f32, rel: f32, what: &str) {
+        let tol = abs + rel * want.abs();
+        assert!(
+            (got - want).abs() <= tol,
+            "{what}: {got} vs {want} (tol {tol})"
+        );
+    }
+
+    const ABS_TOL: f32 = 1e-4;
+    const REL_TOL: f32 = 2e-4;
+
+    fn gpu_or_skip_simple() -> Option<()> {
+        let probe = probe();
+        if !probe.available {
+            assert!(
+                std::env::var("TUCKMILL_REQUIRE_METAL").is_err(),
+                "TUCKMILL_REQUIRE_METAL is set but no Metal device is available"
+            );
+            eprintln!("skipping: no Metal device");
+            return None;
+        }
+        Some(())
+    }
+
+    fn upload_f32(gpu: &Qwen35Gpu, data: &[f32]) -> MetalBuffer {
+        let buffer = gpu.buffer(data.len() * 4).unwrap();
+        buffer.upload(0, &f32_bytes(data)).unwrap();
+        buffer
+    }
+
+    fn download_f32(buffer: &MetalBuffer, n: usize) -> Vec<f32> {
+        let mut bytes = vec![0u8; n * 4];
+        buffer.download(0, &mut bytes).unwrap();
+        bytes_f32(&bytes)
+    }
+
+    /// Fresh construction is explicitly zeroed: state never depends on
+    /// unspecified initial GPU contents, even after prior allocations.
+    #[test]
+    fn fresh_construction_is_zeroed_and_deterministic() {
+        if gpu_or_skip_simple().is_none() {
+            return;
+        }
+        let gpu = Qwen35Gpu::open().unwrap();
+        // Prior allocation churn in the same context.
+        let _noise = gpu.buffer(1 << 16).unwrap();
+        let _noise2 = gpu.buffer(1 << 16).unwrap();
+
+        let layer_a = GdnGpu::new_with(&gpu, 2, 8, 8, 4, 48).unwrap();
+        let layer_b = GdnGpu::new_with(&gpu, 2, 8, 8, 4, 48).unwrap();
+        assert!(layer_a.state_snapshot().unwrap().iter().all(|v| *v == 0.0));
+        assert!(layer_a.conv_history().unwrap().iter().all(|v| *v == 0.0));
+
+        let mut seed = 0xABCDu64;
+        let q: Vec<f32> = (0..16).map(|_| lcg(&mut seed)).collect();
+        let v: Vec<f32> = (0..16).map(|_| lcg(&mut seed)).collect();
+        let gate = [-0.3f32, -0.7];
+        let beta = [0.6f32, 0.4];
+        let mut out_a = vec![0.0f32; 16];
+        let mut out_b = vec![0.0f32; 16];
+        layer_a
+            .gdn_step(&q, &q, &v, &gate, &beta, &mut out_a)
+            .unwrap();
+        layer_b
+            .gdn_step(&q, &q, &v, &gate, &beta, &mut out_b)
+            .unwrap();
+        assert_eq!(out_a, out_b, "deterministic from explicitly zeroed state");
+        assert_eq!(
+            layer_a.state_snapshot().unwrap(),
+            layer_b.state_snapshot().unwrap()
+        );
+    }
+
+    #[test]
+    fn q_gate_split_matches_cpu() {
+        if gpu_or_skip_simple().is_none() {
+            return;
+        }
+        let gpu = Qwen35Gpu::open().unwrap();
+        let mut seed = 0x6D5u64;
+        for (heads, hd) in [(4usize, 16usize), (8, 256)] {
+            let qg: Vec<f32> = (0..heads * 2 * hd).map(|_| lcg(&mut seed)).collect();
+            let qg_buf = upload_f32(&gpu, &qg);
+            let (q_buf, gate_buf) = (
+                gpu.buffer(heads * hd * 4).unwrap(),
+                gpu.buffer(heads * hd * 4).unwrap(),
+            );
+            gpu.q_gate_split_dev(&qg_buf, &q_buf, &gate_buf, heads as u32, hd as u32)
+                .unwrap();
+            let q = download_f32(&q_buf, heads * hd);
+            let gate = download_f32(&gate_buf, heads * hd);
+            for h in 0..heads {
+                for i in 0..hd {
+                    assert_eq!(q[h * hd + i], qg[h * 2 * hd + i], "q element");
+                    assert_eq!(gate[h * hd + i], qg[h * 2 * hd + i + hd], "gate element");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn partial_rope_matches_cpu() {
+        if gpu_or_skip_simple().is_none() {
+            return;
+        }
+        let gpu = Qwen35Gpu::open().unwrap();
+        let mut seed = 0x20CEu64;
+        // (q_heads, kv_heads, head_dim, n_rot, pos)
+        for (hq, hkv, hd, n_rot, pos) in
+            [(4usize, 2usize, 16usize, 16usize, 3u32), (8, 2, 256, 64, 5)]
+        {
+            let inv = rope_inv_freq_partial(n_rot, 1e7);
+            let q: Vec<f32> = (0..hq * hd).map(|_| lcg(&mut seed)).collect();
+            let k: Vec<f32> = (0..hkv * hd).map(|_| lcg(&mut seed)).collect();
+            let mut cpu_q = q.clone();
+            let mut cpu_k = k.clone();
+            for h in 0..hq {
+                partial_rope_in_place(&mut cpu_q[h * hd..(h + 1) * hd], pos as usize, &inv);
+            }
+            for h in 0..hkv {
+                partial_rope_in_place(&mut cpu_k[h * hd..(h + 1) * hd], pos as usize, &inv);
+            }
+
+            let q_buf = upload_f32(&gpu, &q);
+            let k_buf = upload_f32(&gpu, &k);
+            let f_buf = upload_f32(&gpu, &inv);
+            gpu.rope_partial_dev(
+                &q_buf,
+                &k_buf,
+                &f_buf,
+                pos,
+                hq as u32,
+                hkv as u32,
+                hd as u32,
+                n_rot as u32,
+            )
+            .unwrap();
+            let gq = download_f32(&q_buf, hq * hd);
+            let gk = download_f32(&k_buf, hkv * hd);
+            for (g, c) in gq.iter().zip(cpu_q.iter()) {
+                assert_close(*g, *c, ABS_TOL, REL_TOL, "rope q");
+            }
+            for (g, c) in gk.iter().zip(cpu_k.iter()) {
+                assert_close(*g, *c, ABS_TOL, REL_TOL, "rope k");
+            }
+        }
+    }
+
+    #[test]
+    fn attn_gate_matches_cpu() {
+        if gpu_or_skip_simple().is_none() {
+            return;
+        }
+        let gpu = Qwen35Gpu::open().unwrap();
+        let mut seed = 0x9A7Eu64;
+        let n = 8 * 256;
+        let attn: Vec<f32> = (0..n).map(|_| lcg(&mut seed)).collect();
+        let gate: Vec<f32> = (0..n).map(|_| 2.0 * lcg(&mut seed)).collect();
+        let mut cpu = attn.clone();
+        apply_sigmoid_gate(&mut cpu, &gate);
+
+        let attn_buf = upload_f32(&gpu, &attn);
+        let gate_buf = upload_f32(&gpu, &gate);
+        gpu.attn_gate_dev(&attn_buf, &gate_buf, n as u32).unwrap();
+        let got = download_f32(&attn_buf, n);
+        for (g, c) in got.iter().zip(cpu.iter()) {
+            assert_close(*g, *c, ABS_TOL, REL_TOL, "attn gate");
+        }
+    }
+
+    /// The GPU stores true two-byte f16 entries; the packed cache bytes
+    /// are bit-identical to the CPU packer's round-to-nearest-even bits.
+    #[test]
+    fn packed_kv_store_matches_cpu_bitwise() {
+        if gpu_or_skip_simple().is_none() {
+            return;
+        }
+        let gpu = Qwen35Gpu::open().unwrap();
+        let kv_heads = 2usize;
+        let hd = 16usize;
+        let cap = 4usize;
+        let mut seed = 0xF16u64;
+        let k: Vec<f32> = (0..kv_heads * hd).map(|_| lcg(&mut seed)).collect();
+        let v: Vec<f32> = (0..kv_heads * hd).map(|_| lcg(&mut seed)).collect();
+
+        let k_src = upload_f32(&gpu, &k);
+        let v_src = upload_f32(&gpu, &v);
+        let k_cache = gpu.buffer(kv_heads * cap * hd * 2).unwrap();
+        let v_cache = gpu.buffer(kv_heads * cap * hd * 2).unwrap();
+        gpu.kv_store_f16_dev(
+            &k_src,
+            &v_src,
+            &k_cache,
+            &v_cache,
+            0,
+            cap as u32,
+            hd as u32,
+            kv_heads as u32,
+        )
+        .unwrap();
+
+        let mut gpu_k_bits = vec![0u8; kv_heads * cap * hd * 2];
+        k_cache.download(0, &mut gpu_k_bits).unwrap();
+        let mut cpu_k_bits = vec![0u8; kv_heads * cap * hd * 2];
+        for h in 0..kv_heads {
+            for i in 0..hd {
+                let src = h * hd + i;
+                let dst = h * cap * hd + i; // pos = 0
+                let bits = f32_to_f16_bits(k[src]).to_le_bytes();
+                cpu_k_bits[dst * 2] = bits[0];
+                cpu_k_bits[dst * 2 + 1] = bits[1];
+            }
+        }
+        assert_eq!(gpu_k_bits, cpu_k_bits, "packed f16 bytes are bit-identical");
+    }
+
+    /// Full attention pipeline over the packed cache matches the CPU
+    /// reference (packed cache + decoded rows + GQA), token by token.
+    #[test]
+    fn attention_f16_matches_cpu_across_tokens() {
+        if gpu_or_skip_simple().is_none() {
+            return;
+        }
+        let gpu = Qwen35Gpu::open().unwrap();
+        let mut seed = 0xA77u64;
+        // (heads_q, kv_heads, head_dim, cap, tokens)
+        for (hq, hkv, hd, cap, tokens) in
+            [(4usize, 2usize, 16usize, 4usize, 3usize), (8, 2, 256, 3, 2)]
+        {
+            let scale = 1.0 / (hd as f32).sqrt();
+            let geometry = GqaGeometry {
+                heads_q: hq,
+                heads_kv: hkv,
+                head_dim: hd,
+            };
+            let mut cpu_cache = Qwen35KvCache::new(1, hkv, hd, cap, KvPrecision::F16).unwrap();
+            let k_cache = gpu.buffer(hkv * cap * hd * 2).unwrap();
+            let v_cache = gpu.buffer(hkv * cap * hd * 2).unwrap();
+            let scratch = gpu.buffer(hq * cap * 4).unwrap();
+            let out_buf = gpu.buffer(hq * hd * 4).unwrap();
+
+            for t in 0..tokens {
+                let k: Vec<f32> = (0..hkv * hd).map(|_| lcg(&mut seed)).collect();
+                let v: Vec<f32> = (0..hkv * hd).map(|_| lcg(&mut seed)).collect();
+                let q: Vec<f32> = (0..hq * hd).map(|_| lcg(&mut seed)).collect();
+
+                cpu_cache.write(0, t, &k, &v).unwrap();
+                let k_src = upload_f32(&gpu, &k);
+                let v_src = upload_f32(&gpu, &v);
+                gpu.kv_store_f16_dev(
+                    &k_src, &v_src, &k_cache, &v_cache, t as u32, cap as u32, hd as u32, hkv as u32,
+                )
+                .unwrap();
+
+                let q_buf = upload_f32(&gpu, &q);
+                gpu.attention_f16_dev(
+                    &q_buf,
+                    &k_cache,
+                    &v_cache,
+                    &out_buf,
+                    &scratch,
+                    hq as u32,
+                    t as u32,
+                    cap as u32,
+                    hd as u32,
+                    (hq / hkv) as u32,
+                    scale,
+                )
+                .unwrap();
+                let gpu_out = download_f32(&out_buf, hq * hd);
+
+                // CPU reference: decode the packed cache and run GQA.
+                let seq = t + 1;
+                let mut k_slab = vec![0.0f32; hkv * seq * hd];
+                let mut v_slab = vec![0.0f32; hkv * seq * hd];
+                let mut row = vec![0.0f32; hd];
+                for h in 0..hkv {
+                    for tt in 0..seq {
+                        let base = (h * seq + tt) * hd;
+                        cpu_cache.key_row(0, h, tt, &mut row).unwrap();
+                        k_slab[base..base + hd].copy_from_slice(&row);
+                        cpu_cache.value_row(0, h, tt, &mut row).unwrap();
+                        v_slab[base..base + hd].copy_from_slice(&row);
+                    }
+                }
+                let mut cpu_out = vec![0.0f32; hq * hd];
+                gqa_cache_attention(&q, &k_slab, &v_slab, geometry, seq, scale, &mut cpu_out)
+                    .unwrap();
+
+                for (g, c) in gpu_out.iter().zip(cpu_out.iter()) {
+                    assert_close(*g, *c, ABS_TOL, REL_TOL, "attention f16");
+                }
+            }
+        }
+    }
+
+    /// One GPU owner serves several layer/lens objects: the whole model
+    /// shares a device/queue and a single allocation ledger.
+    #[test]
+    fn shared_context_serves_multiple_layers() {
+        if gpu_or_skip_simple().is_none() {
+            return;
+        }
+        let gpu = Qwen35Gpu::open().unwrap();
+        let before = gpu.context().allocated_bytes();
+        let layer_a = GdnGpu::new_with(&gpu, 2, 8, 8, 4, 48).unwrap();
+        let layer_b = GdnGpu::new_with(&gpu, 16, 128, 128, 4, 6144).unwrap();
+        let after = gpu.context().allocated_bytes();
+        assert!(
+            after > before,
+            "layer buffers join the shared allocation ledger"
+        );
+
+        let mut seed = 0x5A5Eu64;
+        let q: Vec<f32> = (0..2 * 8).map(|_| lcg(&mut seed)).collect();
+        let v: Vec<f32> = (0..2 * 8).map(|_| lcg(&mut seed)).collect();
+        let gate = [-0.5f32, -0.2];
+        let beta = [0.5f32, 0.5];
+        let mut out_a = vec![0.0f32; 16];
+        layer_a
+            .gdn_step(&q, &q, &v, &gate, &beta, &mut out_a)
+            .unwrap();
+        // The second layer is untouched by the first.
+        assert!(layer_b.state_snapshot().unwrap().iter().all(|x| *x == 0.0));
+    }
+
+    /// Sanity: the sigmoid helper used in the CPU comparisons matches the
+    /// operator gate formula (guards the reference, not the kernel).
+    #[test]
+    fn cpu_sigmoid_reference_matches_operator_gate() {
+        assert_close(sigmoid(0.0), 0.5, 1e-7, 1e-7, "sigmoid");
     }
 }

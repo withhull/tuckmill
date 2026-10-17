@@ -234,3 +234,25 @@ never accepted by any real artifact.
   2e-4 relative; observed conv 2.4e-7, L2 1.5e-8, gated norm 1.2e-7,
   delta rule 1.2e-7 (fixture) and 2.4e-4 output / 9.2e-5 state (pinned
   16x128). Device state stays f32.
+
+## Addendum 9 (Q35-2B.0-2B.2: full-attention kernels, shared owner, packed f16 KV)
+
+- **Shared GPU owner.** `Qwen35Gpu` owns one Metal context for the
+  whole model and allocates every buffer through it (single allocation
+  ledger); its `*_dev` methods are buffer-to-buffer, so model
+  activations stay on the device. `GdnGpu`'s slice methods are now
+  explicitly test adapters over those device ops. All buffers are
+  zeroed at allocation: no result may depend on unspecified initial GPU
+  memory (regression included).
+- **Full-attention kernels.** Joint Q+gate split, partial split-half
+  RoPE over the declared span only (`n_rot` of `head_dim`; IMRoPE with
+  text positions reduces to it), sigmoid attention gating, and causal
+  GQA over a packed f16 cache; per-head Q/K RMS norm reuses the
+  existing weighted-rmsnorm kernel. All qualified against the CPU
+  oracle on fixture and pinned shapes.
+- **Packed f16 GPU KV.** `tm_qwen35_kv_store_f16` stores true two-byte
+  entries; a test proves the stored bytes are bit-identical to the CPU
+  RNE packer, and the f16 attention path matches the CPU packed-cache
+  reference token by token. Recurrent DeltaNet state stays f32. One
+  dispatch bug was caught by the pinned shapes and fixed: a 128-thread
+  group per head only covered half of the 256-wide rows.

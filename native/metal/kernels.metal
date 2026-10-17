@@ -807,3 +807,163 @@ kernel void tm_qwen35_gated_norm(device const float *o [[buffer(0)]],
         orow[i] = row[i] * inv * weight[i] * silu;
     }
 }
+
+/* ---------------- Q35-2B: full-attention operators ---------------- */
+
+/*
+ * Split the joint Q projection `qg` [heads, 2*head_dim] (query first,
+ * gate second, per head) into q and gate, both [heads, head_dim].
+ */
+kernel void tm_qwen35_q_gate_split(device const float *qg [[buffer(0)]],
+                                   device float *q_out [[buffer(1)]],
+                                   device float *gate_out [[buffer(2)]],
+                                   constant uint &head_dim [[buffer(3)]],
+                                   uint gid [[thread_position_in_grid]]) {
+    const uint hd = head_dim;
+    const uint head = gid / hd;
+    const uint i = gid % hd;
+    q_out[gid] = qg[(size_t)head * (size_t)(2u * hd) + i];
+    gate_out[gid] = qg[(size_t)head * (size_t)(2u * hd) + hd + i];
+}
+
+/*
+ * Partial split-half RoPE (IMRoPE reduced to text positions): rotate only
+ * the first `n_rot` dims of each head row, pairs (i, i + n_rot/2), angle
+ * pos * inv_freq[i] (inv_freq holds n_rot/2 entries); dims at or beyond
+ * n_rot pass through untouched. One threadgroup per head over q then k
+ * (like tm_rope_f32).
+ */
+kernel void tm_qwen35_rope_partial_f32(device float *q [[buffer(0)]],
+                                       device float *k [[buffer(1)]],
+                                       device const float *inv_freq [[buffer(2)]],
+                                       constant uint &pos [[buffer(3)]],
+                                       constant uint &n_q_heads [[buffer(4)]],
+                                       constant uint &n_kv_heads [[buffer(5)]],
+                                       constant uint &head_dim [[buffer(6)]],
+                                       constant uint &n_rot [[buffer(7)]],
+                                       uint head [[threadgroup_position_in_grid]],
+                                       uint lane [[thread_position_in_threadgroup]]) {
+    const uint half_rot = n_rot / 2u;
+    if (lane >= half_rot) {
+        return;
+    }
+    const bool is_q = head < n_q_heads;
+    const uint local_head = is_q ? head : head - n_q_heads;
+    device float *base = is_q ? q : k;
+    device float *row = base + (size_t)local_head * (size_t)head_dim;
+    const float angle = (float)pos * inv_freq[lane];
+    const float c = cos(angle);
+    const float s = sin(angle);
+    const float a = row[lane];
+    const float b = row[lane + half_rot];
+    row[lane] = a * c - b * s;
+    row[lane + half_rot] = a * s + b * c;
+}
+
+/* Packed f16 KV store: k_cache[h][pos][d] = (half) k_src[h][d], true
+ * two-byte entries (the declared packed cache contract), same for v. */
+kernel void tm_qwen35_kv_store_f16(device const float *k_src [[buffer(0)]],
+                                   device const float *v_src [[buffer(1)]],
+                                   device half *k_cache [[buffer(2)]],
+                                   device half *v_cache [[buffer(3)]],
+                                   constant uint &pos [[buffer(4)]],
+                                   constant uint &cap [[buffer(5)]],
+                                   constant uint &head_dim [[buffer(6)]],
+                                   uint gid [[thread_position_in_grid]]) {
+    const size_t head = (size_t)gid / (size_t)head_dim;
+    const size_t lane = (size_t)gid % (size_t)head_dim;
+    const size_t src = head * (size_t)head_dim + lane;
+    const size_t dst = (head * (size_t)cap + (size_t)pos) * (size_t)head_dim + lane;
+    k_cache[dst] = (half)k_src[src];
+    v_cache[dst] = (half)v_src[src];
+}
+
+/*
+ * Causal GQA attention over a packed f16 cache (values decode to f32 for
+ * the arithmetic, mirroring the CPU reference's packed-cache path).
+ */
+kernel void tm_qwen35_attention_f16(device const float *q [[buffer(0)]],
+                                    device const half *k_cache [[buffer(1)]],
+                                    device const half *v_cache [[buffer(2)]],
+                                    device float *out [[buffer(3)]],
+                                    device float *scratch [[buffer(4)]],
+                                    constant uint &pos [[buffer(5)]],
+                                    constant uint &cap [[buffer(6)]],
+                                    constant uint &head_dim [[buffer(7)]],
+                                    constant uint &group [[buffer(8)]],
+                                    constant float &scale [[buffer(9)]],
+                                    uint head [[threadgroup_position_in_grid]],
+                                    uint tid [[thread_position_in_threadgroup]],
+                                    uint lane [[thread_index_in_simdgroup]],
+                                    uint simd_group [[simdgroup_index_in_threadgroup]]) {
+    threadgroup float reduce_scratch[4];
+    threadgroup float row_stats[2];
+    const uint kv_head = head / group;
+    const device float *qh = q + (size_t)head * (size_t)head_dim;
+    const device half *kc = k_cache + ((size_t)kv_head * (size_t)cap) * (size_t)head_dim;
+    const device half *vc = v_cache + ((size_t)kv_head * (size_t)cap) * (size_t)head_dim;
+    device float *head_scratch = scratch + (size_t)head * (size_t)cap;
+    const uint seq = pos + 1u;
+
+    for (uint j = 0; j < seq; ++j) {
+        float part = 0.0f;
+        for (uint d = tid; d < head_dim; d += 128u) {
+            part += qh[d] * (float)kc[(size_t)j * (size_t)head_dim + d];
+        }
+        const float s = tm_reduce_sum_128(part, reduce_scratch, lane, simd_group) * scale;
+        if (tid == 0u) {
+            head_scratch[j] = s;
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    float local_max = -INFINITY;
+    for (uint j = tid; j < seq; j += 128u) {
+        local_max = max(local_max, head_scratch[j]);
+    }
+    local_max = simd_max(local_max);
+    if (lane == 0u) {
+        reduce_scratch[simd_group] = local_max;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid == 0u) {
+        float m = reduce_scratch[0];
+        for (uint g = 1u; g < 4u; ++g) {
+            m = max(m, reduce_scratch[g]);
+        }
+        row_stats[0] = m;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const float row_max = row_stats[0];
+
+    float local_sum = 0.0f;
+    for (uint j = tid; j < seq; j += 128u) {
+        local_sum += exp(head_scratch[j] - row_max);
+    }
+    const float denom = tm_reduce_sum_128(local_sum, reduce_scratch, lane, simd_group);
+    if (tid == 0u) {
+        row_stats[1] = denom;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    device float *oh = out + (size_t)head * (size_t)head_dim;
+
+    for (uint d = tid; d < head_dim; d += 128u) {
+        float accv = 0.0f;
+        for (uint j = 0; j < seq; ++j) {
+            const float w = exp(head_scratch[j] - row_max) / denom;
+            accv += w * (float)vc[(size_t)j * (size_t)head_dim + d];
+        }
+        oh[d] = accv;
+    }
+}
+
+/* attn[i] *= sigmoid(gate[i]) — the joint Q-projection output gate. */
+kernel void tm_qwen35_attn_gate(device float *attn [[buffer(0)]],
+                                device const float *gate [[buffer(1)]],
+                                constant uint &n [[buffer(2)]],
+                                uint gid [[thread_position_in_grid]]) {
+    if (gid >= n) {
+        return;
+    }
+    attn[gid] *= 1.0f / (1.0f + exp(-gate[gid]));
+}
