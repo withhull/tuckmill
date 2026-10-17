@@ -345,6 +345,7 @@ mod tests {
                     kv_precision: Some("f16".into()),
                     kv_state_bytes: Some(1 << 20),
                     session_kv_bytes: Some(1 << 15),
+                    retained_weight_bytes: Some(1 << 22),
                     threads: Some(4),
                     kernel_impl: Some("neon".into()),
                     numerical_profile: Some("oracle-f32".into()),

@@ -43,7 +43,9 @@ payload := UTF-8 JSON, one message object
   sampled token id. `StatsAck` backend stats include `kv_state_bytes`, the
   prepared KV-state bytes in the backend's actual representation, plus
   `session_kv_bytes`, the KV bytes allocated for the most recent request's
-  own admitted need; the supervisor checks the prepared number against the
+  own admitted need, and `retained_weight_bytes`, the largest weight-cache
+  allocation the load can retain between requests (the supervisor re-checks
+  it against every later plan's reservations before reusing the worker); the supervisor checks the prepared number against the
   plan's KV reservation after every load and fails closed on an understated
   plan. `Control` frames are request-scoped on the supervisor side: a
   command whose request already ended is dropped (counted), never replayed

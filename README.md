@@ -49,7 +49,12 @@ quality.
 > never block on the generating worker; governor commands are scoped to the
 > request that was active when they were decided; benchmark throughput
 > counts model tokens from the worker's Done frame (record schema v4), with
-> visible-chunk cadence reported separately. See
+> visible-chunk cadence reported separately. Every request is validated
+> against the plan it will actually run under at the shared dispatch
+> boundary — before any queueing or allocation, with cold and warm workers
+> rejecting identically — and warm reuse additionally re-checks the
+> worker's retained allocations against the current plan's reservations
+> rather than trusting model identity alone. See
 > [docs/certification-matrix.md](docs/certification-matrix.md) and
 > [docs/claims.md](docs/claims.md).
 
@@ -184,7 +189,7 @@ scripts/            build.sh, test.sh, demo.sh
 ## Verification and benchmarks
 
 `scripts/test.sh` runs formatting, `clippy -D warnings`, and the full test
-suite (351 tests),
+suite (360 tests),
 including adversarial GGUF/Safetensors fixtures, planner math, governor
 semantics, import/pack fault injection, worker-protocol framing, HTTP
 auth/SSE (including long streams through the real endpoint), CLI end-to-end

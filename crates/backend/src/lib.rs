@@ -408,6 +408,13 @@ pub struct BackendStats {
     /// actually allocates — never a previously prepared larger capacity.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_kv_bytes: Option<u64>,
+    /// Largest weight-cache allocation this load can retain between
+    /// requests, in bytes (cache budget clamped to the artifact payload,
+    /// plus one block of transient overhead). The supervisor compares this
+    /// against every later plan's weights + I/O reservations before reusing
+    /// the worker: model identity alone is not resource admission.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retained_weight_bytes: Option<u64>,
     /// Thread count in use for compute, when the backend is threaded.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub threads: Option<u32>,

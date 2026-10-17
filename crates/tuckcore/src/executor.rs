@@ -80,6 +80,12 @@ struct Loaded {
     /// `context_total`; per-request sessions are allocated for their own
     /// admitted need, never for a previously prepared larger capacity.
     session_kv_bytes: Arc<AtomicU64>,
+    /// Largest weight-cache allocation this load can retain between
+    /// requests: the cache budget clamped to the payload, plus one block of
+    /// transient overhead. This is exactly the quantity the load-time
+    /// arena check validated against the plan, reported so the supervisor
+    /// can re-check it against every later plan before reusing the worker.
+    retained_weight_bytes: u64,
 }
 
 /// The experimental custom native executor.
@@ -453,6 +459,7 @@ impl InferenceBackend for TuckCore {
             counters,
             kernels,
             session_kv_bytes: Arc::new(AtomicU64::new(0)),
+            retained_weight_bytes: cache_wanted,
         });
         Ok(note)
     }
@@ -782,6 +789,7 @@ impl InferenceBackend for TuckCore {
                         0 => None,
                         bytes => Some(bytes),
                     },
+                    retained_weight_bytes: Some(loaded.retained_weight_bytes),
                     threads: Some(1), // scalar executor is single-threaded
                     kernel_impl: Some(loaded.kernels.as_str().to_string()),
                     numerical_profile: Some(loaded.profile.as_str().to_string()),
@@ -1064,7 +1072,8 @@ mod tests {
         let err = engine.load(&starved, &artifact, None).unwrap_err();
         assert_eq!(err.code(), ErrorCode::InvalidPlan);
 
-        // The fixture plan remains loadable and acknowledges its KV bytes.
+        // The fixture plan remains loadable and acknowledges its KV bytes
+        // and the weight-cache allocation it can retain between requests.
         engine.load(&plan, &artifact, None).unwrap();
         let stats = engine.stats();
         assert_eq!(
@@ -1073,6 +1082,20 @@ mod tests {
                 &engine.loaded.as_ref().unwrap().weights.cfg,
                 256
             ))
+        );
+        let payload: u64 = tuckmill_manifest::gguf::inspect(
+            std::path::Path::new(&artifact.path),
+            &tuckmill_manifest::gguf::Limits::default(),
+        )
+        .unwrap()
+        .tensors
+        .iter()
+        .map(|t| t.byte_size)
+        .sum();
+        assert_eq!(
+            stats.retained_weight_bytes,
+            Some(payload.min(DEFAULT_CACHE_BYTES) + DEFAULT_BLOCK_BYTES),
+            "the retained weight allocation is the cache clamped to the payload plus one block"
         );
     }
 

@@ -242,6 +242,75 @@ pub struct Runtime {
     overrun_streak: AtomicU64,
 }
 
+/// Validate a run request against the plan it will actually execute under.
+/// This is the shared dispatch boundary (CLI, bench, API, future SDKs and
+/// the Metal path all pass through `start_run`): callers must not rely on
+/// the worker's previously prepared context, because a warm worker can hold
+/// a larger preparation than the current plan admits. Checked arithmetic;
+/// typed rejections.
+fn validate_request_against_plan(plan: &ExecutionPlan, request: &RunRequest) -> Result<()> {
+    let prompt = request.prompt_tokens.len() as u64;
+    if prompt == 0 {
+        return Err(TuckmillError::new(
+            ErrorCode::InvalidRequest,
+            "prompt must contain at least one token",
+        ));
+    }
+    if request.max_output_tokens == 0 {
+        return Err(TuckmillError::new(
+            ErrorCode::InvalidRequest,
+            "max_output_tokens must be positive",
+        ));
+    }
+    if request.max_output_tokens > plan.context.max_output_tokens {
+        return Err(TuckmillError::new(
+            ErrorCode::ContextExceedsBudget,
+            format!(
+                "max_output_tokens {} exceeds the plan's admitted output allowance of {}",
+                request.max_output_tokens, plan.context.max_output_tokens
+            ),
+        )
+        .with_action("Lower max_output_tokens or admit a plan with a larger output allowance."));
+    }
+    let total = prompt
+        .checked_add(request.max_output_tokens)
+        .ok_or_else(|| {
+            TuckmillError::new(
+                ErrorCode::ContextExceedsBudget,
+                "prompt length plus max_output_tokens overflows; refusing to dispatch",
+            )
+        })?;
+    if total > plan.context.total_context {
+        return Err(TuckmillError::new(
+            ErrorCode::ContextExceedsBudget,
+            format!(
+                "prompt {prompt} + max output {} exceeds the plan's admitted context {}",
+                request.max_output_tokens, plan.context.total_context
+            ),
+        )
+        .with_action("Lower max_output_tokens, shorten the prompt, or admit a larger context."));
+    }
+    request.sampling.validate()?;
+    Ok(())
+}
+
+/// Reuse-compatibility gate: the worker's retained weight allocation (as
+/// acknowledged at load) must fit the *current* plan's weights + I/O
+/// reservations. A worker prepared under a generous plan must not be
+/// silently inherited by a plan that did not reserve what the worker can
+/// retain. KV needs no such check: sessions are allocated per request for
+/// the request's own admitted need, which the request validation above
+/// bounds to the current plan.
+fn reuse_fits_retained(plan: &ExecutionPlan, retained_weight_bytes: u64) -> bool {
+    let allowance = plan
+        .budget
+        .reservation_breakdown
+        .weights
+        .bytes()
+        .saturating_add(plan.budget.reservation_breakdown.io_buffers.bytes());
+    retained_weight_bytes <= allowance
+}
+
 /// Resolved identity of a loaded worker (caller holds the worker lock or is
 /// inside the executor thread after load).
 fn worker_identity(worker: &IsolatedWorker) -> tuckmill_manifest::records::EngineIdentity {
@@ -262,6 +331,11 @@ struct WorkerSlot {
     /// this one; request timestamps, seeds, prompts, budgets, and plan ids
     /// deliberately do not participate.
     key: LoadedModelKey,
+    /// Largest weight-cache allocation this load can retain (acknowledged
+    /// by the worker at load, `None` when the backend retains none). Reuse
+    /// additionally requires it to fit the current plan's weights + I/O
+    /// reservations: model identity alone is not resource admission.
+    retained_weight_bytes: u64,
 }
 
 /// Stable identity of a loaded model in a worker (B4). Built from immutable
@@ -649,8 +723,19 @@ impl Runtime {
         artifact: ArtifactRef,
         request: RunRequest,
     ) -> Result<ActiveRun> {
-        self.check_plan_fresh(&plan)?;
-        self.plan_admitted(&plan)?;
+        // Early admission checks run as one group so a rejected request
+        // leaves no ticket behind in the bounded queue. The request is
+        // validated here against the plan it will run under, before any
+        // queue wait or allocation: a warm worker's previously prepared
+        // (possibly larger) context is never an admission authority.
+        if let Err(e) = self
+            .check_plan_fresh(&plan)
+            .and_then(|_| self.plan_admitted(&plan))
+            .and_then(|_| validate_request_against_plan(&plan, &request))
+        {
+            self.queue.abandon(ticket);
+            return Err(e);
+        }
         if self.governor_state() == GovState::Failed {
             return Err(TuckmillError::new(
                 ErrorCode::WorkerFailed,
@@ -878,7 +963,38 @@ impl Runtime {
                 let requested =
                     LoadedModelKey::new(self.engine_kind, plan, artifact, load_options.as_ref());
                 let need_spawn = match slot.as_ref() {
-                    Some(w) => !w.key.satisfies(&requested),
+                    Some(w) => {
+                        let identity_ok = w.key.satisfies(&requested);
+                        let retention_ok = reuse_fits_retained(plan, w.retained_weight_bytes);
+                        if identity_ok && !retention_ok {
+                            self.logger.warn(
+                                "REUSE_DECLINED_RETENTION",
+                                [
+                                    (
+                                        "retained_weight_bytes".to_string(),
+                                        serde_json::json!(w.retained_weight_bytes),
+                                    ),
+                                    (
+                                        "plan_allowance_bytes".to_string(),
+                                        serde_json::json!(plan
+                                            .budget
+                                            .reservation_breakdown
+                                            .weights
+                                            .bytes()
+                                            .saturating_add(
+                                                plan.budget
+                                                    .reservation_breakdown
+                                                    .io_buffers
+                                                    .bytes()
+                                            )),
+                                    ),
+                                ]
+                                .into_iter()
+                                .collect(),
+                            );
+                        }
+                        !identity_ok || !retention_ok
+                    }
                     None => true,
                 };
                 if need_spawn {
@@ -909,6 +1025,10 @@ impl Runtime {
                     let kv_prepared = ack_stats
                         .as_ref()
                         .and_then(|s| s.kv_state_bytes)
+                        .unwrap_or(0);
+                    let retained_weight = ack_stats
+                        .as_ref()
+                        .and_then(|s| s.retained_weight_bytes)
                         .unwrap_or(0);
                     let kv_reserved = plan.budget.reservation_breakdown.kv_state.bytes();
                     if kv_prepared > kv_reserved {
@@ -958,6 +1078,7 @@ impl Runtime {
                     self.worker_pid.store(worker.pid(), Ordering::Relaxed);
                     *slot = Some(WorkerSlot {
                         key: requested,
+                        retained_weight_bytes: retained_weight,
                         worker,
                     });
                 } else {
@@ -1701,6 +1822,280 @@ mod tests {
         assert!(
             session_small_plan < prepared_large,
             "the reused request's KV allocation ({session_small_plan} B) is its own need, not the prepared 4096-token capacity ({prepared_large} B)"
+        );
+        runtime.shutdown();
+    }
+
+    /// Small handcrafted plan for boundary tests (reservations as given).
+    /// Uses the runtime's own device id so plan freshness holds.
+    fn boundary_plan(
+        device_id: &Id,
+        context: u64,
+        max_out: u64,
+        budget: &str,
+        weights: u64,
+        kv: u64,
+        io: u64,
+    ) -> ExecutionPlan {
+        let mut p = ExecutionPlan::new_skeleton(
+            Id::new("a".repeat(64)).unwrap(),
+            device_id.clone(),
+            "qwen3".into(),
+        );
+        p.mode = tuckmill_manifest::plan::ExecutionMode::Resident;
+        p.context = tuckmill_manifest::plan::PlanContext::new(context, max_out);
+        p.budget.requested_budget = Bytes::parse(budget).unwrap();
+        p.budget.add_reservation(
+            tuckmill_manifest::records::ReserveClass::Weights,
+            Bytes(weights),
+        );
+        if kv > 0 {
+            p.budget
+                .add_reservation(tuckmill_manifest::records::ReserveClass::KvState, Bytes(kv));
+        }
+        p.budget.add_reservation(
+            tuckmill_manifest::records::ReserveClass::IoBuffers,
+            Bytes(io),
+        );
+        p.budget.reservation = p.budget.reservation_breakdown.total();
+        p.plan_id = p.compute_id().unwrap();
+        p
+    }
+
+    #[test]
+    fn request_plan_validation_is_typed_and_uses_the_plan_allowance() {
+        // The validation is a pure function of (plan, request), so a cold
+        // and a warm worker necessarily reject identically; this test pins
+        // the rules themselves.
+        let device = Id::new("d".repeat(64)).unwrap();
+        let plan = boundary_plan(&device, 1024, 128, "1GiB", 1 << 20, 0, 1 << 20);
+        let request = |prompt: usize, max: u64| RunRequest {
+            prompt_tokens: vec![0; prompt],
+            max_output_tokens: max,
+            stop: vec![],
+            seed: 0,
+            sampling: tuckmill_backend::SamplingPolicy::default(),
+        };
+        assert!(validate_request_against_plan(&plan, &request(2, 100)).is_ok());
+        assert_eq!(
+            validate_request_against_plan(&plan, &request(0, 10))
+                .unwrap_err()
+                .code(),
+            ErrorCode::InvalidRequest
+        );
+        assert_eq!(
+            validate_request_against_plan(&plan, &request(2, 0))
+                .unwrap_err()
+                .code(),
+            ErrorCode::InvalidRequest
+        );
+        // Output allowance: 2000 > the plan's admitted 128, regardless of
+        // how much context the plan (or a warm worker) could hold.
+        assert_eq!(
+            validate_request_against_plan(&plan, &request(1012, 2000))
+                .unwrap_err()
+                .code(),
+            ErrorCode::ContextExceedsBudget
+        );
+        // Context fit: prompt + output must be within the plan's context.
+        assert_eq!(
+            validate_request_against_plan(&plan, &request(1000, 100))
+                .unwrap_err()
+                .code(),
+            ErrorCode::ContextExceedsBudget
+        );
+        // Unsupported sampling is refused at the same boundary.
+        let mut bad_sampling = request(2, 100);
+        bad_sampling.sampling.temperature = 3.0;
+        assert_eq!(
+            validate_request_against_plan(&plan, &bad_sampling)
+                .unwrap_err()
+                .code(),
+            ErrorCode::InvalidRequest
+        );
+    }
+
+    #[test]
+    fn reuse_gate_requires_retained_allocations_to_fit_the_current_plan() {
+        let device = Id::new("d".repeat(64)).unwrap();
+        let plan = boundary_plan(&device, 2048, 64, "1GiB", 1 << 20, 0, 1 << 20);
+        let allowance = (1u64 << 20) + (1u64 << 20);
+        assert!(reuse_fits_retained(&plan, 0));
+        assert!(reuse_fits_retained(&plan, allowance));
+        assert!(
+            !reuse_fits_retained(&plan, allowance + 1),
+            "retained allocations beyond the plan's weights + I/O reservations must decline reuse"
+        );
+    }
+
+    #[test]
+    fn invalid_requests_are_rejected_identically_on_cold_and_warm_workers() {
+        // Gate B review finding: the shared runtime boundary must not rely
+        // on the worker's previously prepared context. Cache state must
+        // never change admission correctness.
+        let Some(worker_exe) = crate::test_worker_bin() else {
+            return;
+        };
+        let (_dir, runtime, _signals) =
+            test_runtime_kind(EngineMode::Isolated, Some(worker_exe), EngineKind::TuckCore);
+        let (artifact, adapter) = runtime.resolve_artifact("local").unwrap();
+        let plan = runtime
+            .plan_for(&artifact, &adapter, Bytes::parse("2GiB").unwrap(), 2048, 64)
+            .unwrap();
+        runtime.plan_admitted(&plan).unwrap();
+        runtime.admit_engine(&plan).unwrap();
+        let start = |request: RunRequest| {
+            let ticket = runtime.submit().unwrap();
+            runtime.start_run(&ticket, plan.clone(), artifact_ref_for(&runtime), request)
+        };
+        let expect_err = |r: Result<ActiveRun>| match r {
+            Ok(_) => panic!("request must be rejected"),
+            Err(e) => e,
+        };
+
+        // Cold worker: max_output 2000 exceeds the plan's admitted 64.
+        let cold = expect_err(start(RunRequest::greedy(vec![1, 2], 2000)));
+        assert_eq!(cold.code(), ErrorCode::ContextExceedsBudget);
+        assert_eq!(
+            runtime.worker_generation(),
+            0,
+            "rejected before any worker was dispatched"
+        );
+
+        // Warm worker: a successful run first, then the identical request.
+        let run = start(RunRequest::greedy(vec![1, 2], 16)).unwrap();
+        let (reason, committed) = collect_run(&run, |_, _| {});
+        assert_eq!(reason, FinishReason::Length);
+        assert_eq!(committed, 16);
+        assert_eq!(runtime.worker_generation(), 1);
+        let warm = expect_err(start(RunRequest::greedy(vec![1, 2], 2000)));
+        assert_eq!(warm.code(), cold.code());
+        assert_eq!(warm.message(), cold.message());
+        assert_eq!(
+            runtime.worker_generation(),
+            1,
+            "a rejected request must not reload or disturb the worker"
+        );
+
+        // Prompt + output beyond the plan's context: rejected warm as well.
+        let warm_ctx = expect_err(start(RunRequest::greedy(vec![0; 2000], 100)));
+        assert_eq!(warm_ctx.code(), ErrorCode::ContextExceedsBudget);
+        assert_eq!(runtime.worker_generation(), 1);
+        runtime.shutdown();
+    }
+
+    #[test]
+    fn reuse_declines_when_retained_allocations_exceed_the_current_plan() {
+        // A lower-budget plan must not silently inherit the warm worker's
+        // retained allocations: reuse declines, and the reload under the
+        // new plan fails closed (the existing load-time arena check).
+        let Some(worker_exe) = crate::test_worker_bin() else {
+            return;
+        };
+        let (_dir, runtime, _signals) =
+            test_runtime_kind(EngineMode::Isolated, Some(worker_exe), EngineKind::TuckCore);
+        let (artifact, adapter) = runtime.resolve_artifact("local").unwrap();
+
+        // Warm worker under a generous plan.
+        let plan_a = runtime
+            .plan_for(&artifact, &adapter, Bytes::parse("2GiB").unwrap(), 2048, 64)
+            .unwrap();
+        runtime.plan_admitted(&plan_a).unwrap();
+        runtime.admit_engine(&plan_a).unwrap();
+        let ticket = runtime.submit().unwrap();
+        let run = runtime
+            .start_run(
+                &ticket,
+                plan_a,
+                artifact_ref_for(&runtime),
+                RunRequest::greedy(vec![1, 2], 16),
+            )
+            .unwrap();
+        let (reason, _) = collect_run(&run, |_, _| {});
+        assert_eq!(reason, FinishReason::Length);
+        assert_eq!(runtime.worker_generation(), 1);
+        let retained = runtime
+            .backend_stats()
+            .and_then(|s| s.retained_weight_bytes)
+            .expect("tuckcore reports retained weight bytes");
+        assert!(retained > 0);
+
+        // A tiny plan whose weights + I/O reservations cannot cover the
+        // retained allocation: reuse must decline. The reload then fails
+        // closed at the worker's arena check (explicit rejection).
+        let starved = boundary_plan(
+            &runtime.device.device_id,
+            512,
+            64,
+            "64MiB",
+            2 * 1024,
+            4 * 1024 * 1024,
+            2 * 1024,
+        );
+        runtime.plan_admitted(&starved).unwrap();
+        runtime.admit_engine(&starved).unwrap();
+        let ticket = runtime.submit().unwrap();
+        let run = runtime
+            .start_run(
+                &ticket,
+                starved,
+                artifact_ref_for(&runtime),
+                RunRequest::greedy(vec![1, 2, 3, 4], 16),
+            )
+            .unwrap();
+        let terminal = loop {
+            match run.events.recv() {
+                Ok(RunEvent::Error {
+                    code,
+                    message,
+                    action,
+                }) => break Some((code, message, action)),
+                Ok(RunEvent::Done { .. }) => break None,
+                Ok(_) => {}
+                Err(_) => break None,
+            }
+        };
+        let (code, message, _action) = terminal.expect("the reload must fail closed");
+        assert_eq!(code, "INVALID_PLAN", "{message}");
+        assert!(
+            message.contains("weight-cache"),
+            "the rejection must name the uncovered allocation: {message}"
+        );
+        assert_eq!(
+            runtime.worker_generation(),
+            2,
+            "the declined reuse reloaded under the new plan"
+        );
+
+        // And a plan that does cover the retained allocation reuses again
+        // after a fresh load.
+        let generous = boundary_plan(
+            &runtime.device.device_id,
+            512,
+            64,
+            "64MiB",
+            retained + (1 << 20),
+            4 * 1024 * 1024,
+            16 * 1024 * 1024,
+        );
+        runtime.plan_admitted(&generous).unwrap();
+        runtime.admit_engine(&generous).unwrap();
+        let ticket = runtime.submit().unwrap();
+        let run = runtime
+            .start_run(
+                &ticket,
+                generous,
+                artifact_ref_for(&runtime),
+                RunRequest::greedy(vec![1, 2, 3, 4], 16),
+            )
+            .unwrap();
+        let (reason, committed) = collect_run(&run, |_, _| {});
+        assert_eq!(reason, FinishReason::Length);
+        assert_eq!(committed, 16);
+        assert_eq!(
+            runtime.worker_generation(),
+            3,
+            "a covering plan reloads once and runs"
         );
         runtime.shutdown();
     }

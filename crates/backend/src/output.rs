@@ -15,10 +15,28 @@
 //! stop string across tokens. Every pushed run carries the token owners of
 //! its bytes, so a token that contributed at least one byte to visible
 //! output is counted even when the bytes were split across tokens by
-//! UTF-8 assembly. Tokens fully inside a completed stop sequence are
-//! dropped and never counted visible.
+//! UTF-8 assembly. Each contributing token ordinal is counted **once for
+//! the whole stream**, not once per decoded run: a token whose bytes span
+//! several runs (the tail of a split character plus its own following
+//! characters, or invalid-byte replacement runs) gets a single mark.
+//! Tokens fully inside a completed stop sequence are dropped and never
+//! counted visible.
+//!
+//! The deduplication is bounded by construction. Runs arrive in token
+//! order, and a run can only carry owners within the last few tokens: a
+//! decoded character spans at most four bytes, so it can be composed from
+//! at most four token pieces and completes within three nonempty tokens of
+//! its last byte's token. First-seen owners are therefore remembered in a
+//! small window that evicts anything older than the newest owner minus
+//! `OWNER_WINDOW`, and no owner can reappear after eviction.
 
 use std::collections::VecDeque;
+
+/// First-seen owner window: any character spans at most 4 tokens and
+/// completes within 3 more, so an owner can never reappear in a run pushed
+/// more than `OWNER_WINDOW` ordinals after it was first seen. The margin is
+/// deliberately generous (the bound is 4).
+const OWNER_WINDOW: u64 = 8;
 
 /// The result of feeding text to the buffer.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -49,13 +67,21 @@ pub struct VisibleOutputBuffer {
     /// (byte offset in `pending`, token ordinal) per token-owner that
     /// contributed bytes now held. A byte run owned by several tokens
     /// (a multibyte character split across tokens) produces one mark per
-    /// owner at the same offset. Bounded by the longest stop plus one
-    /// push's text.
+    /// owner at the same offset; a token that appears in several runs gets
+    /// exactly one mark for the whole stream. Bounded by the longest stop
+    /// plus one push's text.
     marks: VecDeque<(usize, u64)>,
     /// Tokens with at least one visible byte. This is the honest
     /// completion-token count: tokens dropped inside a stop sequence or
     /// contributing nothing do not count.
     visible_tokens: u64,
+    /// First-seen owner ordinals with a mark in `pending` or already
+    /// counted; insertion order is nondecreasing. Evicted once
+    /// `max_owner_seen - OWNER_WINDOW` passes them (they can no longer
+    /// reappear).
+    seen: VecDeque<u64>,
+    /// Highest owner ordinal observed (None before any run).
+    max_owner_seen: Option<u64>,
 }
 
 impl VisibleOutputBuffer {
@@ -66,20 +92,37 @@ impl VisibleOutputBuffer {
             stops,
             marks: VecDeque::new(),
             visible_tokens: 0,
+            seen: VecDeque::new(),
+            max_owner_seen: None,
         }
     }
 
     /// Feed one decoded run: `text` composed of bytes owned by `owners`
     /// (deduplicated token ordinals; more than one owner means a multibyte
-    /// character was split across tokens).
+    /// character was split across tokens). An owner that already
+    /// contributed an earlier run keeps its single mark — distinct owners
+    /// are counted once across the whole stream.
     pub fn push(&mut self, owners: &[u64], text: &str) -> Release {
         if text.is_empty() {
             return Release::empty();
         }
+        if let Some(newest) = owners.iter().copied().max() {
+            self.max_owner_seen = Some(self.max_owner_seen.map_or(newest, |m| m.max(newest)));
+        }
+        // Evict owners that can no longer reappear (see module docs).
+        if let Some(max) = self.max_owner_seen {
+            let floor = max.saturating_sub(OWNER_WINDOW);
+            while self.seen.front().is_some_and(|o| *o < floor) {
+                self.seen.pop_front();
+            }
+        }
         let start = self.pending.len();
         self.pending.push_str(text);
         for owner in owners {
-            self.marks.push_back((start, *owner));
+            if !self.seen.contains(owner) {
+                self.seen.push_back(*owner);
+                self.marks.push_back((start, *owner));
+            }
         }
 
         // Earliest completed stop inside the held region. An occurrence
@@ -363,6 +406,85 @@ mod tests {
         let mut b = VisibleOutputBuffer::new(&stops(&["", ""]));
         let r = b.push(&[0], "text");
         assert_eq!(r.text, "text");
+    }
+
+    /// Compose the real decoder with the buffer: every contributing token
+    /// ordinal counts exactly once across all decoded runs.
+    mod composition {
+        use super::*;
+        use tuckmill_manifest::utf8::Utf8StreamDecoder;
+
+        fn feed(
+            decoder: &mut Utf8StreamDecoder,
+            b: &mut VisibleOutputBuffer,
+            bytes: &[u8],
+            token: u64,
+        ) {
+            for run in decoder.push_token(bytes, token) {
+                let r = b.push(&run.owners, &run.text);
+                assert!(!r.stop);
+            }
+        }
+
+        #[test]
+        fn split_character_and_ascii_run_count_two_not_three() {
+            // Review counterexample: token 0 starts €, token 1 completes it
+            // and adds x. Runs: [0,1] -> "€", [1] -> "x"; distinct
+            // contributors are two, not three.
+            let mut d = Utf8StreamDecoder::new();
+            let mut b = VisibleOutputBuffer::new(&[]);
+            feed(&mut d, &mut b, &[0xE2], 0);
+            feed(&mut d, &mut b, &[0x82, 0xAC, b'x'], 1);
+            assert_eq!(b.visible_tokens(), 2);
+            assert_eq!(b.held_bytes(), 0);
+        }
+
+        #[test]
+        fn ascii_then_split_character_counts_two() {
+            // The reverse direction: token 0 contributes "x" and starts €,
+            // token 1 completes €.
+            let mut d = Utf8StreamDecoder::new();
+            let mut b = VisibleOutputBuffer::new(&[]);
+            feed(&mut d, &mut b, b"x\xE2", 0);
+            feed(&mut d, &mut b, &[0x82, 0xAC], 1);
+            assert_eq!(b.visible_tokens(), 2);
+        }
+
+        #[test]
+        fn one_token_split_into_several_runs_counts_once() {
+            // Invalid-byte replacement: token 0 alone produces U+FFFD and
+            // then "A" (two runs, same owner).
+            let mut d = Utf8StreamDecoder::new();
+            let mut b = VisibleOutputBuffer::new(&[]);
+            feed(&mut d, &mut b, &[0xF0, 0x9F, 0x41], 0);
+            assert_eq!(b.visible_tokens(), 1);
+        }
+
+        #[test]
+        fn replacement_and_continuation_tokens_count_once_each() {
+            let mut d = Utf8StreamDecoder::new();
+            let mut b = VisibleOutputBuffer::new(&[]);
+            feed(&mut d, &mut b, &[0xF0, 0x9F], 0);
+            feed(&mut d, &mut b, &[0x41], 1);
+            assert_eq!(b.visible_tokens(), 2);
+        }
+
+        #[test]
+        fn dropped_stop_region_never_counts_its_contributors() {
+            // A multi-owner run that is dropped by a stop must not count
+            // any of its owners, while earlier visible text still does.
+            let mut b = VisibleOutputBuffer::new(&stops(&["€"]));
+            let r1 = b.push(&[0], "ok");
+            assert_eq!(r1.text, "ok");
+            let r2 = b.push(&[1, 2], "€");
+            assert_eq!(r2.text, "");
+            assert!(r2.stop);
+            assert_eq!(
+                b.visible_tokens(),
+                1,
+                "the dropped € contributors (tokens 1 and 2) never count"
+            );
+        }
     }
 
     #[test]
