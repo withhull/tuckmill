@@ -1083,5 +1083,5 @@ fn bench_warm_repetitions_and_long_output_drain() {
             );
         }
     }
-    assert_eq!(v["schema_version"], 4);
+    assert_eq!(v["schema_version"], 5);
 }

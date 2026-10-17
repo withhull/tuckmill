@@ -380,6 +380,15 @@ pub struct BenchmarkRun {
     pub confidence: Confidence,
     /// Explicit slow-mode acceptance, required for batch-local labels.
     pub slow_mode_accepted: bool,
+    /// Requested Metal prefill micro-batch (None = engine default). Recorded
+    /// alongside the effective value so a run can never conflate them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prefill_batch_requested: Option<u32>,
+    /// Effective Metal prefill micro-batch the worker acknowledged at load
+    /// (smaller than requested when the plan's workspace reservation
+    /// bounded it). Absent on paths without batched prefill.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prefill_batch_effective: Option<u32>,
     /// Honest caveats; a report without its caveats is incomplete evidence.
     pub caveats: Vec<String>,
 }

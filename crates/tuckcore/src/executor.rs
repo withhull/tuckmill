@@ -246,6 +246,12 @@ impl InferenceBackend for TuckCore {
         let kernels = opts.kernels.unwrap_or(KernelSelection::Auto).resolve()?;
         let metal_mode = kernels == ResolvedKernels::Metal;
         let storage_selection = opts.storage.unwrap_or(StorageSelection::Auto);
+        if !metal_mode && opts.prefill_batch.is_some() {
+            return Err(TuckmillError::new(
+                ErrorCode::InvalidRequest,
+                "prefill_batch applies only to the Metal kernel path; the resolved CPU kernels execute single-token steps and must not silently ignore it",
+            ));
+        }
         if metal_mode && storage_selection != StorageSelection::Auto {
             return Err(TuckmillError::new(
                 ErrorCode::InvalidRequest,
@@ -973,6 +979,8 @@ impl InferenceBackend for TuckCore {
                     retained_weight_bytes: Some(loaded.retained_weight_bytes),
                     trims_applied: Some(loaded.counters.trims_applied.load(Ordering::Relaxed)),
                     gpu_allocated_bytes: loaded.metal.as_ref().map(|m| m.allocated_bytes()),
+                    retained_workspace_bytes: loaded.metal.as_ref().map(|m| m.workspace_bytes()),
+                    prefill_batch: loaded.metal.as_ref().map(|m| m.prefill_batch()),
                     threads: Some(1), // scalar executor is single-threaded
                     kernel_impl: Some(loaded.kernels.as_str().to_string()),
                     numerical_profile: Some(loaded.profile.as_str().to_string()),

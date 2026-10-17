@@ -141,6 +141,7 @@ pub fn run_standard_bench(
     let mut all_gap_p95: Vec<f64> = Vec::new();
     let mut footprint_peak: u64 = 0;
     let mut resolved_identity: Option<tuckmill_manifest::records::EngineIdentity> = None;
+    let mut resolved_batch: Option<u32> = None;
 
     for rep in 0..options.repetitions.max(1) {
         let prompt_id = format!(
@@ -249,6 +250,9 @@ pub fn run_standard_bench(
         }
         if let Some(id) = run.identity.get() {
             resolved_identity = Some(id.clone());
+        }
+        if let Some(batch) = runtime.backend_stats().and_then(|s| s.prefill_batch) {
+            resolved_batch = Some(batch);
         }
         let total_ms = t0.elapsed().as_secs_f64() * 1000.0;
         let final_stats = runtime.backend_stats();
@@ -407,7 +411,10 @@ pub fn run_standard_bench(
         //    visible_chunks. Values from v3-and-earlier records counted
         //    streamed chunks, which match the v4 figures on plain ASCII
         //    output but not with buffering, Unicode assembly, or stops.
-        schema_version: 4,
+        //    5: prefill_batch_requested / prefill_batch_effective recorded
+        //    separately (requested is the option; effective is what the
+        //    worker acknowledged after plan-bounded batch selection).
+        schema_version: 5,
         run_id: Id::new("0".repeat(64)).expect("zero id"),
         started_unix_ms: started,
         device_id: plan.device_id.clone(),
@@ -420,6 +427,8 @@ pub fn run_standard_bench(
         summary: summary.clone(),
         performance_class,
         confidence: Confidence::Estimated,
+        prefill_batch_requested: runtime.execution_options().prefill_batch,
+        prefill_batch_effective: resolved_batch,
         slow_mode_accepted: false,
         caveats,
     };

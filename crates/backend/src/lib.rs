@@ -424,6 +424,16 @@ pub struct BackendStats {
     /// allocations match the admitted plan.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gpu_allocated_bytes: Option<u64>,
+    /// Persistent GPU workspace bytes prepared at load (batched prefill
+    /// buffers). Reuse of a warm worker must re-check this against the
+    /// current plan's workspaces reservation, exactly like retained weight
+    /// bytes; absent when the engine retains no GPU workspaces.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retained_workspace_bytes: Option<u64>,
+    /// Effective Metal prefill micro-batch prepared at load. Recorded so
+    /// benchmarks can report requested versus effective batching.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prefill_batch: Option<u32>,
     /// Thread count in use for compute, when the backend is threaded.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub threads: Option<u32>,

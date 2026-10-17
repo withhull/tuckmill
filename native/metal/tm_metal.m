@@ -158,17 +158,20 @@ static int tm_wait_pending(tm_metal_ctx *ctx, char *err, size_t cap) {
     /* waitUntilCompleted signals execution completion; addCompletedHandler
      * blocks are scheduled separately and may still be pending. Settlement
      * of the counter/lease accounting is part of the fence contract (the
-     * in-flight byte figure must drop to zero when the fence returns), so
-     * wait briefly for the handlers to run. Bounded: execution is already
-     * complete, so this only covers scheduling latency. */
-    for (int spin = 0; spin < 2000; ++spin) {
-        if (atomic_load_explicit(&ctx->completed, memory_order_relaxed) ==
+     * in-flight byte figure must be zero when the fence returns), so wait
+     * for the handlers to run. Execution is already complete, so the wait
+     * only covers scheduling latency (2 s budget). If it still does not
+     * settle, report a typed failure: claiming success here would weaken
+     * the acknowledged-fence invariant. */
+    for (int spin = 0; spin < 40000; ++spin) {
+        if (atomic_load_explicit(&ctx->completed, memory_order_relaxed) >=
             atomic_load_explicit(&ctx->committed, memory_order_relaxed)) {
             return TM_METAL_OK;
         }
         usleep(50);
     }
-    return TM_METAL_OK; /* accounting may settle late; never an execution error */
+    return tm_fail(err, cap, TM_METAL_ERR_INTERNAL,
+                   @"fence: command buffers completed but completion-handler accounting did not settle");
 }
 
 int tm_metal_available(void) {

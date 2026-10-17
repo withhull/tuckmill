@@ -294,21 +294,29 @@ fn validate_request_against_plan(plan: &ExecutionPlan, request: &RunRequest) -> 
     Ok(())
 }
 
-/// Reuse-compatibility gate: the worker's retained weight allocation (as
-/// acknowledged at load) must fit the *current* plan's weights + I/O
-/// reservations. A worker prepared under a generous plan must not be
-/// silently inherited by a plan that did not reserve what the worker can
-/// retain. KV needs no such check: sessions are allocated per request for
-/// the request's own admitted need, which the request validation above
-/// bounds to the current plan.
-fn reuse_fits_retained(plan: &ExecutionPlan, retained_weight_bytes: u64) -> bool {
-    let allowance = plan
+/// Reuse-compatibility gate: every persistent allocation the worker
+/// acknowledged at load — retained weight bytes (including resident GPU
+/// weights) and retained GPU workspace bytes (batched prefill buffers) —
+/// must fit the *current* plan's matching reservations. A worker prepared
+/// under a generous plan must not be silently inherited by a plan that did
+/// not reserve what the worker still holds; declining reuse reloads under
+/// the new plan, where the batch geometry is re-preflighted (a smaller
+/// reservation yields a smaller prepared batch, or a typed rejection). KV
+/// needs no such check: sessions are allocated per request for the request's
+/// own admitted need, bounded to the current plan by the request validation.
+fn reuse_fits_retained(
+    plan: &ExecutionPlan,
+    retained_weight_bytes: u64,
+    retained_workspace_bytes: u64,
+) -> bool {
+    let weight_allowance = plan
         .budget
         .reservation_breakdown
         .weights
         .bytes()
         .saturating_add(plan.budget.reservation_breakdown.io_buffers.bytes());
-    retained_weight_bytes <= allowance
+    let workspace_allowance = plan.budget.reservation_breakdown.workspaces.bytes();
+    retained_weight_bytes <= weight_allowance && retained_workspace_bytes <= workspace_allowance
 }
 
 /// Resolved identity of a loaded worker (caller holds the worker lock or is
@@ -336,6 +344,10 @@ struct WorkerSlot {
     /// additionally requires it to fit the current plan's weights + I/O
     /// reservations: model identity alone is not resource admission.
     retained_weight_bytes: u64,
+    /// Persistent GPU workspace bytes prepared at load (batched prefill
+    /// buffers). Reuse requires them to fit the current plan's workspaces
+    /// reservation as well.
+    retained_workspace_bytes: u64,
 }
 
 /// Stable identity of a loaded model in a worker (B4). Built from immutable
@@ -685,6 +697,12 @@ impl Runtime {
         (pid != 0).then_some(pid)
     }
 
+    /// Snapshot of the fixed execution options this runtime was opened with
+    /// (records report requested-versus-effective settings from it).
+    pub fn execution_options(&self) -> crate::options::ExecutionOptions {
+        self.execution.clone()
+    }
+
     /// Number of worker spawns (model loads) this runtime has performed.
     /// Equivalent consecutive requests must not increase it (B4).
     pub fn worker_generation(&self) -> u64 {
@@ -965,7 +983,11 @@ impl Runtime {
                 let need_spawn = match slot.as_ref() {
                     Some(w) => {
                         let identity_ok = w.key.satisfies(&requested);
-                        let retention_ok = reuse_fits_retained(plan, w.retained_weight_bytes);
+                        let retention_ok = reuse_fits_retained(
+                            plan,
+                            w.retained_weight_bytes,
+                            w.retained_workspace_bytes,
+                        );
                         if identity_ok && !retention_ok {
                             self.logger.warn(
                                 "REUSE_DECLINED_RETENTION",
@@ -975,7 +997,11 @@ impl Runtime {
                                         serde_json::json!(w.retained_weight_bytes),
                                     ),
                                     (
-                                        "plan_allowance_bytes".to_string(),
+                                        "retained_workspace_bytes".to_string(),
+                                        serde_json::json!(w.retained_workspace_bytes),
+                                    ),
+                                    (
+                                        "plan_weights_allowance_bytes".to_string(),
                                         serde_json::json!(plan
                                             .budget
                                             .reservation_breakdown
@@ -987,6 +1013,14 @@ impl Runtime {
                                                     .io_buffers
                                                     .bytes()
                                             )),
+                                    ),
+                                    (
+                                        "plan_workspaces_reservation_bytes".to_string(),
+                                        serde_json::json!(plan
+                                            .budget
+                                            .reservation_breakdown
+                                            .workspaces
+                                            .bytes()),
                                     ),
                                 ]
                                 .into_iter()
@@ -1029,6 +1063,10 @@ impl Runtime {
                     let retained_weight = ack_stats
                         .as_ref()
                         .and_then(|s| s.retained_weight_bytes)
+                        .unwrap_or(0);
+                    let retained_workspace = ack_stats
+                        .as_ref()
+                        .and_then(|s| s.retained_workspace_bytes)
                         .unwrap_or(0);
                     let kv_reserved = plan.budget.reservation_breakdown.kv_state.bytes();
                     if kv_prepared > kv_reserved {
@@ -1079,6 +1117,7 @@ impl Runtime {
                     *slot = Some(WorkerSlot {
                         key: requested,
                         retained_weight_bytes: retained_weight,
+                        retained_workspace_bytes: retained_workspace,
                         worker,
                     });
                 } else {
@@ -1919,12 +1958,24 @@ mod tests {
     fn reuse_gate_requires_retained_allocations_to_fit_the_current_plan() {
         let device = Id::new("d".repeat(64)).unwrap();
         let plan = boundary_plan(&device, 2048, 64, "1GiB", 1 << 20, 0, 1 << 20);
-        let allowance = (1u64 << 20) + (1u64 << 20);
-        assert!(reuse_fits_retained(&plan, 0));
-        assert!(reuse_fits_retained(&plan, allowance));
+        let weight_allowance = (1u64 << 20) + (1u64 << 20);
+        // boundary_plan reserves no workspaces, so its workspace allowance
+        // is zero and any nonzero retained workspace must decline.
+        let workspace_allowance = plan.budget.reservation_breakdown.workspaces.bytes();
+        assert_eq!(workspace_allowance, 0);
+        assert!(reuse_fits_retained(&plan, 0, 0));
+        assert!(reuse_fits_retained(
+            &plan,
+            weight_allowance,
+            workspace_allowance
+        ));
         assert!(
-            !reuse_fits_retained(&plan, allowance + 1),
-            "retained allocations beyond the plan's weights + I/O reservations must decline reuse"
+            !reuse_fits_retained(&plan, weight_allowance + 1, 0),
+            "retained weights beyond the plan's weights + I/O reservations must decline reuse"
+        );
+        assert!(
+            !reuse_fits_retained(&plan, 0, workspace_allowance + 1),
+            "retained GPU workspaces beyond the plan's workspaces reservation must decline reuse"
         );
     }
 
@@ -2096,6 +2147,151 @@ mod tests {
             runtime.worker_generation(),
             3,
             "a covering plan reloads once and runs"
+        );
+        runtime.shutdown();
+    }
+
+    /// Finding A regression: warm reuse must revalidate the worker's
+    /// retained GPU workspace (batch-dependent since C3), not just its
+    /// weights. A smaller plan declines reuse; the reload re-preflights the
+    /// batch geometry and prepares a smaller workspace that fits. Actual
+    /// allocations are asserted for both the initial and the reused load.
+    #[test]
+    fn warm_reuse_revalidates_retained_gpu_workspace() {
+        let Some(worker_exe) = crate::test_worker_bin() else {
+            return;
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let layout = StoreLayout::open(dir.path().join("store"));
+        let src = dir.path().join("m.gguf");
+        write_synthetic(&src, &SyntheticConfig::tiny_qwen3()).unwrap();
+        let registry = tuckmill_manifest::adapter::AdapterRegistry::builtin().unwrap();
+        tuckmill_store::import::import_local(
+            &layout,
+            &registry,
+            &src,
+            &tuckmill_store::import::ImportOptions {
+                alias: Some("local".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let execution = crate::options::ExecutionOptions {
+            kernels: Some(tuckmill_tuckcore::KernelSelection::Metal),
+            ..Default::default()
+        };
+        let runtime = Runtime::open(RuntimeOptions {
+            data_dir: Some(layout.root().to_path_buf()),
+            engine_mode: EngineMode::Isolated,
+            engine_kind: EngineKind::TuckCore,
+            worker_exe: Some(worker_exe),
+            queue_capacity: 4,
+            execution,
+            default_budget: Some(Bytes::parse("2GiB").unwrap()),
+            default_context: 512,
+            default_max_output: 32,
+            policy: PlannerPolicy::default(),
+            governor_poll: Duration::from_millis(200),
+            monitor: true,
+            ..Default::default()
+        })
+        .unwrap();
+
+        // Fixture geometry: exact preflight for the batch candidates.
+        let payload =
+            layout.artifact_payload_path(&runtime.resolve_artifact("local").unwrap().0.artifact_id);
+        let insp =
+            tuckmill_manifest::gguf::inspect(&payload, &tuckmill_manifest::gguf::Limits::default())
+                .unwrap();
+        let reg = tuckmill_manifest::adapter::AdapterRegistry::builtin().unwrap();
+        let (cfg, _) = tuckmill_tuckcore::model::resolve(&insp, &reg).unwrap();
+        let required = |batch: u32| {
+            tuckmill_tuckcore::gpu::MetalForward::required_bytes(&insp, &cfg, 512, batch).unwrap()
+        };
+        let (weights_req, ws1) = required(1);
+        let (_, ws8) = required(8);
+        assert!(ws8 > ws1);
+        let kv_req = tuckmill_tuckcore::forward::KvState::bytes_for(&cfg, 512);
+
+        let device = runtime.device.device_id.clone();
+        let plan_with = |ws_reservation: u64| {
+            let mut p = boundary_plan(
+                &device,
+                512,
+                32,
+                "2GiB",
+                weights_req + (1 << 20),
+                0,
+                1 << 20,
+            );
+            p.budget.add_reservation(
+                tuckmill_manifest::records::ReserveClass::KvState,
+                Bytes(kv_req + (1 << 20)),
+            );
+            p.budget.add_reservation(
+                tuckmill_manifest::records::ReserveClass::Workspaces,
+                Bytes(ws_reservation),
+            );
+            p.budget.reservation = p.budget.reservation_breakdown.total();
+            p.plan_id = p.compute_id().unwrap();
+            p
+        };
+
+        // Initial load: generous workspaces allowance -> batch 8 prepared.
+        let plan_a = plan_with(64 * 1024 * 1024);
+        runtime.plan_admitted(&plan_a).unwrap();
+        runtime.admit_engine(&plan_a).unwrap();
+        let ticket = runtime.submit().unwrap();
+        let run = runtime
+            .start_run(
+                &ticket,
+                plan_a,
+                artifact_ref_for(&runtime),
+                RunRequest::greedy(vec![1, 2, 3, 4], 16),
+            )
+            .unwrap();
+        let (reason, committed) = collect_run(&run, |_, _| {});
+        assert_eq!(reason, FinishReason::Length);
+        assert_eq!(committed, 16);
+        assert_eq!(runtime.worker_generation(), 1);
+        let stats_a = runtime.backend_stats().expect("stats");
+        assert_eq!(stats_a.prefill_batch, Some(8));
+        assert_eq!(stats_a.retained_workspace_bytes, Some(ws8));
+
+        // Smaller plan whose workspaces reservation covers batch 4 but not
+        // the retained batch-8 workspace: reuse must decline and the reload
+        // must prepare the smaller batch within the new reservation.
+        let ws_b = ws1 + (ws8 - ws1) / 2;
+        let plan_b = plan_with(ws_b);
+        runtime.plan_admitted(&plan_b).unwrap();
+        runtime.admit_engine(&plan_b).unwrap();
+        let ticket = runtime.submit().unwrap();
+        let run = runtime
+            .start_run(
+                &ticket,
+                plan_b,
+                artifact_ref_for(&runtime),
+                RunRequest::greedy(vec![1, 2, 3, 4], 32),
+            )
+            .unwrap();
+        let (reason, committed) = collect_run(&run, |_, _| {});
+        assert_eq!(reason, FinishReason::Length);
+        assert_eq!(committed, 32);
+        assert_eq!(runtime.worker_generation(), 2, "declined reuse reloads");
+        let stats_b = runtime.backend_stats().expect("stats");
+        let (_, ws_eff) = required(stats_b.prefill_batch.expect("batch"));
+        assert!(
+            stats_b.prefill_batch.unwrap() < 8,
+            "the reload re-preflights a smaller batch"
+        );
+        assert_eq!(
+            stats_b.retained_workspace_bytes,
+            Some(ws_eff),
+            "the reused load's actual workspace equals its preflight"
+        );
+        assert!(
+            ws_eff <= ws_b,
+            "the prepared workspace fits the smaller plan's reservation"
         );
         runtime.shutdown();
     }

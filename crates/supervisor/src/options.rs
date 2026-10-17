@@ -64,6 +64,18 @@ impl ExecutionOptions {
                     ));
                 }
                 if let Some(b) = self.prefill_batch {
+                    // Batched prefill is a Metal capability: the CPU kernel
+                    // paths execute single-token steps and never silently
+                    // ignore a requested batching.
+                    if !matches!(self.kernels, Some(KernelSelection::Metal)) {
+                        return Err(TuckmillError::new(
+                            ErrorCode::InvalidRequest,
+                            "--prefill-batch requires --kernels metal; CPU kernel selections execute single-token steps and do not implement batching",
+                        )
+                        .with_action(
+                            "Select --kernels metal, or drop --prefill-batch.",
+                        ));
+                    }
                     if !(1..=32).contains(&b) {
                         return Err(TuckmillError::new(
                             ErrorCode::InvalidRequest,
@@ -308,4 +320,36 @@ pub struct AcknowledgedExecution {
     pub numerical_profile: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub kv_precision: Option<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn prefill_batch_requires_metal_kernels() {
+        let mut o = ExecutionOptions {
+            prefill_batch: Some(4),
+            ..Default::default()
+        };
+        assert!(
+            o.validate(EngineKind::TuckCore).is_err(),
+            "batching without a kernel selection must be refused, never ignored"
+        );
+        o.kernels = Some(KernelSelection::Neon);
+        assert!(
+            o.validate(EngineKind::TuckCore).is_err(),
+            "NEON executes single-token steps; batching must not be accepted"
+        );
+        o.kernels = Some(KernelSelection::Metal);
+        assert!(o.validate(EngineKind::TuckCore).is_ok());
+        o.prefill_batch = Some(64);
+        assert!(o.validate(EngineKind::TuckCore).is_err(), "range is 1..=32");
+
+        let llama = ExecutionOptions {
+            prefill_batch: Some(4),
+            ..Default::default()
+        };
+        assert!(llama.validate(EngineKind::LlamaCpp).is_err());
+    }
 }

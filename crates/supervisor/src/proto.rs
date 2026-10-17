@@ -27,6 +27,9 @@ pub const MAX_FRAME_BYTES: u32 = 1024 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "t")]
+// Frames are decoded one at a time at the socket boundary; boxing a large
+// variant would ripple through every match arm for no measured benefit.
+#[allow(clippy::large_enum_variant)]
 pub enum WorkerFrame {
     Hello {
         protocol: u16,
@@ -348,6 +351,8 @@ mod tests {
                     retained_weight_bytes: Some(1 << 22),
                     trims_applied: Some(3),
                     gpu_allocated_bytes: Some(1 << 24),
+                    retained_workspace_bytes: Some(1 << 18),
+                    prefill_batch: Some(8),
                     threads: Some(4),
                     kernel_impl: Some("neon".into()),
                     numerical_profile: Some("oracle-f32".into()),
