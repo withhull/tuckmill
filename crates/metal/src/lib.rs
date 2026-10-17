@@ -310,6 +310,79 @@ mod imp {
             err: *mut c_char,
             err_cap: usize,
         ) -> c_int;
+        pub fn tm_metal_qwen35_conv_step(
+            ctx: *mut TmMetalCtx,
+            hist: *mut TmMetalBuffer,
+            x: *mut TmMetalBuffer,
+            w: *mut TmMetalBuffer,
+            y: *mut TmMetalBuffer,
+            channels: u32,
+            kernel: u32,
+            err: *mut c_char,
+            err_cap: usize,
+        ) -> c_int;
+        pub fn tm_metal_qwen35_conv_shift(
+            ctx: *mut TmMetalCtx,
+            hist: *mut TmMetalBuffer,
+            x: *mut TmMetalBuffer,
+            channels: u32,
+            kernel: u32,
+            err: *mut c_char,
+            err_cap: usize,
+        ) -> c_int;
+        pub fn tm_metal_qwen35_l2norm_heads(
+            ctx: *mut TmMetalCtx,
+            x: *mut TmMetalBuffer,
+            y: *mut TmMetalBuffer,
+            rows: u32,
+            cols: u32,
+            eps: f32,
+            err: *mut c_char,
+            err_cap: usize,
+        ) -> c_int;
+        #[allow(clippy::too_many_arguments)]
+        pub fn tm_metal_qwen35_beta_decay(
+            ctx: *mut TmMetalCtx,
+            raw_beta: *mut TmMetalBuffer,
+            alpha: *mut TmMetalBuffer,
+            dt_bias: *mut TmMetalBuffer,
+            ssm_a: *mut TmMetalBuffer,
+            beta_out: *mut TmMetalBuffer,
+            gate_out: *mut TmMetalBuffer,
+            n: u32,
+            err: *mut c_char,
+            err_cap: usize,
+        ) -> c_int;
+        #[allow(clippy::too_many_arguments)]
+        pub fn tm_metal_qwen35_gdn_step(
+            ctx: *mut TmMetalCtx,
+            q: *mut TmMetalBuffer,
+            k: *mut TmMetalBuffer,
+            v: *mut TmMetalBuffer,
+            gate: *mut TmMetalBuffer,
+            beta: *mut TmMetalBuffer,
+            state: *mut TmMetalBuffer,
+            out: *mut TmMetalBuffer,
+            heads: u32,
+            k_dim: u32,
+            v_dim: u32,
+            q_scale: f32,
+            err: *mut c_char,
+            err_cap: usize,
+        ) -> c_int;
+        #[allow(clippy::too_many_arguments)]
+        pub fn tm_metal_qwen35_gated_norm(
+            ctx: *mut TmMetalCtx,
+            o: *mut TmMetalBuffer,
+            z: *mut TmMetalBuffer,
+            weight: *mut TmMetalBuffer,
+            out: *mut TmMetalBuffer,
+            rows: u32,
+            cols: u32,
+            eps: f32,
+            err: *mut c_char,
+            err_cap: usize,
+        ) -> c_int;
         pub fn tm_metal_committed_dispatches(ctx: *const TmMetalCtx) -> u64;
         pub fn tm_metal_completed_dispatches(ctx: *const TmMetalCtx) -> u64;
         pub fn tm_metal_last_gpu_ms(ctx: *const TmMetalCtx) -> f64;
@@ -702,6 +775,230 @@ impl MetalContext {
             let mut err = [0 as c_char; ERR_CAP];
             // SAFETY: caller holds the lock; ctx is valid.
             let code = unsafe { imp::tm_metal_abort_group(ctx, err.as_mut_ptr(), ERR_CAP) };
+            (code, err)
+        })
+    }
+
+    /// Q35-2A: one decode step of the depthwise causal convolution
+    /// (`hist` = previous kernel-1 rows channel-major; `w` in GGUF order,
+    /// taps fastest). Returns the convolution output row in `y`.
+    pub fn qwen35_conv_step(
+        &self,
+        hist: &MetalBuffer,
+        x: &MetalBuffer,
+        w: &MetalBuffer,
+        y: &MetalBuffer,
+        channels: u32,
+        kernel: u32,
+    ) -> Result<()> {
+        for buffer in [hist, x, w, y] {
+            self.check_buffer(buffer)?;
+        }
+        let (hc, xc, wc, yc) = (hist.raw, x.raw, w.raw, y.raw);
+        self.operate("qwen35_conv_step", move |ctx| {
+            let mut err = [0 as c_char; ERR_CAP];
+            // SAFETY: raw handles were validated against this context.
+            let code = unsafe {
+                imp::tm_metal_qwen35_conv_step(
+                    ctx,
+                    hc,
+                    xc,
+                    wc,
+                    yc,
+                    channels,
+                    kernel,
+                    err.as_mut_ptr(),
+                    ERR_CAP,
+                )
+            };
+            (code, err)
+        })
+    }
+
+    /// Q35-2A: advance the convolution history (shift down, append `x`).
+    pub fn qwen35_conv_shift(
+        &self,
+        hist: &MetalBuffer,
+        x: &MetalBuffer,
+        channels: u32,
+        kernel: u32,
+    ) -> Result<()> {
+        for buffer in [hist, x] {
+            self.check_buffer(buffer)?;
+        }
+        let (hc, xc) = (hist.raw, x.raw);
+        self.operate("qwen35_conv_shift", move |ctx| {
+            let mut err = [0 as c_char; ERR_CAP];
+            // SAFETY: raw handles were validated against this context.
+            let code = unsafe {
+                imp::tm_metal_qwen35_conv_shift(
+                    ctx,
+                    hc,
+                    xc,
+                    channels,
+                    kernel,
+                    err.as_mut_ptr(),
+                    ERR_CAP,
+                )
+            };
+            (code, err)
+        })
+    }
+
+    /// Q35-2A: per-head L2 norm with the epsilon inside the root.
+    pub fn qwen35_l2norm_heads(
+        &self,
+        x: &MetalBuffer,
+        y: &MetalBuffer,
+        rows: u32,
+        cols: u32,
+        eps: f32,
+    ) -> Result<()> {
+        self.check_pair(x, y)?;
+        let (xc, yc) = (x.raw, y.raw);
+        self.operate("qwen35_l2norm_heads", move |ctx| {
+            let mut err = [0 as c_char; ERR_CAP];
+            // SAFETY: raw handles were validated against this context.
+            let code = unsafe {
+                imp::tm_metal_qwen35_l2norm_heads(
+                    ctx,
+                    xc,
+                    yc,
+                    rows,
+                    cols,
+                    eps,
+                    err.as_mut_ptr(),
+                    ERR_CAP,
+                )
+            };
+            (code, err)
+        })
+    }
+
+    /// Q35-2A: per-head sigmoid beta and `ssm_a * softplus(alpha + dt)`.
+    #[allow(clippy::too_many_arguments)] // mirrors the C ABI arity
+    pub fn qwen35_beta_decay(
+        &self,
+        raw_beta: &MetalBuffer,
+        alpha: &MetalBuffer,
+        dt_bias: &MetalBuffer,
+        ssm_a: &MetalBuffer,
+        beta_out: &MetalBuffer,
+        gate_out: &MetalBuffer,
+        n: u32,
+    ) -> Result<()> {
+        for buffer in [raw_beta, alpha, dt_bias, ssm_a, beta_out, gate_out] {
+            self.check_buffer(buffer)?;
+        }
+        let (bc, ac, dc, sc, boc, goc) = (
+            raw_beta.raw,
+            alpha.raw,
+            dt_bias.raw,
+            ssm_a.raw,
+            beta_out.raw,
+            gate_out.raw,
+        );
+        self.operate("qwen35_beta_decay", move |ctx| {
+            let mut err = [0 as c_char; ERR_CAP];
+            // SAFETY: raw handles were validated against this context.
+            let code = unsafe {
+                imp::tm_metal_qwen35_beta_decay(
+                    ctx,
+                    bc,
+                    ac,
+                    dc,
+                    sc,
+                    boc,
+                    goc,
+                    n,
+                    err.as_mut_ptr(),
+                    ERR_CAP,
+                )
+            };
+            (code, err)
+        })
+    }
+
+    /// Q35-2A: one token of the delta rule; `state` [heads, k_dim, v_dim]
+    /// f32 is updated in place.
+    #[allow(clippy::too_many_arguments)]
+    pub fn qwen35_gdn_step(
+        &self,
+        q: &MetalBuffer,
+        k: &MetalBuffer,
+        v: &MetalBuffer,
+        gate: &MetalBuffer,
+        beta: &MetalBuffer,
+        state: &MetalBuffer,
+        out: &MetalBuffer,
+        heads: u32,
+        k_dim: u32,
+        v_dim: u32,
+        q_scale: f32,
+    ) -> Result<()> {
+        for buffer in [q, k, v, gate, beta, state, out] {
+            self.check_buffer(buffer)?;
+        }
+        let (qc, kc, vc, gc, bc, sc, oc) =
+            (q.raw, k.raw, v.raw, gate.raw, beta.raw, state.raw, out.raw);
+        self.operate("qwen35_gdn_step", move |ctx| {
+            let mut err = [0 as c_char; ERR_CAP];
+            // SAFETY: raw handles were validated against this context.
+            let code = unsafe {
+                imp::tm_metal_qwen35_gdn_step(
+                    ctx,
+                    qc,
+                    kc,
+                    vc,
+                    gc,
+                    bc,
+                    sc,
+                    oc,
+                    heads,
+                    k_dim,
+                    v_dim,
+                    q_scale,
+                    err.as_mut_ptr(),
+                    ERR_CAP,
+                )
+            };
+            (code, err)
+        })
+    }
+
+    /// Q35-2A: gated output normalization (RMS norm with weights x SiLU(z)).
+    #[allow(clippy::too_many_arguments)] // mirrors the C ABI arity
+    pub fn qwen35_gated_norm(
+        &self,
+        o: &MetalBuffer,
+        z: &MetalBuffer,
+        weight: &MetalBuffer,
+        out: &MetalBuffer,
+        rows: u32,
+        cols: u32,
+        eps: f32,
+    ) -> Result<()> {
+        for buffer in [o, z, weight, out] {
+            self.check_buffer(buffer)?;
+        }
+        let (oc, zc, wc, yc) = (o.raw, z.raw, weight.raw, out.raw);
+        self.operate("qwen35_gated_norm", move |ctx| {
+            let mut err = [0 as c_char; ERR_CAP];
+            // SAFETY: raw handles were validated against this context.
+            let code = unsafe {
+                imp::tm_metal_qwen35_gated_norm(
+                    ctx,
+                    oc,
+                    zc,
+                    wc,
+                    yc,
+                    rows,
+                    cols,
+                    eps,
+                    err.as_mut_ptr(),
+                    ERR_CAP,
+                )
+            };
             (code, err)
         })
     }
@@ -1263,6 +1560,10 @@ impl MetalContext {
     fn check_pair(&self, x: &MetalBuffer, y: &MetalBuffer) -> Result<()> {
         self.check_owned(x, "input")?;
         self.check_owned(y, "output")
+    }
+
+    fn check_buffer(&self, x: &MetalBuffer) -> Result<()> {
+        self.check_owned(x, "buffer")
     }
 }
 

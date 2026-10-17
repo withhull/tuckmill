@@ -39,6 +39,12 @@ struct tm_metal_ctx {
     id<MTLComputePipelineState> pso_rope_batch;
     id<MTLComputePipelineState> pso_kvstore_batch;
     id<MTLComputePipelineState> pso_attention_batch;
+    id<MTLComputePipelineState> pso_q35_conv;
+    id<MTLComputePipelineState> pso_q35_conv_shift;
+    id<MTLComputePipelineState> pso_q35_l2norm;
+    id<MTLComputePipelineState> pso_q35_beta_decay;
+    id<MTLComputePipelineState> pso_q35_gdn_step;
+    id<MTLComputePipelineState> pso_q35_gated_norm;
     /* Last committed command buffer (retained); the queue executes in
      * order, so waiting on it fences everything committed before it. */
     id<MTLCommandBuffer> pending;
@@ -268,6 +274,12 @@ tm_metal_ctx *tm_metal_create(const char *msl_source, char *err, size_t err_cap)
         ctx->pso_rope_batch = tm_pipeline(ctx, @"tm_rope_batch_f32", &error);
         ctx->pso_kvstore_batch = tm_pipeline(ctx, @"tm_kv_store_batch_f32", &error);
         ctx->pso_attention_batch = tm_pipeline(ctx, @"tm_attention_batch_f32", &error);
+        ctx->pso_q35_conv = tm_pipeline(ctx, @"tm_qwen35_conv_step", &error);
+        ctx->pso_q35_conv_shift = tm_pipeline(ctx, @"tm_qwen35_conv_shift", &error);
+        ctx->pso_q35_l2norm = tm_pipeline(ctx, @"tm_qwen35_l2norm_heads", &error);
+        ctx->pso_q35_beta_decay = tm_pipeline(ctx, @"tm_qwen35_beta_decay", &error);
+        ctx->pso_q35_gdn_step = tm_pipeline(ctx, @"tm_qwen35_gdn_step", &error);
+        ctx->pso_q35_gated_norm = tm_pipeline(ctx, @"tm_qwen35_gated_norm", &error);
         if (ctx->pso_scale == nil || ctx->pso_axpy == nil || ctx->pso_f16f32 == nil ||
             ctx->pso_f32f16 == nil || ctx->pso_q8gemv == nil || ctx->pso_f16gemv == nil ||
             ctx->pso_q8row == nil || ctx->pso_rmsnorm == nil || ctx->pso_rope == nil ||
@@ -275,7 +287,10 @@ tm_metal_ctx *tm_metal_create(const char *msl_source, char *err, size_t err_cap)
             ctx->pso_f16row == nil || ctx->pso_rmsnorm_f16w == nil ||
             ctx->pso_q8gemm == nil || ctx->pso_f16gemm == nil ||
             ctx->pso_rope_batch == nil || ctx->pso_kvstore_batch == nil ||
-            ctx->pso_attention_batch == nil) {
+            ctx->pso_attention_batch == nil ||
+            ctx->pso_q35_conv == nil || ctx->pso_q35_conv_shift == nil ||
+            ctx->pso_q35_l2norm == nil || ctx->pso_q35_beta_decay == nil ||
+            ctx->pso_q35_gdn_step == nil || ctx->pso_q35_gated_norm == nil) {
             tm_set_err(err, err_cap,
                        [NSString stringWithFormat:@"pipeline creation failed: %@",
                                                   error != nil ? [error localizedDescription] : @"unknown"]);
@@ -1267,4 +1282,260 @@ uint64_t tm_metal_allocated_bytes(const tm_metal_ctx *ctx) {
 
 uint64_t tm_metal_in_flight_bytes(const tm_metal_ctx *ctx) {
     return ctx == NULL ? 0 : atomic_load_explicit(&ctx->leased, memory_order_relaxed);
+}
+
+/* ---------------- Q35-2A: Gated DeltaNet operator dispatches ---------------- */
+
+int tm_metal_qwen35_conv_step(tm_metal_ctx *ctx, tm_metal_buffer *hist, tm_metal_buffer *x,
+                              tm_metal_buffer *w, tm_metal_buffer *y, uint32_t channels,
+                              uint32_t kernel, char *err, size_t err_cap) {
+    if (tm_check_ctx(ctx, err, err_cap, "qwen35_conv") != TM_METAL_OK) {
+        return TM_METAL_ERR_UNSUPPORTED;
+    }
+    if (channels == 0 || kernel == 0) {
+        return tm_fail(err, err_cap, TM_METAL_ERR_BOUNDS, @"qwen35_conv: zero geometry");
+    }
+    if (tm_check_buffer(ctx, hist, (size_t)(kernel - 1) * channels * 4u, err, err_cap,
+                        "qwen35_conv.hist") != TM_METAL_OK ||
+        tm_check_buffer(ctx, x, (size_t)channels * 4u, err, err_cap, "qwen35_conv.x") != TM_METAL_OK ||
+        tm_check_buffer(ctx, w, (size_t)kernel * channels * 4u, err, err_cap,
+                        "qwen35_conv.w") != TM_METAL_OK ||
+        tm_check_buffer(ctx, y, (size_t)channels * 4u, err, err_cap, "qwen35_conv.y") != TM_METAL_OK) {
+        return TM_METAL_ERR_BOUNDS;
+    }
+    @autoreleasepool {
+        tm_frame f;
+        id<MTLComputeCommandEncoder> enc = tm_frame_open(ctx, &f);
+        if (enc == nil) {
+            return tm_fail(err, err_cap, TM_METAL_ERR_INTERNAL, @"qwen35_conv: no encoder");
+        }
+        [enc setComputePipelineState:ctx->pso_q35_conv];
+        [enc setBuffer:hist->buffer offset:0 atIndex:0];
+        [enc setBuffer:x->buffer offset:0 atIndex:1];
+        [enc setBuffer:w->buffer offset:0 atIndex:2];
+        [enc setBuffer:y->buffer offset:0 atIndex:3];
+        [f.keep addObject:hist->buffer];
+        [f.keep addObject:x->buffer];
+        [f.keep addObject:w->buffer];
+        [f.keep addObject:y->buffer];
+        [enc setBytes:&channels length:sizeof(channels) atIndex:4];
+        [enc setBytes:&kernel length:sizeof(kernel) atIndex:5];
+        NSUInteger width = ctx->pso_q35_conv.threadExecutionWidth;
+        NSUInteger tg = width > 0 ? width * 8 : 256;
+        [enc dispatchThreads:MTLSizeMake((NSUInteger)channels, 1, 1)
+            threadsPerThreadgroup:MTLSizeMake(tg, 1, 1)];
+        return tm_frame_commit(ctx, &f, err, err_cap, "qwen35_conv");
+    }
+}
+
+int tm_metal_qwen35_conv_shift(tm_metal_ctx *ctx, tm_metal_buffer *hist, tm_metal_buffer *x,
+                               uint32_t channels, uint32_t kernel, char *err, size_t err_cap) {
+    if (tm_check_ctx(ctx, err, err_cap, "qwen35_conv_shift") != TM_METAL_OK) {
+        return TM_METAL_ERR_UNSUPPORTED;
+    }
+    if (channels == 0 || kernel == 0) {
+        return tm_fail(err, err_cap, TM_METAL_ERR_BOUNDS, @"qwen35_conv_shift: zero geometry");
+    }
+    if (tm_check_buffer(ctx, hist, (size_t)(kernel - 1) * channels * 4u, err, err_cap,
+                        "qwen35_conv_shift.hist") != TM_METAL_OK ||
+        tm_check_buffer(ctx, x, (size_t)channels * 4u, err, err_cap,
+                        "qwen35_conv_shift.x") != TM_METAL_OK) {
+        return TM_METAL_ERR_BOUNDS;
+    }
+    @autoreleasepool {
+        tm_frame f;
+        id<MTLComputeCommandEncoder> enc = tm_frame_open(ctx, &f);
+        if (enc == nil) {
+            return tm_fail(err, err_cap, TM_METAL_ERR_INTERNAL, @"qwen35_conv_shift: no encoder");
+        }
+        [enc setComputePipelineState:ctx->pso_q35_conv_shift];
+        [enc setBuffer:hist->buffer offset:0 atIndex:0];
+        [enc setBuffer:x->buffer offset:0 atIndex:1];
+        [f.keep addObject:hist->buffer];
+        [f.keep addObject:x->buffer];
+        [enc setBytes:&channels length:sizeof(channels) atIndex:2];
+        [enc setBytes:&kernel length:sizeof(kernel) atIndex:3];
+        NSUInteger width = ctx->pso_q35_conv_shift.threadExecutionWidth;
+        NSUInteger tg = width > 0 ? width * 8 : 256;
+        [enc dispatchThreads:MTLSizeMake((NSUInteger)channels, 1, 1)
+            threadsPerThreadgroup:MTLSizeMake(tg, 1, 1)];
+        return tm_frame_commit(ctx, &f, err, err_cap, "qwen35_conv_shift");
+    }
+}
+
+int tm_metal_qwen35_l2norm_heads(tm_metal_ctx *ctx, tm_metal_buffer *x, tm_metal_buffer *y,
+                                 uint32_t rows, uint32_t cols, float eps, char *err,
+                                 size_t err_cap) {
+    if (tm_check_ctx(ctx, err, err_cap, "qwen35_l2norm") != TM_METAL_OK) {
+        return TM_METAL_ERR_UNSUPPORTED;
+    }
+    if (rows == 0 || cols == 0) {
+        return tm_fail(err, err_cap, TM_METAL_ERR_BOUNDS, @"qwen35_l2norm: zero geometry");
+    }
+    if (tm_check_buffer(ctx, x, (size_t)rows * cols * 4u, err, err_cap, "qwen35_l2norm.x") != TM_METAL_OK ||
+        tm_check_buffer(ctx, y, (size_t)rows * cols * 4u, err, err_cap, "qwen35_l2norm.y") != TM_METAL_OK) {
+        return TM_METAL_ERR_BOUNDS;
+    }
+    @autoreleasepool {
+        tm_frame f;
+        id<MTLComputeCommandEncoder> enc = tm_frame_open(ctx, &f);
+        if (enc == nil) {
+            return tm_fail(err, err_cap, TM_METAL_ERR_INTERNAL, @"qwen35_l2norm: no encoder");
+        }
+        [enc setComputePipelineState:ctx->pso_q35_l2norm];
+        [enc setBuffer:x->buffer offset:0 atIndex:0];
+        [enc setBuffer:y->buffer offset:0 atIndex:1];
+        [f.keep addObject:x->buffer];
+        [f.keep addObject:y->buffer];
+        [enc setBytes:&cols length:sizeof(cols) atIndex:2];
+        [enc setBytes:&eps length:sizeof(eps) atIndex:3];
+        [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)rows, 1, 1)
+            threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+        return tm_frame_commit(ctx, &f, err, err_cap, "qwen35_l2norm");
+    }
+}
+
+int tm_metal_qwen35_beta_decay(tm_metal_ctx *ctx, tm_metal_buffer *raw_beta, tm_metal_buffer *alpha,
+                               tm_metal_buffer *dt_bias, tm_metal_buffer *ssm_a,
+                               tm_metal_buffer *beta_out, tm_metal_buffer *gate_out, uint32_t n,
+                               char *err, size_t err_cap) {
+    if (tm_check_ctx(ctx, err, err_cap, "qwen35_beta_decay") != TM_METAL_OK) {
+        return TM_METAL_ERR_UNSUPPORTED;
+    }
+    if (n == 0) {
+        return tm_fail(err, err_cap, TM_METAL_ERR_BOUNDS, @"qwen35_beta_decay: zero length");
+    }
+    size_t need = (size_t)n * 4u;
+    if (tm_check_buffer(ctx, raw_beta, need, err, err_cap, "qwen35_beta_decay.beta") != TM_METAL_OK ||
+        tm_check_buffer(ctx, alpha, need, err, err_cap, "qwen35_beta_decay.alpha") != TM_METAL_OK ||
+        tm_check_buffer(ctx, dt_bias, need, err, err_cap, "qwen35_beta_decay.dt") != TM_METAL_OK ||
+        tm_check_buffer(ctx, ssm_a, need, err, err_cap, "qwen35_beta_decay.a") != TM_METAL_OK ||
+        tm_check_buffer(ctx, beta_out, need, err, err_cap, "qwen35_beta_decay.beta_out") != TM_METAL_OK ||
+        tm_check_buffer(ctx, gate_out, need, err, err_cap, "qwen35_beta_decay.gate_out") != TM_METAL_OK) {
+        return TM_METAL_ERR_BOUNDS;
+    }
+    @autoreleasepool {
+        tm_frame f;
+        id<MTLComputeCommandEncoder> enc = tm_frame_open(ctx, &f);
+        if (enc == nil) {
+            return tm_fail(err, err_cap, TM_METAL_ERR_INTERNAL, @"qwen35_beta_decay: no encoder");
+        }
+        [enc setComputePipelineState:ctx->pso_q35_beta_decay];
+        [enc setBuffer:raw_beta->buffer offset:0 atIndex:0];
+        [enc setBuffer:alpha->buffer offset:0 atIndex:1];
+        [enc setBuffer:dt_bias->buffer offset:0 atIndex:2];
+        [enc setBuffer:ssm_a->buffer offset:0 atIndex:3];
+        [enc setBuffer:beta_out->buffer offset:0 atIndex:4];
+        [enc setBuffer:gate_out->buffer offset:0 atIndex:5];
+        [f.keep addObject:raw_beta->buffer];
+        [f.keep addObject:alpha->buffer];
+        [f.keep addObject:dt_bias->buffer];
+        [f.keep addObject:ssm_a->buffer];
+        [f.keep addObject:beta_out->buffer];
+        [f.keep addObject:gate_out->buffer];
+        [enc setBytes:&n length:sizeof(n) atIndex:6];
+        NSUInteger width = ctx->pso_q35_beta_decay.threadExecutionWidth;
+        NSUInteger tg = width > 0 ? width * 8 : 256;
+        [enc dispatchThreads:MTLSizeMake((NSUInteger)n, 1, 1)
+            threadsPerThreadgroup:MTLSizeMake(tg, 1, 1)];
+        return tm_frame_commit(ctx, &f, err, err_cap, "qwen35_beta_decay");
+    }
+}
+
+int tm_metal_qwen35_gdn_step(tm_metal_ctx *ctx, tm_metal_buffer *q, tm_metal_buffer *k,
+                             tm_metal_buffer *v, tm_metal_buffer *gate, tm_metal_buffer *beta,
+                             tm_metal_buffer *state, tm_metal_buffer *out, uint32_t heads,
+                             uint32_t k_dim, uint32_t v_dim, float q_scale, char *err,
+                             size_t err_cap) {
+    if (tm_check_ctx(ctx, err, err_cap, "qwen35_gdn_step") != TM_METAL_OK) {
+        return TM_METAL_ERR_UNSUPPORTED;
+    }
+    if (heads == 0 || k_dim == 0 || v_dim == 0) {
+        return tm_fail(err, err_cap, TM_METAL_ERR_BOUNDS, @"qwen35_gdn_step: zero geometry");
+    }
+    size_t qk = (size_t)heads * k_dim * 4u;
+    size_t vv = (size_t)heads * v_dim * 4u;
+    if (tm_check_buffer(ctx, q, qk, err, err_cap, "gdn_step.q") != TM_METAL_OK ||
+        tm_check_buffer(ctx, k, qk, err, err_cap, "gdn_step.k") != TM_METAL_OK ||
+        tm_check_buffer(ctx, v, vv, err, err_cap, "gdn_step.v") != TM_METAL_OK ||
+        tm_check_buffer(ctx, gate, (size_t)heads * 4u, err, err_cap, "gdn_step.gate") != TM_METAL_OK ||
+        tm_check_buffer(ctx, beta, (size_t)heads * 4u, err, err_cap, "gdn_step.beta") != TM_METAL_OK ||
+        tm_check_buffer(ctx, state, (size_t)heads * k_dim * v_dim * 4u, err, err_cap,
+                        "gdn_step.state") != TM_METAL_OK ||
+        tm_check_buffer(ctx, out, vv, err, err_cap, "gdn_step.out") != TM_METAL_OK) {
+        return TM_METAL_ERR_BOUNDS;
+    }
+    @autoreleasepool {
+        tm_frame f;
+        id<MTLComputeCommandEncoder> enc = tm_frame_open(ctx, &f);
+        if (enc == nil) {
+            return tm_fail(err, err_cap, TM_METAL_ERR_INTERNAL, @"gdn_step: no encoder");
+        }
+        [enc setComputePipelineState:ctx->pso_q35_gdn_step];
+        [enc setBuffer:q->buffer offset:0 atIndex:0];
+        [enc setBuffer:k->buffer offset:0 atIndex:1];
+        [enc setBuffer:v->buffer offset:0 atIndex:2];
+        [enc setBuffer:gate->buffer offset:0 atIndex:3];
+        [enc setBuffer:beta->buffer offset:0 atIndex:4];
+        [enc setBuffer:state->buffer offset:0 atIndex:5];
+        [enc setBuffer:out->buffer offset:0 atIndex:6];
+        [f.keep addObject:q->buffer];
+        [f.keep addObject:k->buffer];
+        [f.keep addObject:v->buffer];
+        [f.keep addObject:gate->buffer];
+        [f.keep addObject:beta->buffer];
+        [f.keep addObject:state->buffer];
+        [f.keep addObject:out->buffer];
+        uint32_t kd = k_dim;
+        uint32_t vd = v_dim;
+        [enc setBytes:&kd length:sizeof(kd) atIndex:7];
+        [enc setBytes:&vd length:sizeof(vd) atIndex:8];
+        [enc setBytes:&q_scale length:sizeof(q_scale) atIndex:9];
+        NSUInteger width = ctx->pso_q35_gdn_step.threadExecutionWidth;
+        NSUInteger tg = width > 0 ? width : 32;
+        [enc dispatchThreads:MTLSizeMake((NSUInteger)heads, 1, 1)
+            threadsPerThreadgroup:MTLSizeMake(tg, 1, 1)];
+        return tm_frame_commit(ctx, &f, err, err_cap, "qwen35_gdn_step");
+    }
+}
+
+int tm_metal_qwen35_gated_norm(tm_metal_ctx *ctx, tm_metal_buffer *o, tm_metal_buffer *z,
+                               tm_metal_buffer *weight, tm_metal_buffer *out, uint32_t rows,
+                               uint32_t cols, float eps, char *err, size_t err_cap) {
+    if (tm_check_ctx(ctx, err, err_cap, "qwen35_gated_norm") != TM_METAL_OK) {
+        return TM_METAL_ERR_UNSUPPORTED;
+    }
+    if (rows == 0 || cols == 0) {
+        return tm_fail(err, err_cap, TM_METAL_ERR_BOUNDS, @"qwen35_gated_norm: zero geometry");
+    }
+    size_t need = (size_t)rows * cols * 4u;
+    if (tm_check_buffer(ctx, o, need, err, err_cap, "gated_norm.o") != TM_METAL_OK ||
+        tm_check_buffer(ctx, z, need, err, err_cap, "gated_norm.z") != TM_METAL_OK ||
+        tm_check_buffer(ctx, weight, (size_t)cols * 4u, err, err_cap, "gated_norm.w") != TM_METAL_OK ||
+        tm_check_buffer(ctx, out, need, err, err_cap, "gated_norm.out") != TM_METAL_OK) {
+        return TM_METAL_ERR_BOUNDS;
+    }
+    @autoreleasepool {
+        tm_frame f;
+        id<MTLComputeCommandEncoder> enc = tm_frame_open(ctx, &f);
+        if (enc == nil) {
+            return tm_fail(err, err_cap, TM_METAL_ERR_INTERNAL, @"gated_norm: no encoder");
+        }
+        [enc setComputePipelineState:ctx->pso_q35_gated_norm];
+        [enc setBuffer:o->buffer offset:0 atIndex:0];
+        [enc setBuffer:z->buffer offset:0 atIndex:1];
+        [enc setBuffer:weight->buffer offset:0 atIndex:2];
+        [enc setBuffer:out->buffer offset:0 atIndex:3];
+        [f.keep addObject:o->buffer];
+        [f.keep addObject:z->buffer];
+        [f.keep addObject:weight->buffer];
+        [f.keep addObject:out->buffer];
+        [enc setBytes:&cols length:sizeof(cols) atIndex:4];
+        [enc setBytes:&eps length:sizeof(eps) atIndex:5];
+        NSUInteger width = ctx->pso_q35_gated_norm.threadExecutionWidth;
+        NSUInteger tg = width > 0 ? width : 32;
+        [enc dispatchThreads:MTLSizeMake((NSUInteger)rows, 1, 1)
+            threadsPerThreadgroup:MTLSizeMake(tg, 1, 1)];
+        return tm_frame_commit(ctx, &f, err, err_cap, "qwen35_gated_norm");
+    }
 }

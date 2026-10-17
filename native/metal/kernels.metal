@@ -626,3 +626,184 @@ kernel void tm_attention_batch_f32(device const float *q [[buffer(0)]],
         oh[d] = accv;
     }
 }
+
+/* ---------------- Q35-2A: Gated DeltaNet operators ---------------- */
+
+/*
+ * One decode step of the depthwise causal convolution. `hist` holds the
+ * previous (kernel - 1) rows of the QKV stream (channel-major, oldest
+ * first), `x` the new row, `w` the `ssm_conv1d` weights in GGUF memory
+ * order (channel-major, taps fastest: w[c * kernel + tap]). The window is
+ * hist followed by x, so the output row is the graph's `ggml_ssm_conv`
+ * result for this token. One thread per channel.
+ */
+kernel void tm_qwen35_conv_step(device const float *hist [[buffer(0)]],
+                                device const float *x [[buffer(1)]],
+                                device const float *w [[buffer(2)]],
+                                device float *y [[buffer(3)]],
+                                constant uint &channels [[buffer(4)]],
+                                constant uint &kern [[buffer(5)]],
+                                uint gid [[thread_position_in_grid]]) {
+    if (gid >= channels) {
+        return;
+    }
+    const uint k = kern;
+    float acc = 0.0f;
+    for (uint j = 0; j + 1u < k; ++j) {
+        acc += w[gid * k + j] * hist[j * channels + gid];
+    }
+    acc += w[gid * k + (k - 1u)] * x[gid];
+    y[gid] = acc;
+}
+
+/*
+ * Advance the convolution history after a conv_step: shift down by one
+ * row and append the new input row. Runs after tm_qwen35_conv_step inside
+ * the same group, so the next token sees exactly the last (kernel - 1)
+ * rows of the window.
+ */
+kernel void tm_qwen35_conv_shift(device float *hist [[buffer(0)]],
+                                 device const float *x [[buffer(1)]],
+                                 constant uint &channels [[buffer(2)]],
+                                 constant uint &kern [[buffer(3)]],
+                                 uint gid [[thread_position_in_grid]]) {
+    if (gid >= channels || kern < 2u) {
+        return;
+    }
+    for (uint j = 0; j + 2u < kern; ++j) {
+        hist[j * channels + gid] = hist[(j + 1u) * channels + gid];
+    }
+    hist[(kern - 2u) * channels + gid] = x[gid];
+}
+
+/*
+ * Per-head L2 normalization with the tolerance epsilon inside the root:
+ * x / sqrt(sum(x^2) + eps). One threadgroup of 128 threads per row
+ * (head); shared with the full-attention Q/K head norms.
+ */
+kernel void tm_qwen35_l2norm_heads(device const float *x [[buffer(0)]],
+                                   device float *y [[buffer(1)]],
+                                   constant uint &cols [[buffer(2)]],
+                                   constant float &eps [[buffer(3)]],
+                                   uint row [[threadgroup_position_in_grid]],
+                                   uint tid [[thread_position_in_threadgroup]],
+                                   uint lane [[thread_index_in_simdgroup]],
+                                   uint simd_group [[simdgroup_index_in_threadgroup]]) {
+    threadgroup float scratch[4];
+    const device float *xrow = x + (size_t)row * (size_t)cols;
+    device float *yrow = y + (size_t)row * (size_t)cols;
+    float acc = 0.0f;
+    for (uint i = tid; i < cols; i += 128u) {
+        acc += xrow[i] * xrow[i];
+    }
+    const float sumsq = tm_reduce_sum_128(acc, scratch, lane, simd_group);
+    const float inv = 1.0f / sqrt(sumsq + eps);
+    for (uint i = tid; i < cols; i += 128u) {
+        yrow[i] = xrow[i] * inv;
+    }
+}
+
+/*
+ * Per-head gate preparation: beta = sigmoid(raw_beta) and
+ * gate = ssm_a * softplus(alpha + dt_bias), with ggml's thresholded
+ * softplus (x > 20 ? x : log(1 + exp(x))). One thread per head.
+ */
+kernel void tm_qwen35_beta_decay(device const float *raw_beta [[buffer(0)]],
+                                 device const float *alpha [[buffer(1)]],
+                                 device const float *dt_bias [[buffer(2)]],
+                                 device const float *ssm_a [[buffer(3)]],
+                                 device float *beta_out [[buffer(4)]],
+                                 device float *gate_out [[buffer(5)]],
+                                 constant uint &n [[buffer(6)]],
+                                 uint gid [[thread_position_in_grid]]) {
+    if (gid >= n) {
+        return;
+    }
+    const float b = raw_beta[gid];
+    beta_out[gid] = 1.0f / (1.0f + exp(-b));
+    const float t = alpha[gid] + dt_bias[gid];
+    const float sp = t > 20.0f ? t : log(1.0f + exp(t));
+    gate_out[gid] = ssm_a[gid] * sp;
+}
+
+/*
+ * One token of the autoregressive delta rule, per value head, matching
+ * `build_delta_net_autoregressive` exactly in arithmetic order:
+ *   decay = exp(gate); s~ = s * decay; sk = s~^T k; d = beta (v - sk);
+ *   s = s~ + k d^T; o = s^T (q * scale).
+ * State layout: [head][i][j] with i over the key dim (contraction) and j
+ * over the value dim, i-major f32. One thread per head: the recurrence is
+ * sequential by construction, and per-head loops keep the CPU rule's
+ * order for deterministic comparisons.
+ */
+kernel void tm_qwen35_gdn_step(device const float *q [[buffer(0)]],
+                               device const float *k [[buffer(1)]],
+                               device const float *v [[buffer(2)]],
+                               device const float *gate [[buffer(3)]],
+                               device const float *beta [[buffer(4)]],
+                               device float *state [[buffer(5)]],
+                               device float *out [[buffer(6)]],
+                               constant uint &k_dim [[buffer(7)]],
+                               constant uint &v_dim [[buffer(8)]],
+                               constant float &q_scale [[buffer(9)]],
+                               uint head [[thread_position_in_grid]]) {
+    const uint sk = k_dim;
+    const uint sv = v_dim;
+    device float *s = state + (size_t)head * (size_t)sk * (size_t)sv;
+    const device float *kk = k + (size_t)head * (size_t)sk;
+    const device float *vv = v + (size_t)head * (size_t)sv;
+    const device float *qq = q + (size_t)head * (size_t)sk;
+    device float *o = out + (size_t)head * (size_t)sv;
+    const float decay = exp(gate[head]);
+    const float b = beta[head];
+
+    for (uint i = 0; i < sk; ++i) {
+        for (uint j = 0; j < sv; ++j) {
+            s[i * sv + j] *= decay;
+        }
+    }
+    for (uint j = 0; j < sv; ++j) {
+        float sk_acc = 0.0f;
+        for (uint i = 0; i < sk; ++i) {
+            sk_acc += s[i * sv + j] * kk[i];
+        }
+        const float d = b * (vv[j] - sk_acc);
+        for (uint i = 0; i < sk; ++i) {
+            s[i * sv + j] += kk[i] * d;
+        }
+    }
+    for (uint j = 0; j < sv; ++j) {
+        float acc = 0.0f;
+        for (uint i = 0; i < sk; ++i) {
+            acc += s[i * sv + j] * (qq[i] * q_scale);
+        }
+        o[j] = acc;
+    }
+}
+
+/*
+ * Gated output normalization: per value head, RMS norm over the head's
+ * value dim with the `ssm_norm` weights, times SiLU of the gate row.
+ * One thread per head, same order as the CPU operator.
+ */
+kernel void tm_qwen35_gated_norm(device const float *o [[buffer(0)]],
+                                 device const float *z [[buffer(1)]],
+                                 device const float *weight [[buffer(2)]],
+                                 device float *out [[buffer(3)]],
+                                 constant uint &cols [[buffer(4)]],
+                                 constant float &eps [[buffer(5)]],
+                                 uint head [[thread_position_in_grid]]) {
+    const device float *row = o + (size_t)head * (size_t)cols;
+    const device float *zrow = z + (size_t)head * (size_t)cols;
+    device float *orow = out + (size_t)head * (size_t)cols;
+    float acc = 0.0f;
+    for (uint i = 0; i < cols; ++i) {
+        acc += row[i] * row[i];
+    }
+    const float inv = 1.0f / sqrt(acc / (float)cols + eps);
+    for (uint i = 0; i < cols; ++i) {
+        const float zz = zrow[i];
+        const float silu = zz / (1.0f + exp(-zz));
+        orow[i] = row[i] * inv * weight[i] * silu;
+    }
+}

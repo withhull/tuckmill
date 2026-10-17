@@ -216,3 +216,21 @@ never accepted by any real artifact.
   KV width is now resolved by backend AND model family: dense TuckCore
   stays 4 B/element (f32 store), hybrid TuckCore prices the declared
   packed precision (2 default, 4 for f32), llama.cpp unchanged.
+
+## Addendum 8 (Q35-2A: Gated DeltaNet Metal operators)
+
+- Six isolated Metal kernels join the ABI and the kernel library:
+  causal convolution step plus history advance (GGUF channel-major
+  order preserved), per-head L2 norm, sigmoid-beta / softplus-decay
+  gates, the f32 delta-rule recurrence with device-resident state, and
+  the gated output normalization. Host dispatches follow the existing
+  frame/group discipline; the Rust wrapper set mirrors the CPU operator
+  signatures in `crates/tuckcore/src/qwen35_gpu.rs`.
+- The recurrence is one thread per head (correct-first): per-head
+  arithmetic order matches the scalar rule, and prefill batching waits
+  until decode and state transitions are qualified.
+- Registered tolerances (Metal vs scalar, fixture and pinned shapes,
+  3-6 token sequences with state compared every step): 1e-4 absolute /
+  2e-4 relative; observed conv 2.4e-7, L2 1.5e-8, gated norm 1.2e-7,
+  delta rule 1.2e-7 (fixture) and 2.4e-4 output / 9.2e-5 state (pinned
+  16x128). Device state stays f32.

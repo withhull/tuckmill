@@ -196,6 +196,49 @@ int tm_metal_q8_0_gemv(tm_metal_ctx *ctx, tm_metal_buffer *w, tm_metal_buffer *x
                        tm_metal_buffer *y, uint32_t rows, uint32_t cols,
                        char *err, size_t err_cap);
 
+/* ---------------- Q35-2A: Gated DeltaNet operators ---------------- */
+
+/* One decode step of the depthwise causal convolution: `hist` holds the
+ * previous (kernel - 1) rows (channel-major, oldest first), `x` the new
+ * row, `w` the ssm_conv1d weights in GGUF memory order (channel-major,
+ * taps fastest), `y` the output row. */
+int tm_metal_qwen35_conv_step(tm_metal_ctx *ctx, tm_metal_buffer *hist, tm_metal_buffer *x,
+                              tm_metal_buffer *w, tm_metal_buffer *y, uint32_t channels,
+                              uint32_t kernel, char *err, size_t err_cap);
+
+/* Advance the convolution history after tm_metal_qwen35_conv_step: shift
+ * down one row and append the new input row (same group). */
+int tm_metal_qwen35_conv_shift(tm_metal_ctx *ctx, tm_metal_buffer *hist, tm_metal_buffer *x,
+                               uint32_t channels, uint32_t kernel, char *err, size_t err_cap);
+
+/* Per-head L2 norm with the epsilon inside the root:
+ * y[r][i] = x[r][i] / sqrt(sum_i x^2 + eps). */
+int tm_metal_qwen35_l2norm_heads(tm_metal_ctx *ctx, tm_metal_buffer *x, tm_metal_buffer *y,
+                                 uint32_t rows, uint32_t cols, float eps, char *err,
+                                 size_t err_cap);
+
+/* Per-head gates: beta_out = sigmoid(raw_beta);
+ * gate_out = ssm_a * softplus(alpha + dt_bias) with ggml's thresholded
+ * softplus (x > 20 ? x : log(1 + e^x)). */
+int tm_metal_qwen35_beta_decay(tm_metal_ctx *ctx, tm_metal_buffer *raw_beta, tm_metal_buffer *alpha,
+                               tm_metal_buffer *dt_bias, tm_metal_buffer *ssm_a,
+                               tm_metal_buffer *beta_out, tm_metal_buffer *gate_out, uint32_t n,
+                               char *err, size_t err_cap);
+
+/* One token of the autoregressive delta rule for every value head; the
+ * f32 state buffer [heads, k_dim, v_dim] (i-major) is updated in place. */
+int tm_metal_qwen35_gdn_step(tm_metal_ctx *ctx, tm_metal_buffer *q, tm_metal_buffer *k,
+                             tm_metal_buffer *v, tm_metal_buffer *gate, tm_metal_buffer *beta,
+                             tm_metal_buffer *state, tm_metal_buffer *out, uint32_t heads,
+                             uint32_t k_dim, uint32_t v_dim, float q_scale, char *err,
+                             size_t err_cap);
+
+/* Gated output normalization: per row, RMS norm over `cols` with the
+ * ssm_norm weights, times SiLU of the z row. */
+int tm_metal_qwen35_gated_norm(tm_metal_ctx *ctx, tm_metal_buffer *o, tm_metal_buffer *z,
+                               tm_metal_buffer *weight, tm_metal_buffer *out, uint32_t rows,
+                               uint32_t cols, float eps, char *err, size_t err_cap);
+
 /* Block until every committed command buffer has completed. Safe to call
  * with no pending work. */
 int tm_metal_fence(tm_metal_ctx *ctx, char *err, size_t err_cap);
