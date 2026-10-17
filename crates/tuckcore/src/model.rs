@@ -132,6 +132,15 @@ pub fn resolve(
             "artifact declares no architecture",
         )
     })?;
+    if arch == "qwen35" {
+        return Err(TuckmillError::new(
+            ErrorCode::UnsupportedArchitecture,
+            "qwen35 is a hybrid Gated-DeltaNet + full-attention architecture; tuckcore does not implement its operators yet",
+        )
+        .with_action(
+            "The artifact contract (inspect/import/plan) is recognized; execution waits for the Q35-1 CPU oracle and Q35-2 Metal gates (ADR-008).",
+        ));
+    }
     if arch != "qwen3" {
         return Err(TuckmillError::new(
             ErrorCode::UnsupportedArchitecture,
@@ -280,5 +289,26 @@ mod tests {
         let err = resolve(&insp, &registry).unwrap_err();
         assert_eq!(err.code(), ErrorCode::UnsupportedArchitecture);
         assert!(err.message().contains("qwen3moe"));
+    }
+
+    /// qwen35 artifacts are recognized at the contract level but the
+    /// hybrid operators are unimplemented; the refusal names the gate.
+    #[test]
+    fn qwen35_artifacts_are_refused_with_the_gate_reference() {
+        let bytes = synthetic_qwen3_bytes(&SyntheticConfig::tiny_qwen35());
+        let mut cursor = std::io::Cursor::new(bytes.clone());
+        let insp = tuckmill_manifest::gguf::inspect_reader(
+            &mut cursor,
+            bytes.len() as u64,
+            &tuckmill_manifest::gguf::Limits::default(),
+            None,
+        )
+        .unwrap();
+        let registry = AdapterRegistry::builtin().unwrap();
+        let err = resolve(&insp, &registry).unwrap_err();
+        assert_eq!(err.code(), ErrorCode::UnsupportedArchitecture);
+        assert!(err.message().contains("hybrid"));
+        assert!(err.message().contains("does not implement its operators"));
+        assert!(err.action().contains("Q35-1 CPU oracle"));
     }
 }

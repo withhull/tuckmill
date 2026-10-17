@@ -963,6 +963,84 @@ fn llama_reference_comparison_when_available() {
     assert!(v["logits"]["vocab"].as_u64().unwrap() == 512);
 }
 
+/// Q35-0 real-artifact gate (machine-local): with TUCKMILL_QWEN35_GGUF
+/// pointing at the pinned ggml-org Qwen3.5-0.8B Q8_0 file, inspect,
+/// import and plan must work on the real hybrid contract and execution
+/// must stay refused for the precise reason. Machine-local by design:
+/// the artifact is ~834 MB and pinned by SHA-256 (ADR-008).
+#[test]
+fn qwen35_pinned_artifact_contract_when_available() {
+    let Some(gguf) = std::env::var("TUCKMILL_QWEN35_GGUF")
+        .ok()
+        .filter(|p| std::path::Path::new(p).exists())
+    else {
+        eprintln!("skipping: TUCKMILL_QWEN35_GGUF not set (pinned Qwen3.5-0.8B Q8_0)");
+        return;
+    };
+    let env = TestEnv::new();
+
+    let out = env.run_ok(&["inspect", &gguf, "--json"]);
+    let v: serde_json::Value = serde_json::from_str(&out).expect("inspect json");
+    assert_eq!(v["architecture"], "qwen35");
+    assert_eq!(v["tensor_stats"]["total_tensors"], 335);
+    assert_eq!(v["context_length"], 262144);
+
+    let out = env.run_ok(&["import", &gguf, "--alias", "q35", "--json"]);
+    let v: serde_json::Value = serde_json::from_str(&out).expect("import json");
+    // The raw file was verified against the published SHA-256 at fetch time
+    // (37ae482d336108d23516fa35e8e0c4126688d81018b87178a18d752a1357814f);
+    // the store identity below pins the exact bytes across runs.
+    assert_eq!(
+        v["artifact"]["file_bytes"].as_u64(),
+        Some(833_592_096),
+        "pinned artifact size"
+    );
+    assert_eq!(
+        v["artifact"]["content_hash"].as_str().unwrap(),
+        "c93ca9f8e1e31129d09df29eada023a126ce56a0ed13dc12996e235ca72d2984",
+        "store identity of the pinned bytes (ADR-008)"
+    );
+    assert_eq!(
+        v["warnings"].as_array().map(|a| a.len()),
+        Some(0),
+        "the adapter accepts the pinned contract: {v}"
+    );
+
+    // Plan works on the hybrid geometry: the pinned 0.8B fits resident
+    // with attention KV on 6 layers plus the constant recurrent state.
+    let out = env.run_ok(&["plan", "q35", "--json"]);
+    let v: serde_json::Value = serde_json::from_str(&out).expect("plan json");
+    assert_eq!(v["mode"], "resident", "0.8B Q8_0 with 2 GiB: {v}");
+    assert!(
+        v["reason"].as_str().unwrap().contains("state"),
+        "admission states the hybrid state reservation: {v}"
+    );
+
+    // Execution stays refused, and the refusal is precise at every layer.
+    // Without the pinned reference tokenizer the 'qwen35' pre-tokenizer
+    // contract stops it first; with it, the declared multimodal chat
+    // template is byte-exact-unrecognized and the bundle refuses to
+    // approximate a prompt format. The hybrid operators themselves are
+    // refused by the worker (unit-tested in tuckcore; Q35-1 gate).
+    let (code, _, stderr) = env.run(&[
+        "run",
+        "q35",
+        "--prompt",
+        "hi",
+        "--max-output",
+        "1",
+        "--engine",
+        "tuckcore",
+    ]);
+    assert_eq!(code, 1, "stderr: {stderr}");
+    if std::env::var("TUCKMILL_LLAMA_LIB").is_ok() {
+        assert!(stderr.contains("chat template"), "{stderr}");
+        assert!(stderr.contains("does not recognize"), "{stderr}");
+    } else {
+        assert!(stderr.contains("pre-tokenizer \"qwen35\""), "{stderr}");
+    }
+}
+
 #[test]
 fn worker_and_adapter_consistency() {
     // The fixture must resolve the builtin qwen3 adapter metadata fully; this

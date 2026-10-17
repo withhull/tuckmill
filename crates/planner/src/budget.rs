@@ -149,22 +149,30 @@ pub fn make_plan_budget(
     }
 }
 
-/// KV payload for an admitted context.
+/// KV payload for an admitted context: attention KV on the layers that
+/// carry it, plus the constant per-session recurrent state of hybrid
+/// stacks (context-independent, reserved once).
 pub fn kv_bytes_for(
     geometry: Option<&tuckmill_manifest::records::ModelGeometry>,
     context: &PlanContext,
     bytes_per_element: u32,
 ) -> Option<u64> {
     let g = geometry?;
+    let attention_layers = g.attention_layers.unwrap_or(g.layers);
     let kv_geometry = tuckmill_manifest::adapter::KvGeometry {
-        layers: g.layers,
+        layers: attention_layers,
+        attention_layers,
+        state_bytes: 0,
         head_count: g.head_count,
         kv_head_count: g.kv_head_count,
         head_dim: g.key_length,
         key_length: g.key_length,
         value_length: g.value_length,
     };
-    estimate_kv_bytes(&kv_geometry, context.total_context, bytes_per_element).map(|e| e.total_bytes)
+    let attention = estimate_kv_bytes(&kv_geometry, context.total_context, bytes_per_element)?;
+    attention
+        .total_bytes
+        .checked_add(g.state_bytes.unwrap_or(0))
 }
 
 #[cfg(test)]
@@ -255,5 +263,41 @@ mod tests {
     fn kv_bytes_missing_geometry_is_none() {
         let ctx = PlanContext::new(2048, 256);
         assert!(kv_bytes_for(None, &ctx, 2).is_none());
+    }
+
+    /// Hybrid geometry prices attention KV on the attention layers only and
+    /// reserves the constant recurrent state exactly once (ADR-008).
+    #[test]
+    fn hybrid_kv_prices_attention_layers_plus_state_once() {
+        use tuckmill_manifest::records::ModelGeometry;
+        let ctx = PlanContext::new(2048, 256);
+        let hybrid = ModelGeometry {
+            layers: 24,
+            head_count: 8,
+            kv_head_count: 2,
+            key_length: 256,
+            value_length: 256,
+            attention_layers: Some(6),
+            state_bytes: Some(20_201_472),
+            expert_count: None,
+            expert_used_per_token: None,
+        };
+        let attention = 6 * 2 * (256 + 256) * 2048 * 2;
+        assert_eq!(
+            kv_bytes_for(Some(&hybrid), &ctx, 2),
+            Some(attention + 20_201_472)
+        );
+
+        // A dense geometry without hybrid fields is unchanged: every layer
+        // carries KV and there is no constant state.
+        let dense = ModelGeometry {
+            attention_layers: None,
+            state_bytes: None,
+            ..hybrid.clone()
+        };
+        assert_eq!(
+            kv_bytes_for(Some(&dense), &ctx, 2),
+            Some(24 * 2 * (256 + 256) * 2048 * 2)
+        );
     }
 }

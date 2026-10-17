@@ -42,6 +42,8 @@ mod tests {
         // 80 layers, 8 KV heads, head dim 128, 16-bit, 8192 tokens = 2.5GiB.
         let kv = KvGeometry {
             layers: 80,
+            attention_layers: 80,
+            state_bytes: 0,
             head_count: 64,
             kv_head_count: 8,
             head_dim: 128,
@@ -57,6 +59,8 @@ mod tests {
     fn scales_linearly_with_sequence() {
         let kv = KvGeometry {
             layers: 28,
+            attention_layers: 28,
+            state_bytes: 0,
             head_count: 16,
             kv_head_count: 8,
             head_dim: 128,
@@ -73,6 +77,8 @@ mod tests {
     fn asymmetric_key_value_lengths_are_supported() {
         let kv = KvGeometry {
             layers: 1,
+            attention_layers: 1,
+            state_bytes: 0,
             head_count: 1,
             kv_head_count: 1,
             head_dim: 128,
@@ -87,6 +93,8 @@ mod tests {
     fn overflow_is_rejected() {
         let kv = KvGeometry {
             layers: u64::MAX,
+            attention_layers: u64::MAX,
+            state_bytes: 0,
             head_count: 1,
             kv_head_count: 2,
             head_dim: 1,

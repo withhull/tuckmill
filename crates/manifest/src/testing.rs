@@ -26,6 +26,26 @@ pub struct SyntheticConfig {
     pub expert_used: Option<u32>,
     /// Store expert tensors as Q4_0 to exercise quantized size math.
     pub quantize_experts: bool,
+    /// Hybrid (qwen35) geometry; absent for dense-attention fixtures.
+    pub hybrid: Option<HybridFixture>,
+}
+
+/// Geometry for the qwen35 synthetic fixture: alternating Gated DeltaNet
+/// and full-attention layers plus an optional trailing MTP block.
+#[derive(Debug, Clone)]
+pub struct HybridFixture {
+    /// Every Nth served layer is a full-attention layer (1-based).
+    pub full_attention_interval: u32,
+    /// Trailing non-served MTP (`nextn`) blocks appended after the stack.
+    pub nextn_layers: u32,
+    pub ssm_group_count: u32,
+    pub ssm_state_size: u32,
+    pub ssm_inner_size: u32,
+    pub ssm_conv_kernel: u32,
+    pub ssm_time_step_rank: u32,
+    /// When set, the fixture carries a per-layer boolean attention array
+    /// instead of relying on the interval alone.
+    pub recurrent_layers_array: Option<Vec<bool>>,
 }
 
 impl SyntheticConfig {
@@ -44,6 +64,7 @@ impl SyntheticConfig {
             expert_count: None,
             expert_used: None,
             quantize_experts: false,
+            hybrid: None,
         }
     }
 
@@ -62,7 +83,48 @@ impl SyntheticConfig {
             expert_count: Some(8),
             expert_used: Some(2),
             quantize_experts: true,
+            hybrid: None,
         }
+    }
+
+    /// Tiny qwen35 hybrid: four served layers (one full attention) plus
+    /// one MTP block, mirroring the pinned 3:1 layout at fixture scale.
+    pub fn tiny_qwen35() -> Self {
+        Self {
+            arch: "qwen35".into(),
+            name: "tuckmill-fixture-qwen35-tiny".into(),
+            layers: 4,
+            hidden: 64,
+            heads: 4,
+            kv_heads: 2,
+            head_dim: 16,
+            ffn: 64,
+            vocab: 512,
+            context: 4096,
+            expert_count: None,
+            expert_used: None,
+            quantize_experts: false,
+            hybrid: Some(HybridFixture {
+                full_attention_interval: 4,
+                nextn_layers: 1,
+                ssm_group_count: 2,
+                ssm_state_size: 8,
+                ssm_inner_size: 16,
+                ssm_conv_kernel: 4,
+                ssm_time_step_rank: 2,
+                recurrent_layers_array: None,
+            }),
+        }
+    }
+
+    /// Same fixture with an explicit per-layer boolean attention array
+    /// (llama.cpp semantics: true = recurrent / linear attention).
+    pub fn tiny_qwen35_with_recurrent_array() -> Self {
+        let mut cfg = Self::tiny_qwen35();
+        if let Some(h) = cfg.hybrid.as_mut() {
+            h.recurrent_layers_array = Some(vec![true, true, true, false]);
+        }
+        cfg
     }
 }
 
@@ -115,48 +177,124 @@ fn build(cfg: &SyntheticConfig) -> Result<Vec<u8>> {
         &[cfg.hidden as u64, cfg.vocab as u64],
         1,
     )?);
+    fn push_attention_block(
+        tensors: &mut Vec<Tensor>,
+        p: &dyn Fn(&str) -> String,
+        h: u64,
+        q_out: u64,
+        kv_out: u64,
+        head_dim: u64,
+    ) -> Result<()> {
+        tensors.push(tensor(&p("attn_q.weight"), &[h, q_out * 2], 1)?);
+        tensors.push(tensor(&p("attn_k.weight"), &[h, kv_out], 1)?);
+        tensors.push(tensor(&p("attn_v.weight"), &[h, kv_out], 1)?);
+        tensors.push(tensor(&p("attn_output.weight"), &[q_out, h], 1)?);
+        tensors.push(tensor(&p("attn_q_norm.weight"), &[head_dim], 0)?);
+        tensors.push(tensor(&p("attn_k_norm.weight"), &[head_dim], 0)?);
+        Ok(())
+    }
     let q_out = (cfg.heads * cfg.head_dim) as u64;
     let kv_out = (cfg.kv_heads * cfg.head_dim) as u64;
-    for l in 0..cfg.layers {
-        let p = |s: &str| format!("blk.{l}.{s}");
-        tensors.push(tensor(&p("attn_norm.weight"), &[cfg.hidden as u64], 0)?);
-        // GGUF stores dims fastest-first: for a linear (out x in) the dims
-        // are [in, out] — matching llama.cpp's create_tensor convention.
-        tensors.push(tensor(&p("attn_q.weight"), &[cfg.hidden as u64, q_out], 1)?);
-        tensors.push(tensor(
-            &p("attn_k.weight"),
-            &[cfg.hidden as u64, kv_out],
-            1,
-        )?);
-        tensors.push(tensor(
-            &p("attn_v.weight"),
-            &[cfg.hidden as u64, kv_out],
-            1,
-        )?);
-        tensors.push(tensor(
-            &p("attn_output.weight"),
-            &[q_out, cfg.hidden as u64],
-            1,
-        )?);
-        tensors.push(tensor(&p("attn_q_norm.weight"), &[cfg.head_dim as u64], 0)?);
-        tensors.push(tensor(&p("attn_k_norm.weight"), &[cfg.head_dim as u64], 0)?);
-        tensors.push(tensor(&p("ffn_norm.weight"), &[cfg.hidden as u64], 0)?);
-        if is_moe {
-            let e = cfg.expert_count.unwrap_or(8) as u64;
-            let f = cfg.ffn as u64;
-            let h = cfg.hidden as u64;
-            let expert_ty = if cfg.quantize_experts { 2 } else { 1 };
-            tensors.push(tensor(&p("ffn_gate_inp.weight"), &[h, e], 0)?);
-            tensors.push(tensor(&p("ffn_gate_exps.weight"), &[h, f, e], expert_ty)?);
-            tensors.push(tensor(&p("ffn_up_exps.weight"), &[h, f, e], expert_ty)?);
-            tensors.push(tensor(&p("ffn_down_exps.weight"), &[f, h, e], expert_ty)?);
-            tensors.push(tensor(&p("ffn_gate_shexp.weight"), &[h, f], 1)?);
-        } else {
-            let f = cfg.ffn as u64;
-            let h = cfg.hidden as u64;
-            tensors.push(tensor(&p("ffn_gate.weight"), &[h, f], 1)?);
-            tensors.push(tensor(&p("ffn_up.weight"), &[h, f], 1)?);
-            tensors.push(tensor(&p("ffn_down.weight"), &[f, h], 1)?);
+    let h = cfg.hidden as u64;
+    if let Some(hy) = &cfg.hybrid {
+        // qwen35 hybrid layout: Gated DeltaNet layers between full
+        // attention layers, plus trailing MTP (`nextn`) blocks that are
+        // not part of the served stack.
+        let inner = hy.ssm_inner_size as u64;
+        let groups = hy.ssm_group_count as u64;
+        let conv_channels = inner + 2 * groups * hy.ssm_state_size as u64;
+        for l in 0..cfg.layers {
+            let p = |s: &str| format!("blk.{l}.{s}");
+            tensors.push(tensor(&p("attn_norm.weight"), &[h], 0)?);
+            if (l + 1) % hy.full_attention_interval == 0 {
+                push_attention_block(&mut tensors, &p, h, q_out, kv_out, cfg.head_dim as u64)?;
+            } else {
+                tensors.push(tensor(&p("attn_qkv.weight"), &[h, 3 * inner], 1)?);
+                tensors.push(tensor(&p("attn_gate.weight"), &[h, inner], 1)?);
+                tensors.push(tensor(&p("ssm_a"), &[hy.ssm_time_step_rank as u64], 0)?);
+                tensors.push(tensor(
+                    &p("ssm_dt.bias"),
+                    &[hy.ssm_time_step_rank as u64],
+                    0,
+                )?);
+                tensors.push(tensor(
+                    &p("ssm_alpha.weight"),
+                    &[h, hy.ssm_time_step_rank as u64],
+                    1,
+                )?);
+                tensors.push(tensor(
+                    &p("ssm_beta.weight"),
+                    &[h, hy.ssm_time_step_rank as u64],
+                    1,
+                )?);
+                tensors.push(tensor(
+                    &p("ssm_conv1d.weight"),
+                    &[hy.ssm_conv_kernel as u64, conv_channels],
+                    0,
+                )?);
+                tensors.push(tensor(&p("ssm_norm.weight"), &[inner / groups], 0)?);
+                tensors.push(tensor(&p("ssm_out.weight"), &[inner, h], 1)?);
+            }
+            tensors.push(tensor(&p("ffn_gate.weight"), &[h, cfg.ffn as u64], 1)?);
+            tensors.push(tensor(&p("ffn_up.weight"), &[h, cfg.ffn as u64], 1)?);
+            tensors.push(tensor(&p("ffn_down.weight"), &[cfg.ffn as u64, h], 1)?);
+            tensors.push(tensor(&p("post_attention_norm.weight"), &[h], 0)?);
+        }
+        for l in 0..hy.nextn_layers {
+            let p = |s: &str| format!("blk.{}.{s}", cfg.layers + l);
+            tensors.push(tensor(&p("attn_norm.weight"), &[h], 0)?);
+            push_attention_block(&mut tensors, &p, h, q_out, kv_out, cfg.head_dim as u64)?;
+            tensors.push(tensor(&p("ffn_gate.weight"), &[h, cfg.ffn as u64], 1)?);
+            tensors.push(tensor(&p("ffn_up.weight"), &[h, cfg.ffn as u64], 1)?);
+            tensors.push(tensor(&p("ffn_down.weight"), &[cfg.ffn as u64, h], 1)?);
+            tensors.push(tensor(&p("post_attention_norm.weight"), &[h], 0)?);
+            tensors.push(tensor(&p("nextn.eh_proj.weight"), &[h * 2, h], 1)?);
+            tensors.push(tensor(&p("nextn.enorm.weight"), &[h], 0)?);
+            tensors.push(tensor(&p("nextn.hnorm.weight"), &[h], 0)?);
+            tensors.push(tensor(&p("nextn.shared_head_norm.weight"), &[h], 0)?);
+        }
+    } else {
+        for l in 0..cfg.layers {
+            let p = |s: &str| format!("blk.{l}.{s}");
+            tensors.push(tensor(&p("attn_norm.weight"), &[cfg.hidden as u64], 0)?);
+            // GGUF stores dims fastest-first: for a linear (out x in) the dims
+            // are [in, out] — matching llama.cpp's create_tensor convention.
+            tensors.push(tensor(&p("attn_q.weight"), &[cfg.hidden as u64, q_out], 1)?);
+            tensors.push(tensor(
+                &p("attn_k.weight"),
+                &[cfg.hidden as u64, kv_out],
+                1,
+            )?);
+            tensors.push(tensor(
+                &p("attn_v.weight"),
+                &[cfg.hidden as u64, kv_out],
+                1,
+            )?);
+            tensors.push(tensor(
+                &p("attn_output.weight"),
+                &[q_out, cfg.hidden as u64],
+                1,
+            )?);
+            tensors.push(tensor(&p("attn_q_norm.weight"), &[cfg.head_dim as u64], 0)?);
+            tensors.push(tensor(&p("attn_k_norm.weight"), &[cfg.head_dim as u64], 0)?);
+            tensors.push(tensor(&p("ffn_norm.weight"), &[cfg.hidden as u64], 0)?);
+            if is_moe {
+                let e = cfg.expert_count.unwrap_or(8) as u64;
+                let f = cfg.ffn as u64;
+                let h = cfg.hidden as u64;
+                let expert_ty = if cfg.quantize_experts { 2 } else { 1 };
+                tensors.push(tensor(&p("ffn_gate_inp.weight"), &[h, e], 0)?);
+                tensors.push(tensor(&p("ffn_gate_exps.weight"), &[h, f, e], expert_ty)?);
+                tensors.push(tensor(&p("ffn_up_exps.weight"), &[h, f, e], expert_ty)?);
+                tensors.push(tensor(&p("ffn_down_exps.weight"), &[f, h, e], expert_ty)?);
+                tensors.push(tensor(&p("ffn_gate_shexp.weight"), &[h, f], 1)?);
+            } else {
+                let f = cfg.ffn as u64;
+                let h = cfg.hidden as u64;
+                tensors.push(tensor(&p("ffn_gate.weight"), &[h, f], 1)?);
+                tensors.push(tensor(&p("ffn_up.weight"), &[h, f], 1)?);
+                tensors.push(tensor(&p("ffn_down.weight"), &[f, h], 1)?);
+            }
         }
     }
 
@@ -186,7 +324,10 @@ fn build(cfg: &SyntheticConfig) -> Result<Vec<u8>> {
         KV::U32(if is_moe { 2 } else { 1 }),
     ));
     kvs.push(("general.quantization_version".into(), KV::U32(2)));
-    kvs.push((format!("{arch}.block_count"), KV::U32(cfg.layers)));
+    kvs.push((
+        format!("{arch}.block_count"),
+        KV::U32(cfg.layers + cfg.hybrid.as_ref().map(|h| h.nextn_layers).unwrap_or(0)),
+    ));
     kvs.push((
         format!("{arch}.context_length"),
         KV::U32(cfg.context as u32),
@@ -211,6 +352,46 @@ fn build(cfg: &SyntheticConfig) -> Result<Vec<u8>> {
         format!("{arch}.attention.layer_norm_rms_epsilon"),
         KV::F32(1e-6),
     ));
+    if let Some(hy) = &cfg.hybrid {
+        kvs.push((
+            format!("{arch}.rope.dimension_count"),
+            KV::U32(cfg.head_dim),
+        ));
+        kvs.push((
+            format!("{arch}.rope.dimension_sections"),
+            KV::Array(4, vec![KV::U32(1), KV::U32(1), KV::U32(1), KV::U32(0)]),
+        ));
+        kvs.push((
+            format!("{arch}.full_attention_interval"),
+            KV::U32(hy.full_attention_interval),
+        ));
+        if hy.nextn_layers > 0 {
+            kvs.push((
+                format!("{arch}.nextn_predict_layers"),
+                KV::U32(hy.nextn_layers),
+            ));
+        }
+        kvs.push((
+            format!("{arch}.ssm.conv_kernel"),
+            KV::U32(hy.ssm_conv_kernel),
+        ));
+        kvs.push((format!("{arch}.ssm.state_size"), KV::U32(hy.ssm_state_size)));
+        kvs.push((
+            format!("{arch}.ssm.group_count"),
+            KV::U32(hy.ssm_group_count),
+        ));
+        kvs.push((
+            format!("{arch}.ssm.time_step_rank"),
+            KV::U32(hy.ssm_time_step_rank),
+        ));
+        kvs.push((format!("{arch}.ssm.inner_size"), KV::U32(hy.ssm_inner_size)));
+        if let Some(flags) = &hy.recurrent_layers_array {
+            kvs.push((
+                format!("{arch}.attention.recurrent_layers"),
+                KV::Array(7, flags.iter().map(|b| KV::Bool(*b)).collect()),
+            ));
+        }
+    }
     if let (Some(ec), Some(eu)) = (cfg.expert_count, cfg.expert_used) {
         kvs.push((format!("{arch}.expert_count"), KV::U32(ec)));
         kvs.push((format!("{arch}.expert_used_count"), KV::U32(eu)));
@@ -406,6 +587,7 @@ enum KV {
     U32(u32),
     I32(i32),
     F32(f32),
+    Bool(bool),
     Str(String),
     Array(u32, Vec<KV>),
 }
@@ -429,6 +611,10 @@ fn write_kv_value(out: &mut Vec<u8>, v: &KV) {
             out.extend_from_slice(&6u32.to_le_bytes());
             out.extend_from_slice(&x.to_bits().to_le_bytes());
         }
+        KV::Bool(x) => {
+            out.extend_from_slice(&7u32.to_le_bytes());
+            out.push(u8::from(*x));
+        }
         KV::Str(s) => {
             out.extend_from_slice(&8u32.to_le_bytes());
             write_string(out, s);
@@ -451,6 +637,7 @@ fn write_value_payload(out: &mut Vec<u8>, v: &KV) {
         KV::U32(x) => out.extend_from_slice(&x.to_le_bytes()),
         KV::I32(x) => out.extend_from_slice(&x.to_le_bytes()),
         KV::F32(x) => out.extend_from_slice(&x.to_bits().to_le_bytes()),
+        KV::Bool(x) => out.push(u8::from(*x)),
         KV::Str(s) => write_string(out, s),
         KV::Array(..) => unreachable!("nested arrays are not used in fixtures"),
     }
@@ -495,6 +682,32 @@ mod tests {
             stats.by_type.contains_key("Q4_0"),
             "experts quantized in fixture"
         );
+    }
+
+    #[test]
+    fn qwen35_fixture_carries_the_hybrid_contract() {
+        let bytes = synthetic_qwen3_bytes(&SyntheticConfig::tiny_qwen35());
+        let mut cur = std::io::Cursor::new(bytes.clone());
+        let insp = inspect_reader(&mut cur, bytes.len() as u64, &Limits::default(), None).unwrap();
+        assert_eq!(insp.arch_id().as_deref(), Some("qwen35"));
+        assert_eq!(insp.get_u64("qwen35.block_count"), Some(5));
+        assert_eq!(insp.get_u64("qwen35.nextn_predict_layers"), Some(1));
+        assert_eq!(insp.get_u64("qwen35.ssm.state_size"), Some(8));
+        assert_eq!(insp.get_u64("qwen35.full_attention_interval"), Some(4));
+        assert!(insp
+            .tensors
+            .iter()
+            .any(|t| t.name == "blk.0.ssm_conv1d.weight"));
+        assert!(insp.tensors.iter().any(|t| t.name == "blk.3.attn_q.weight"));
+        assert!(!insp
+            .tensors
+            .iter()
+            .any(|t| t.name == "blk.3.ssm_conv1d.weight"));
+        assert!(insp
+            .tensors
+            .iter()
+            .any(|t| t.name == "blk.4.nextn.eh_proj.weight"));
+        assert!(insp.layout_warnings.is_empty());
     }
 
     #[test]

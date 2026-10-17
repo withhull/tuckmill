@@ -243,6 +243,9 @@ pub fn import_local(
                                 kv_head_count: kv.kv_head_count,
                                 key_length: kv.key_length,
                                 value_length: kv.value_length,
+                                attention_layers: (kv.attention_layers != kv.layers)
+                                    .then_some(kv.attention_layers),
+                                state_bytes: (kv.state_bytes > 0).then_some(kv.state_bytes),
                                 expert_count: experts.map(|e| e.count),
                                 expert_used_per_token: experts.map(|e| e.used_per_token),
                             });
@@ -630,6 +633,41 @@ mod tests {
 
         let aliases = AliasRegistry::load(&layout).unwrap();
         assert_eq!(aliases.resolve("local-model"), Some(&artifact.artifact_id));
+    }
+
+    /// Q35-0: a hybrid artifact records the served stack, the attention
+    /// layers that carry KV, and the constant recurrent state — planning
+    /// prices hybrid state from this record, never from a guess.
+    #[test]
+    fn hybrid_fixture_records_attention_layers_and_state_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let layout = StoreLayout::open(dir.path().join("store"));
+        let src = dir.path().join("hybrid.gguf");
+        std::fs::write(&src, synthetic_qwen3_bytes(&SyntheticConfig::tiny_qwen35())).unwrap();
+        let outcome = import_local(
+            &layout,
+            &registry(),
+            &src,
+            &ImportOptions {
+                alias: Some("q35".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(outcome.artifact.arch_id.as_deref(), Some("qwen35"));
+        assert!(
+            outcome.warnings.is_empty(),
+            "adapter must accept the pinned contract shape: {:?}",
+            outcome.warnings
+        );
+        let geometry = outcome
+            .artifact
+            .geometry
+            .as_ref()
+            .expect("geometry resolved");
+        assert_eq!(geometry.layers, 4, "MTP block excluded");
+        assert_eq!(geometry.attention_layers, Some(1));
+        assert_eq!(geometry.state_bytes, Some((512 + 576) * 3));
     }
 
     #[test]

@@ -220,6 +220,8 @@ pub mod testing {
             kv_head_count: 8,
             key_length: 128,
             value_length: 128,
+            attention_layers: None,
+            state_bytes: None,
             expert_count: if dense { None } else { Some(128) },
             expert_used_per_token: if dense { None } else { Some(8) },
         }

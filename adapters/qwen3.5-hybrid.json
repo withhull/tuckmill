@@ -1,12 +1,12 @@
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "id": "qwen3.5-hybrid",
-  "display_name": "Qwen3.5 text-only hybrid (GGUF)",
+  "display_name": "Qwen3.5 hybrid Gated-DeltaNet + attention (GGUF)",
   "family": "qwen3.5",
-  "architecture": "qwen3.5",
+  "architecture": "qwen35",
   "traits": {
-    "dense": false,
-    "moe": true,
+    "dense": true,
+    "moe": false,
     "hybrid_linear_attention": true,
     "ternary_quantized": false
   },
@@ -14,8 +14,8 @@
   "certification": {
     "state": "unmeasured",
     "notes": [
-      "FR-29: text-only hybrid adapter is mandatory before any Bonsai small-model certification.",
-      "Metadata key namespace must be confirmed against the first pinned published artifact before this adapter is promoted from 'specified'.",
+      "Metadata namespace verified against the pinned ggml-org Qwen3.5-0.8B-GGUF Q8_0 artifact (833592096 bytes, sha256 37ae482d336108d23516fa35e8e0c4126688d81018b87178a18d752a1357814f) on 2026-10-17; geometry derivation registered in ADR-008.",
+      "Contract only: inspect/import/plan are supported; execution is refused until the Q35-1 CPU numerical oracle lands.",
       "Hybrid recurrent state rollback (K07) is not implemented; speculative execution stays disabled."
     ]
   },
@@ -23,30 +23,56 @@
   "required_transforms": [],
   "metadata_requirements": [
     { "key": "general.architecture", "kind": "string", "required": true },
-    { "key": "qwen3.5.block_count", "kind": "u32", "required": true },
-    { "key": "qwen3.5.context_length", "kind": "u32", "required": true },
-    { "key": "qwen3.5.embedding_length", "kind": "u32", "required": true },
-    { "key": "qwen3.5.attention.head_count", "kind": "u32", "required": true },
-    { "key": "qwen3.5.attention.head_count_kv", "kind": "u32", "required": true },
-    { "key": "qwen3.5.feed_forward_length", "kind": "u32", "required": true },
-    { "key": "qwen3.5.expert_count", "kind": "u32", "required": false },
-    { "key": "qwen3.5.expert_used_count", "kind": "u32", "required": false },
-    { "key": "tokenizer.ggml.tokens", "kind": "array", "required": true }
+    { "key": "qwen35.block_count", "kind": "u32", "required": true },
+    { "key": "qwen35.context_length", "kind": "u32", "required": true },
+    { "key": "qwen35.embedding_length", "kind": "u32", "required": true },
+    { "key": "qwen35.feed_forward_length", "kind": "u32", "required": true },
+    { "key": "qwen35.attention.head_count", "kind": "u32", "required": true },
+    { "key": "qwen35.attention.head_count_kv", "kind": "u32", "required": true },
+    { "key": "qwen35.attention.key_length", "kind": "u32", "required": true },
+    { "key": "qwen35.attention.value_length", "kind": "u32", "required": true },
+    { "key": "qwen35.attention.layer_norm_rms_epsilon", "kind": "f32", "required": true },
+    { "key": "qwen35.rope.freq_base", "kind": "f32", "required": true },
+    { "key": "qwen35.rope.dimension_count", "kind": "u32", "required": true },
+    { "key": "qwen35.rope.dimension_sections", "kind": "array", "required": true },
+    { "key": "qwen35.full_attention_interval", "kind": "u32", "required": false },
+    { "key": "qwen35.attention.recurrent_layers", "kind": "array", "required": false },
+    { "key": "qwen35.nextn_predict_layers", "kind": "u32", "required": false },
+    { "key": "qwen35.ssm.conv_kernel", "kind": "u32", "required": true },
+    { "key": "qwen35.ssm.state_size", "kind": "u32", "required": true },
+    { "key": "qwen35.ssm.group_count", "kind": "u32", "required": true },
+    { "key": "qwen35.ssm.time_step_rank", "kind": "u32", "required": true },
+    { "key": "qwen35.ssm.inner_size", "kind": "u32", "required": true },
+    { "key": "tokenizer.ggml.model", "kind": "string", "required": false },
+    { "key": "tokenizer.ggml.pre", "kind": "string", "required": false },
+    { "key": "tokenizer.ggml.tokens", "kind": "array", "required": true },
+    { "key": "tokenizer.ggml.merges", "kind": "array", "required": false },
+    { "key": "tokenizer.ggml.eos_token_id", "kind": "u32", "required": false }
   ],
   "kv": {
-    "layers_key": "qwen3.5.block_count",
-    "head_count_key": "qwen3.5.attention.head_count",
-    "kv_head_count_key": "qwen3.5.attention.head_count_kv",
-    "embedding_key": "qwen3.5.embedding_length",
-    "key_length_key": "qwen3.5.attention.key_length",
-    "value_length_key": "qwen3.5.attention.value_length"
-  },
-  "expert_meta": {
-    "count_key": "qwen3.5.expert_count",
-    "used_key": "qwen3.5.expert_used_count"
+    "layers_key": "qwen35.block_count",
+    "head_count_key": "qwen35.attention.head_count",
+    "kv_head_count_key": "qwen35.attention.head_count_kv",
+    "embedding_key": "qwen35.embedding_length",
+    "key_length_key": "qwen35.attention.key_length",
+    "value_length_key": "qwen35.attention.value_length",
+    "attention": {
+      "interval_key": "qwen35.full_attention_interval",
+      "excluded_tail_key": "qwen35.nextn_predict_layers",
+      "layers_key": "qwen35.attention.recurrent_layers"
+    },
+    "recurrent": {
+      "groups_key": "qwen35.ssm.group_count",
+      "state_size_key": "qwen35.ssm.state_size",
+      "inner_size_key": "qwen35.ssm.inner_size",
+      "conv_kernel_key": "qwen35.ssm.conv_kernel",
+      "element_bytes": 4
+    }
   },
   "notes": [
-    "Hybrid state checks (full prefill, chunked prefill, one-token updates from identical states) are a certification prerequisite.",
-    "KV truncation alone does not undo recurrent state (PRD section 12)."
+    "3:1 hybrid: every fourth served layer is full attention (GQA with output gate, partial RoPE, per-head QK norm); the rest are Gated DeltaNet layers with per-session recurrent and convolution state (ADR-008).",
+    "MTP/nextn blocks are excluded from the served stack (block_count minus nextn_predict_layers); the pinned 0.8B artifact carries one.",
+    "Multimodal (image-text-to-text) artifact family; only the text path is a target. The built-in tokenizer does not recognize the 'qwen35' pre-tokenizer and no chat template is recognized, so chat requests stay refused.",
+    "Dense execution must process every required dense weight; a router does not apply."
   ]
 }

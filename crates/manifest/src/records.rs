@@ -137,11 +137,22 @@ pub struct PackedInfo {
 /// at inspect/import time via the adapter; absent when no adapter resolved.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ModelGeometry {
+    /// Served stack layers (trailing non-served blocks such as MTP/`nextn`
+    /// prediction layers are already excluded).
     pub layers: u64,
     pub head_count: u64,
     pub kv_head_count: u64,
     pub key_length: u64,
     pub value_length: u64,
+    /// Served layers carrying per-request attention KV. Absent = every
+    /// layer (dense attention); smaller values mark hybrid stacks whose
+    /// remaining layers carry recurrent state instead.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attention_layers: Option<u64>,
+    /// Constant per-session recurrent state bytes (delta-rule state plus
+    /// convolution history). Absent = the stack is pure attention.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub state_bytes: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expert_count: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
