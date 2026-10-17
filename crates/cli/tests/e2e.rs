@@ -1114,6 +1114,49 @@ fn qwen35_teacher_forced_logits_match_reference_when_available() {
         mean_abs <= 0.1,
         "registered mean agreement (observed {mean_abs:.6})"
     );
+
+    // Q35-2C: the complete GPU model executes the same tokens and is
+    // compared against the pinned reference as well. Skips (loudly) only
+    // when no Metal device is available.
+    match tuckmill_tuckcore::qwen35_gpu::Qwen35Gpu::open() {
+        Ok(gpu) => {
+            let model =
+                tuckmill_tuckcore::qwen35_gpu::Qwen35GpuModel::load(gpu, &model, 16).unwrap();
+            let mut gpu_logits = Vec::new();
+            model.forward_token(tokens[0], &mut gpu_logits).unwrap();
+            for token in &tokens[1..] {
+                model.forward_token(*token, &mut gpu_logits).unwrap();
+            }
+            assert_eq!(gpu_logits.len(), theirs.len(), "identical vocabulary");
+            let mut gpu_max = 0f64;
+            let mut gpu_top = 0usize;
+            for (i, (a, b)) in gpu_logits.iter().zip(theirs.iter()).enumerate() {
+                gpu_max = gpu_max.max((*a as f64 - *b as f64).abs());
+                if gpu_logits[i] > gpu_logits[gpu_top] {
+                    gpu_top = i;
+                }
+            }
+            eprintln!(
+                "qwen35 GPU model vs pinned llama.cpp: max|diff| {gpu_max:.6} over vocab {}; top1 gpu {gpu_top} reference {theirs_top}",
+                gpu_logits.len()
+            );
+            assert_eq!(
+                gpu_top, theirs_top,
+                "GPU top-1 matches the pinned reference"
+            );
+            assert!(
+                gpu_max <= 0.5,
+                "registered GPU-vs-reference tolerance (observed {gpu_max:.6})"
+            );
+        }
+        Err(e) => {
+            assert!(
+                std::env::var("TUCKMILL_REQUIRE_METAL").is_err(),
+                "TUCKMILL_REQUIRE_METAL is set but the GPU model could not open: {e}"
+            );
+            eprintln!("skipping GPU model comparison: no Metal device ({e})");
+        }
+    }
 }
 
 #[test]

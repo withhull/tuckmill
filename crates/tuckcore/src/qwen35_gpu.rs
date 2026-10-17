@@ -1175,6 +1175,7 @@ impl LayerGeometry {
 /// uploaded verbatim) and 1-D vectors are raw f32.
 pub struct DeviceTensor {
     buf: MetalBuffer,
+    type_id: u32,
     in_dim: u64,
     out_dim: u64,
 }
@@ -1190,26 +1191,46 @@ impl DeviceTensor {
                 format!("tensor {index} is 1-D; vectors use the f32 path"),
             ));
         }
-        if type_id != 1 {
+        if type_id != 1 && type_id != 8 {
             return Err(TuckmillError::new(
                 ErrorCode::UnsupportedQuantization,
-                format!(
-                    "device layer assembly currently wires F16 matrices only; tensor {index} is type {type_id} (Q8_0 lands with Q35-2C)"
-                ),
+                format!("device matrices must be F16 or Q8_0; tensor {index} is type {type_id}"),
             ));
         }
         let buf = gpu.buffer(bytes.len())?;
         buf.upload(0, &bytes)?;
         Ok(Self {
             buf,
+            type_id,
             in_dim,
             out_dim,
         })
     }
 
+    /// Device `y = W x` with the projection kernel for the stored type.
     fn gemv(&self, gpu: &Qwen35Gpu, x: &MetalBuffer, y: &MetalBuffer) -> Result<()> {
-        gpu.context()
-            .f16_gemv(&self.buf, x, y, self.out_dim as u32, self.in_dim as u32)
+        let ctx = gpu.context();
+        match self.type_id {
+            1 => ctx.f16_gemv(&self.buf, x, y, self.out_dim as u32, self.in_dim as u32),
+            8 => ctx.q8_0_gemv(&self.buf, x, y, self.out_dim as u32, self.in_dim as u32),
+            other => Err(TuckmillError::new(
+                ErrorCode::UnsupportedQuantization,
+                format!("no device projection for stored type {other}"),
+            )),
+        }
+    }
+
+    /// Dequantize one matrix row on the device (embedding lookups).
+    fn row_into(&self, gpu: &Qwen35Gpu, row: u32, out: &MetalBuffer, out_off: u32) -> Result<()> {
+        let ctx = gpu.context();
+        match self.type_id {
+            1 => ctx.f16_row(&self.buf, out, row, self.in_dim as u32, out_off),
+            8 => ctx.q8_0_row(&self.buf, out, row, self.in_dim as u32, out_off),
+            other => Err(TuckmillError::new(
+                ErrorCode::UnsupportedQuantization,
+                format!("no device row reader for stored type {other}"),
+            )),
+        }
     }
 }
 
@@ -1423,6 +1444,168 @@ impl LayerGpu {
             LayerGpu::Attention(l) => l.forward(gpu, x, pos),
         }
     }
+
+    /// Zero this layer's session state (delta rule, convolution history,
+    /// packed KV caches). No stateful byte survives a reset.
+    pub fn reset(&self) -> Result<()> {
+        let zero = |buf: &MetalBuffer| buf.upload(0, &vec![0u8; buf.len()]);
+        match self {
+            LayerGpu::Gdn(l) => {
+                zero(&l.state)?;
+                zero(&l.hist)
+            }
+            LayerGpu::Attention(l) => {
+                zero(&l.k_cache)?;
+                zero(&l.v_cache)
+            }
+        }
+    }
+}
+
+/// Stage reported to a traced device forward: the embedding row or a
+/// completed layer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Stage {
+    Embedding,
+    Layer(usize),
+}
+
+/// The complete served stack on the device: per-layer weights, state and
+/// scratch on one shared owner, a single embedding lookup path and the
+/// tied head. Weights are uploaded raw from the verified artifact; the
+/// shared ledger (`allocated_bytes`) is the number the plan admission
+/// must cover.
+pub struct Qwen35GpuModel {
+    gpu: Qwen35Gpu,
+    layers: Vec<LayerGpu>,
+    output_norm: MetalBuffer,
+    tied: DeviceTensor,
+    x: MetalBuffer,
+    h: MetalBuffer,
+    logits_buf: MetalBuffer,
+    hidden: usize,
+    vocab: usize,
+    eps: f32,
+    capacity: usize,
+    positions: std::cell::Cell<usize>,
+}
+
+impl Qwen35GpuModel {
+    /// Upload every served tensor and allocate all state and scratch.
+    /// Takes ownership of the shared GPU owner so the ledger covers the
+    /// whole model.
+    pub fn load(gpu: Qwen35Gpu, model: &Qwen35Model, capacity: usize) -> Result<Self> {
+        let hidden = model.config().hidden as usize;
+        let vocab = model.config().vocab as usize;
+        let eps = model.config().rms_eps;
+        let layers = (0..model.layout().layers.len())
+            .map(|l| LayerGpu::load(&gpu, model, l, capacity))
+            .collect::<Result<Vec<_>>>()?;
+        let output_norm = vec_buf(&gpu, &model.read_vector(model.layout().output_norm.index)?)?;
+        let tied = DeviceTensor::load(&gpu, model, model.layout().token_embd.index)?;
+        let x = zero_buf(&gpu, hidden)?;
+        let h = zero_buf(&gpu, hidden)?;
+        let logits_buf = zero_buf(&gpu, vocab)?;
+        Ok(Self {
+            gpu,
+            layers,
+            output_norm,
+            tied,
+            x,
+            h,
+            logits_buf,
+            hidden,
+            vocab,
+            eps,
+            capacity,
+            positions: std::cell::Cell::new(0),
+        })
+    }
+
+    pub fn positions(&self) -> usize {
+        self.positions.get()
+    }
+
+    /// Total bytes held on the device by this model (weights, state,
+    /// scratch) — a single authoritative ledger.
+    pub fn allocated_bytes(&self) -> u64 {
+        self.gpu.context().allocated_bytes()
+    }
+
+    pub fn layers(&self) -> &[LayerGpu] {
+        &self.layers
+    }
+
+    /// The running hidden-state buffer (verification surface).
+    pub fn activations(&self) -> &MetalBuffer {
+        &self.x
+    }
+
+    /// Zero every session state and the position counter.
+    pub fn reset(&self) -> Result<()> {
+        for layer in &self.layers {
+            layer.reset()?;
+        }
+        self.positions.set(0);
+        Ok(())
+    }
+
+    /// One decode step; the full vocabulary logits are downloaded for
+    /// the caller (sampling/verification happen on the host).
+    pub fn forward_token(&self, token: u32, logits: &mut Vec<f32>) -> Result<()> {
+        self.forward_token_traced(token, logits, |_, _| Ok(()))
+    }
+
+    /// Same step with a per-stage callback (embedding row, then after
+    /// every layer) on the device activations — the layer-by-layer
+    /// qualification surface.
+    pub fn forward_token_traced(
+        &self,
+        token: u32,
+        logits: &mut Vec<f32>,
+        mut on_stage: impl FnMut(Stage, &MetalBuffer) -> Result<()>,
+    ) -> Result<()> {
+        if token as usize >= self.vocab {
+            return Err(TuckmillError::new(
+                ErrorCode::InvalidRequest,
+                format!(
+                    "token id {token} is outside the {}-entry vocabulary",
+                    self.vocab
+                ),
+            ));
+        }
+        let pos = self.positions.get();
+        if pos >= self.capacity {
+            return Err(TuckmillError::new(
+                ErrorCode::InvalidPlan,
+                format!(
+                    "token {pos} exceeds the admitted {}-position context",
+                    self.capacity
+                ),
+            ));
+        }
+        self.tied.row_into(&self.gpu, token, &self.x, 0)?;
+        on_stage(Stage::Embedding, &self.x)?;
+        for (l, layer) in self.layers.iter().enumerate() {
+            layer.forward(&self.gpu, &self.x, pos as u32)?;
+            on_stage(Stage::Layer(l), &self.x)?;
+        }
+        self.gpu.context().rmsnorm(
+            &self.x,
+            &self.output_norm,
+            &self.h,
+            1,
+            self.hidden as u32,
+            self.eps,
+        )?;
+        self.tied.gemv(&self.gpu, &self.h, &self.logits_buf)?;
+        logits.resize(self.vocab, 0.0);
+        let mut bytes = vec![0u8; self.vocab * 4];
+        self.logits_buf.download(0, &mut bytes)?;
+        logits.copy_from_slice(&bytes_f32(&bytes));
+        self.positions.set(pos + 1);
+        Ok(())
+    }
 }
 
 impl GdnLayerGpu {
@@ -1592,6 +1775,11 @@ mod layer_tests {
     use crate::qwen35_kv::KvPrecision;
     use tuckmill_manifest::testing::{synthetic_qwen3_bytes, SyntheticConfig};
 
+    /// Registered device-vs-oracle tolerances for the complete fixture
+    /// model (observed worst: hidden 5.4e-7, logits 1.4e-6 over 3 tokens).
+    const HIDDEN_TOL: f32 = 1e-5;
+    const LOGITS_TOL: f32 = 1e-4;
+
     fn gpu_or_skip() -> Option<()> {
         let probe = probe();
         if !probe.available {
@@ -1614,21 +1802,26 @@ mod layer_tests {
         (got - want).abs()
     }
 
-    /// Registered device-vs-oracle tolerances for the complete fixture
-    /// model (observed worst: hidden 5.4e-7, logits 1.4e-6 over 3 tokens).
-    const HIDDEN_TOL: f32 = 1e-5;
-    const LOGITS_TOL: f32 = 1e-4;
-
     fn device_f32(buf: &MetalBuffer, n: usize) -> Vec<f32> {
         let mut b = vec![0u8; n * 4];
         buf.download(0, &mut b).unwrap();
         bytes_f32(&b)
     }
 
+    fn top1(logits: &[f32]) -> usize {
+        let mut best = 0usize;
+        for (i, v) in logits.iter().enumerate() {
+            if *v > logits[best] {
+                best = i;
+            }
+        }
+        best
+    }
+
     /// Complete fixture-model verification: every served layer executes on
-    /// the device (weights and activations stay on the GPU between
-    /// layers) and each hidden state matches the CPU oracle bit-close;
-    /// the final tied logits agree with the oracle's.
+    /// the device through the single assembled model (weights and
+    /// activations stay on the GPU between layers) and each hidden state
+    /// matches the CPU oracle's activation trace; the tied logits agree.
     #[test]
     fn fixture_device_layers_match_the_cpu_oracle_layer_by_layer() {
         if gpu_or_skip().is_none() {
@@ -1640,86 +1833,128 @@ mod layer_tests {
         std::fs::write(&path, &bytes).unwrap();
         let capacity = 8usize;
         let mut cpu = Qwen35Model::open(&path, capacity, KvPrecision::F16).unwrap();
-        let gpu = Qwen35Gpu::open().unwrap();
-
         let hidden = cpu.config().hidden as usize;
-        let vocab = cpu.config().vocab as usize;
-        let eps = cpu.config().rms_eps;
-
-        let layers: Vec<LayerGpu> = (0..cpu.layout().layers.len())
-            .map(|l| LayerGpu::load(&gpu, &cpu, l, capacity).unwrap())
-            .collect();
-        let output_norm = vec_buf(
-            &gpu,
-            &cpu.read_vector(cpu.layout().output_norm.index).unwrap(),
-        )
-        .unwrap();
-        let tied = DeviceTensor::load(&gpu, &cpu, cpu.layout().token_embd.index).unwrap();
-        let x = zero_buf(&gpu, hidden).unwrap();
-        let h = zero_buf(&gpu, hidden).unwrap();
-        let logits_buf = zero_buf(&gpu, vocab).unwrap();
-        let embed_buf = gpu.buffer(hidden * 2).unwrap();
-        let embed_bytes = cpu.raw_tensor_bytes(cpu.layout().token_embd.index).unwrap();
+        let model = Qwen35GpuModel::load(Qwen35Gpu::open().unwrap(), &cpu, capacity).unwrap();
 
         let tokens = [3u32, 11, 29];
         let mut worst_hidden = 0.0f32;
         let mut worst_logits = 0.0f32;
-        for (pos, token) in tokens.iter().enumerate() {
+        for token in tokens {
             let mut cpu_logits = Vec::new();
             let mut trace = Vec::new();
-            cpu.forward_token_traced(*token, &mut cpu_logits, &mut trace)
+            cpu.forward_token_traced(token, &mut cpu_logits, &mut trace)
                 .unwrap();
 
-            // Embedding row: the fixture's token_embd is F16, uploaded raw.
-            let start = *token as usize * hidden * 2;
-            embed_buf
-                .upload(0, &embed_bytes[start..start + hidden * 2])
+            let mut gpu_logits = Vec::new();
+            model
+                .forward_token_traced(token, &mut gpu_logits, |stage, act| {
+                    let idx = match stage {
+                        Stage::Embedding => 0,
+                        Stage::Layer(l) => l + 1,
+                    };
+                    let gx = device_f32(act, hidden);
+                    for (g, c) in gx.iter().zip(trace[idx].iter()) {
+                        worst_hidden = worst_hidden.max(assert_close(
+                            *g,
+                            *c,
+                            HIDDEN_TOL,
+                            HIDDEN_TOL,
+                            &format!("{stage:?}"),
+                        ));
+                    }
+                    Ok(())
+                })
                 .unwrap();
-            gpu.context()
-                .cast_f16_to_f32(&embed_buf, &x, hidden as u32)
-                .unwrap();
-            let gx = device_f32(&x, hidden);
-            for (g, c) in gx.iter().zip(trace[0].iter()) {
-                worst_hidden =
-                    worst_hidden.max(assert_close(*g, *c, HIDDEN_TOL, HIDDEN_TOL, "embedding"));
-            }
 
-            for (l, layer) in layers.iter().enumerate() {
-                layer.forward(&gpu, &x, pos as u32).unwrap();
-                let gx = device_f32(&x, hidden);
-                for (g, c) in gx.iter().zip(trace[l + 1].iter()) {
-                    worst_hidden = worst_hidden.max(assert_close(
-                        *g,
-                        *c,
-                        HIDDEN_TOL,
-                        HIDDEN_TOL,
-                        &format!("layer {l}"),
-                    ));
-                }
+            for (g, c) in gpu_logits.iter().zip(cpu_logits.iter()) {
+                worst_logits = worst_logits.max((g - c).abs());
             }
-
-            gpu.context()
-                .rmsnorm(&x, &output_norm, &h, 1, hidden as u32, eps)
-                .unwrap();
-            tied.gemv(&gpu, &h, &logits_buf).unwrap();
-            let gpu_logits = device_f32(&logits_buf, vocab);
-            let mut top_gpu = 0usize;
-            let mut top_cpu = 0usize;
-            for i in 0..vocab {
-                if gpu_logits[i] > gpu_logits[top_gpu] {
-                    top_gpu = i;
-                }
-                if cpu_logits[i] > cpu_logits[top_cpu] {
-                    top_cpu = i;
-                }
-                worst_logits = worst_logits.max((gpu_logits[i] - cpu_logits[i]).abs());
-            }
-            assert_eq!(top_gpu, top_cpu, "token {token}: top-1 matches the oracle");
+            assert_eq!(
+                top1(&gpu_logits),
+                top1(&cpu_logits),
+                "token {token}: top-1 matches the oracle"
+            );
         }
         eprintln!(
             "fixture device model: worst hidden|diff| {worst_hidden:.3e}, worst logits|diff| {worst_logits:.3e} over {tokens:?}"
         );
         assert!(worst_hidden <= HIDDEN_TOL, "registered hidden tolerance");
         assert!(worst_logits <= LOGITS_TOL, "registered logits tolerance");
+    }
+
+    /// Q35-2C machine-local gate: the complete pinned 0.8B executes on
+    /// the GPU through the single assembled model and its logits match
+    /// the CPU oracle; the device ledger stays within the accounted
+    /// budget (weights payload + state + per-layer scratch). Run with
+    /// --release for speed.
+    #[test]
+    fn real_artifact_gpu_model_matches_cpu_when_available() {
+        let Some(path) = std::env::var("TUCKMILL_QWEN35_GGUF")
+            .ok()
+            .map(std::path::PathBuf::from)
+            .filter(|p| p.exists())
+        else {
+            eprintln!("skipping: TUCKMILL_QWEN35_GGUF not set (pinned Qwen3.5-0.8B Q8_0)");
+            return;
+        };
+        if gpu_or_skip().is_none() {
+            return;
+        }
+        let capacity = 16usize;
+        let mut cpu = Qwen35Model::open(&path, capacity, KvPrecision::F16).unwrap();
+
+        // Preflight ledger bound from inspected geometry.
+        let insp =
+            tuckmill_manifest::gguf::inspect(&path, &tuckmill_manifest::gguf::Limits::default())
+                .unwrap();
+        let budget =
+            crate::qwen35_forward::required_bytes(&insp, capacity as u64, KvPrecision::F16)
+                .unwrap();
+        let layers = cpu.layout().layers.len() as u64;
+        let accounted = budget
+            .weights_payload
+            .saturating_add(budget.state_total())
+            .saturating_add(budget.scratch.saturating_mul(layers + 4));
+
+        let model = Qwen35GpuModel::load(Qwen35Gpu::open().unwrap(), &cpu, capacity).unwrap();
+        assert!(
+            model.allocated_bytes() <= accounted,
+            "GPU ledger {} exceeds the accounted {} (weights {} + state {} + scratch {} x {} layers)",
+            model.allocated_bytes(),
+            accounted,
+            budget.weights_payload,
+            budget.state_total(),
+            budget.scratch,
+            layers
+        );
+
+        let tokens = [9707u32, 11, 1879, 1000];
+        let mut worst = 0.0f32;
+        for token in tokens {
+            let mut cpu_logits = Vec::new();
+            let mut trace = Vec::new();
+            cpu.forward_token_traced(token, &mut cpu_logits, &mut trace)
+                .unwrap();
+            let mut gpu_logits = Vec::new();
+            model.forward_token(token, &mut gpu_logits).unwrap();
+            for (g, c) in gpu_logits.iter().zip(cpu_logits.iter()) {
+                worst = worst.max((g - c).abs());
+            }
+            assert_eq!(
+                top1(&gpu_logits),
+                top1(&cpu_logits),
+                "token {token}: GPU top-1 matches the CPU oracle"
+            );
+        }
+        eprintln!(
+            "real artifact GPU model: ledger {} B (accounted {accounted} B: weights {} + state {} + scratch {}/layer), worst logits|diff| {worst:.6} over {tokens:?}",
+            model.allocated_bytes(),
+            budget.weights_payload,
+            budget.state_total(),
+            budget.scratch
+        );
+        // Registered GPU-vs-oracle tolerance (observed 4.88e-4 on the
+        // pinned artifact over 4 tokens; recorded in the matrix).
+        assert!(worst <= 2e-3, "registered GPU-vs-oracle logits tolerance");
     }
 }

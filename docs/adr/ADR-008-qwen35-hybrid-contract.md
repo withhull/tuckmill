@@ -276,3 +276,28 @@ never accepted by any real artifact.
   class of bug the pinned-vs-fixture shape pairs exist for.
 - Scope: F16 matrices only; the Q8_0 matrix path and the real-artifact
   upload/preflight land with Q35-2C.
+
+## Addendum 11 (Q35-2C: the complete 0.8B on the GPU)
+
+- **Real-artifact device execution.** `Qwen35GpuModel` assembles the
+  whole served stack on one shared owner: Q8_0 and F16 matrices are
+  uploaded raw (no re-quantization) and projected with the existing
+  kernels, the embedding lookup dequantizes one stored row directly on
+  the device, and the tied head projects to full-vocabulary logits. All
+  weights, activations and state stay on the GPU across the 24 layers.
+- **Ledger honesty.** The device allocation is reported as a single
+  number and asserted against the accounted budget (weights payload +
+  packed KV + recurrent state + per-layer scratch). On the pinned
+  artifact: 825,411,072 B held against 849,597,184 B accounted
+  (weights 822,629,632 + state 20,398,080 + 234,624 B scratch per
+  layer).
+- **Qualification.** Pinned artifact, four tokens: GPU vs the CPU
+  oracle — top-1 identical, worst logits |diff| 4.88e-4 (registered
+  2e-3). Independently against the pinned llama.cpp reference in the
+  same run: max|diff| 0.325343 with identical top-1 — statistically
+  the same declared profile gap the CPU oracle shows (0.325393),
+  confirming the GPU introduces no additional divergence. Fixture
+  layer-by-layer trace comparison remains green (5.4e-7 / 1.4e-6).
+- Scope: sequential per-token decode; prefill batching (Q35-2D) stays
+  gated behind this qualification, and text/chat enablement still
+  waits on Q35-1E.2 plus tokenizer/template support.
