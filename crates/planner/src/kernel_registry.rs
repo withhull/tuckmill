@@ -111,14 +111,17 @@ mod tests {
     #[test]
     fn availability_tracks_registry_status() {
         let r = KernelRegistry::builtin().unwrap();
-        // K01's first increment is available; K03 is not implemented yet,
-        // so a profile requiring it still falls back to the reference path.
+        // K01 (CPU + Metal) and K02 (Metal batched prefill, C3) are
+        // implemented; K03 is not implemented yet, so a profile requiring
+        // it still falls back to the reference path.
         let ids = vec!["K01".to_string(), "K03".to_string()];
         assert!(r.find("K01").unwrap().is_available());
+        assert!(r.find("K02").unwrap().is_available());
         assert!(!r.all_available(&ids), "K03 is not implemented");
         assert_eq!(r.missing(&ids), vec!["K03".to_string()]);
-        assert!(!r.all_available(&["K02".to_string()]));
-        assert_eq!(r.missing(&["K02".to_string()]), vec!["K02".to_string()]);
+        assert!(r.all_available(&["K01".to_string(), "K02".to_string()]));
+        assert!(!r.all_available(&["K04".to_string()]));
+        assert_eq!(r.missing(&["K04".to_string()]), vec!["K04".to_string()]);
     }
 
     #[test]
