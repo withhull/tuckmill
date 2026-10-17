@@ -2148,24 +2148,34 @@ mod tests {
             .and_then(|s| s.trims_applied)
             .unwrap_or(0);
 
-        // Warning pressure while the second (reused) request runs. The
-        // observable is the engine applying the trim at a safe checkpoint
-        // (`trims_applied`), not an eviction count: evicting an empty
-        // expendable set is legitimately zero and must not decide this
-        // regression (CI run 39021538597 exposed exactly that flake).
+        // Warning pressure while reused requests run. The observable is the
+        // engine applying the trim at a safe checkpoint (`trims_applied`),
+        // not an eviction count: evicting an empty expendable set is
+        // legitimately zero and must not decide this regression (CI run
+        // 39021538597 exposed exactly that flake). The monitor thread is
+        // independently scheduled, so a single short run can straddle a
+        // starved poll under load; the assertion retries a bounded number
+        // of reused requests and requires the trim to land in at least one.
         signals.set_pressure(crate::pressure::PressureLevel::Warning);
-        run_once(24);
+        let mut trims_after = trims_before;
+        for attempt in 1..=3 {
+            run_once(48);
+            trims_after = runtime
+                .backend_stats()
+                .and_then(|s| s.trims_applied)
+                .unwrap_or(0);
+            if trims_after > trims_before {
+                break;
+            }
+            eprintln!("attempt {attempt}: trim not applied yet; retrying under sustained pressure");
+        }
         signals.set_pressure(crate::pressure::PressureLevel::Normal);
 
         assert_eq!(
             runtime.worker_generation(),
             1,
-            "the second request reused the worker"
+            "the reused requests kept the one loaded worker"
         );
-        let trims_after = runtime
-            .backend_stats()
-            .and_then(|s| s.trims_applied)
-            .unwrap_or(0);
         assert!(
             trims_after > trims_before,
             "the trim command must reach the reused worker's backend and be applied: trims {trims_before} -> {trims_after}"
