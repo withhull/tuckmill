@@ -484,6 +484,7 @@ dependencies = [
  "serde_json",
  "tempfile",
  "tuckmill-backend",
+ "tuckmill-llamaref",
  "tuckmill-manifest",
  "tuckmill-planner",
  "tuckmill-store",
