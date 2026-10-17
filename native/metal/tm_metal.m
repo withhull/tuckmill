@@ -9,6 +9,7 @@
 #import <Metal/Metal.h>
 
 #include <stdatomic.h>
+#include <unistd.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -33,6 +34,11 @@ struct tm_metal_ctx {
     id<MTLComputePipelineState> pso_silu;
     id<MTLComputePipelineState> pso_f16row;
     id<MTLComputePipelineState> pso_rmsnorm_f16w;
+    id<MTLComputePipelineState> pso_q8gemm;
+    id<MTLComputePipelineState> pso_f16gemm;
+    id<MTLComputePipelineState> pso_rope_batch;
+    id<MTLComputePipelineState> pso_kvstore_batch;
+    id<MTLComputePipelineState> pso_attention_batch;
     /* Last committed command buffer (retained); the queue executes in
      * order, so waiting on it fences everything committed before it. */
     id<MTLCommandBuffer> pending;
@@ -46,6 +52,12 @@ struct tm_metal_ctx {
     _Atomic(uint64_t) completed;
     _Atomic(uint64_t) last_gpu_nanos;
     _Atomic(uint64_t) allocated;
+    /* Bytes leased by pending command buffers: physically alive until the
+     * completion handler runs, even if their handles were already freed.
+     * Combined with `allocated` this bounds live GPU bytes from above (a
+     * buffer that is both handle-live and in flight is counted twice; the
+     * bound is conservative, never understated). */
+    _Atomic(uint64_t) leased;
 };
 
 struct tm_metal_buffer {
@@ -101,6 +113,11 @@ static int tm_commit(tm_metal_ctx *ctx, id<MTLCommandBuffer> cb, NSArray *in_fli
                      char *err, size_t cap) {
     (void)err;
     (void)cap;
+    uint64_t leased = 0;
+    for (id<MTLBuffer> buffer in in_flight) {
+        leased += (uint64_t)buffer.length;
+    }
+    atomic_fetch_add_explicit(&ctx->leased, leased, memory_order_relaxed);
     atomic_fetch_add_explicit(&ctx->committed, 1, memory_order_relaxed);
     if (ctx->pending != nil) {
         [ctx->pending release];
@@ -112,6 +129,7 @@ static int tm_commit(tm_metal_ctx *ctx, id<MTLCommandBuffer> cb, NSArray *in_fli
          * leased MTLBuffer) alive until completion; the array is released
          * with the handler afterwards. */
         (void)in_flight.count;
+        atomic_fetch_sub_explicit(&c->leased, leased, memory_order_relaxed);
         double nanos = (buffer.GPUEndTime - buffer.GPUStartTime) * 1e9;
         if (nanos < 0.0) {
             nanos = 0.0;
@@ -137,7 +155,20 @@ static int tm_wait_pending(tm_metal_ctx *ctx, char *err, size_t cap) {
                                                       ? [ctx->pending.error localizedDescription]
                                                       : @"unknown"]);
     }
-    return TM_METAL_OK;
+    /* waitUntilCompleted signals execution completion; addCompletedHandler
+     * blocks are scheduled separately and may still be pending. Settlement
+     * of the counter/lease accounting is part of the fence contract (the
+     * in-flight byte figure must drop to zero when the fence returns), so
+     * wait briefly for the handlers to run. Bounded: execution is already
+     * complete, so this only covers scheduling latency. */
+    for (int spin = 0; spin < 2000; ++spin) {
+        if (atomic_load_explicit(&ctx->completed, memory_order_relaxed) ==
+            atomic_load_explicit(&ctx->committed, memory_order_relaxed)) {
+            return TM_METAL_OK;
+        }
+        usleep(50);
+    }
+    return TM_METAL_OK; /* accounting may settle late; never an execution error */
 }
 
 int tm_metal_available(void) {
@@ -229,11 +260,19 @@ tm_metal_ctx *tm_metal_create(const char *msl_source, char *err, size_t err_cap)
         ctx->pso_silu = tm_pipeline(ctx, @"tm_silu_mul_f32", &error);
         ctx->pso_f16row = tm_pipeline(ctx, @"tm_f16_row_f32", &error);
         ctx->pso_rmsnorm_f16w = tm_pipeline(ctx, @"tm_rmsnorm_f16w", &error);
+        ctx->pso_q8gemm = tm_pipeline(ctx, @"tm_q8_0_gemm", &error);
+        ctx->pso_f16gemm = tm_pipeline(ctx, @"tm_f16_gemm", &error);
+        ctx->pso_rope_batch = tm_pipeline(ctx, @"tm_rope_batch_f32", &error);
+        ctx->pso_kvstore_batch = tm_pipeline(ctx, @"tm_kv_store_batch_f32", &error);
+        ctx->pso_attention_batch = tm_pipeline(ctx, @"tm_attention_batch_f32", &error);
         if (ctx->pso_scale == nil || ctx->pso_axpy == nil || ctx->pso_f16f32 == nil ||
             ctx->pso_f32f16 == nil || ctx->pso_q8gemv == nil || ctx->pso_f16gemv == nil ||
             ctx->pso_q8row == nil || ctx->pso_rmsnorm == nil || ctx->pso_rope == nil ||
             ctx->pso_kvstore == nil || ctx->pso_attention == nil || ctx->pso_silu == nil ||
-            ctx->pso_f16row == nil || ctx->pso_rmsnorm_f16w == nil) {
+            ctx->pso_f16row == nil || ctx->pso_rmsnorm_f16w == nil ||
+            ctx->pso_q8gemm == nil || ctx->pso_f16gemm == nil ||
+            ctx->pso_rope_batch == nil || ctx->pso_kvstore_batch == nil ||
+            ctx->pso_attention_batch == nil) {
             tm_set_err(err, err_cap,
                        [NSString stringWithFormat:@"pipeline creation failed: %@",
                                                   error != nil ? [error localizedDescription] : @"unknown"]);
@@ -244,6 +283,7 @@ tm_metal_ctx *tm_metal_create(const char *msl_source, char *err, size_t err_cap)
         atomic_init(&ctx->completed, 0);
         atomic_init(&ctx->last_gpu_nanos, 0);
         atomic_init(&ctx->allocated, 0);
+        atomic_init(&ctx->leased, 0);
         return ctx;
     }
 }
@@ -274,6 +314,11 @@ void tm_metal_destroy(tm_metal_ctx *ctx) {
             fprintf(stderr, "tm_metal: %llu bytes still allocated at destroy; buffer lifetime bug\n",
                     (unsigned long long)still_allocated);
         }
+        [ctx->pso_attention_batch release];
+        [ctx->pso_kvstore_batch release];
+        [ctx->pso_rope_batch release];
+        [ctx->pso_f16gemm release];
+        [ctx->pso_q8gemm release];
         [ctx->pso_rmsnorm_f16w release];
         [ctx->pso_f16row release];
         [ctx->pso_silu release];
@@ -680,7 +725,7 @@ int tm_metal_f16_gemv(tm_metal_ctx *ctx, tm_metal_buffer *w, tm_metal_buffer *x,
 }
 
 int tm_metal_q8_0_row_f32(tm_metal_ctx *ctx, tm_metal_buffer *w, tm_metal_buffer *out,
-                          uint32_t row, uint32_t cols, char *err, size_t err_cap) {
+                          uint32_t row, uint32_t cols, uint32_t out_off, char *err, size_t err_cap) {
     if (tm_check_ctx(ctx, err, err_cap, "q8_0_row") != TM_METAL_OK) {
         return TM_METAL_ERR_UNSUPPORTED;
     }
@@ -690,7 +735,7 @@ int tm_metal_q8_0_row_f32(tm_metal_ctx *ctx, tm_metal_buffer *w, tm_metal_buffer
     }
     size_t w_need = ((size_t)row + 1u) * ((size_t)cols / 32u) * 34u;
     if (tm_check_buffer(ctx, w, w_need, err, err_cap, "q8_0_row.weights") != TM_METAL_OK ||
-        tm_check_buffer(ctx, out, (size_t)cols * 4u, err, err_cap, "q8_0_row.out") != TM_METAL_OK) {
+        tm_check_buffer(ctx, out, ((size_t)out_off + cols) * 4u, err, err_cap, "q8_0_row.out") != TM_METAL_OK) {
         return TM_METAL_ERR_BOUNDS;
     }
     @autoreleasepool {
@@ -707,6 +752,7 @@ int tm_metal_q8_0_row_f32(tm_metal_ctx *ctx, tm_metal_buffer *w, tm_metal_buffer
         [f.keep addObject:out->buffer];
         [enc setBytes:&row length:sizeof(row) atIndex:2];
         [enc setBytes:&cols length:sizeof(cols) atIndex:3];
+        [enc setBytes:&out_off length:sizeof(out_off) atIndex:4];
         NSUInteger tg = 256;
         NSUInteger width = ctx->pso_q8row.threadExecutionWidth;
         if (width > 0 && width < tg) { tg = width * 8; }
@@ -945,7 +991,7 @@ int tm_metal_rmsnorm_f16w(tm_metal_ctx *ctx, tm_metal_buffer *x, tm_metal_buffer
 }
 
 int tm_metal_f16_row_f32(tm_metal_ctx *ctx, tm_metal_buffer *w, tm_metal_buffer *out,
-                         uint32_t row, uint32_t cols, char *err, size_t err_cap) {
+                         uint32_t row, uint32_t cols, uint32_t out_off, char *err, size_t err_cap) {
     if (tm_check_ctx(ctx, err, err_cap, "f16_row") != TM_METAL_OK) {
         return TM_METAL_ERR_UNSUPPORTED;
     }
@@ -954,7 +1000,7 @@ int tm_metal_f16_row_f32(tm_metal_ctx *ctx, tm_metal_buffer *w, tm_metal_buffer 
     }
     size_t w_need = ((size_t)row + 1u) * (size_t)cols * 2u;
     if (tm_check_buffer(ctx, w, w_need, err, err_cap, "f16_row.weights") != TM_METAL_OK ||
-        tm_check_buffer(ctx, out, (size_t)cols * 4u, err, err_cap, "f16_row.out") != TM_METAL_OK) {
+        tm_check_buffer(ctx, out, ((size_t)out_off + cols) * 4u, err, err_cap, "f16_row.out") != TM_METAL_OK) {
         return TM_METAL_ERR_BOUNDS;
     }
     @autoreleasepool {
@@ -970,10 +1016,219 @@ int tm_metal_f16_row_f32(tm_metal_ctx *ctx, tm_metal_buffer *w, tm_metal_buffer 
         [f.keep addObject:out->buffer];
         [enc setBytes:&row length:sizeof(row) atIndex:2];
         [enc setBytes:&cols length:sizeof(cols) atIndex:3];
+        [enc setBytes:&out_off length:sizeof(out_off) atIndex:4];
         NSUInteger tg = 256;
         [enc dispatchThreads:MTLSizeMake((NSUInteger)cols, 1, 1)
             threadsPerThreadgroup:MTLSizeMake(tg, 1, 1)];
         return tm_frame_commit(ctx, &f, err, err_cap, "f16_row");
+    }
+}
+
+static int tm_gemm_dispatch(tm_metal_ctx *ctx, id<MTLComputePipelineState> pso,
+                            tm_metal_buffer *w, size_t w_need, tm_metal_buffer *x,
+                            tm_metal_buffer *y, uint32_t rows, uint32_t cols, uint32_t batch,
+                            uint32_t x_off, uint32_t y_off, char *err, size_t err_cap,
+                            const char *what) {
+    if (tm_check_ctx(ctx, err, err_cap, what) != TM_METAL_OK) {
+        return TM_METAL_ERR_UNSUPPORTED;
+    }
+    if (rows == 0 || cols == 0 || batch == 0 || batch > 32) {
+        return tm_fail(err, err_cap, TM_METAL_ERR_UNSUPPORTED,
+                       [NSString stringWithFormat:@"%s: rows %u, cols %u, batch %u (1..=32)",
+                                                  what, rows, cols, batch]);
+    }
+    size_t x_need = ((size_t)x_off + (size_t)batch * (size_t)cols) * 4u;
+    size_t y_need = ((size_t)y_off + (size_t)batch * (size_t)rows) * 4u;
+    if (tm_check_buffer(ctx, w, w_need, err, err_cap, "gemm.weights") != TM_METAL_OK ||
+        tm_check_buffer(ctx, x, x_need, err, err_cap, "gemm.x") != TM_METAL_OK ||
+        tm_check_buffer(ctx, y, y_need, err, err_cap, "gemm.y") != TM_METAL_OK) {
+        return TM_METAL_ERR_BOUNDS;
+    }
+    @autoreleasepool {
+        tm_frame f;
+        id<MTLComputeCommandEncoder> enc = tm_frame_open(ctx, &f);
+        if (enc == nil) {
+            return tm_fail(err, err_cap, TM_METAL_ERR_INTERNAL,
+                           [NSString stringWithFormat:@"%s: no encoder", what]);
+        }
+        [enc setComputePipelineState:pso];
+        [enc setBuffer:w->buffer offset:0 atIndex:0];
+        [enc setBuffer:x->buffer offset:0 atIndex:1];
+        [enc setBuffer:y->buffer offset:0 atIndex:2];
+        [f.keep addObject:w->buffer];
+        [f.keep addObject:x->buffer];
+        [f.keep addObject:y->buffer];
+        [enc setBytes:&rows length:sizeof(rows) atIndex:3];
+        [enc setBytes:&cols length:sizeof(cols) atIndex:4];
+        [enc setBytes:&batch length:sizeof(batch) atIndex:5];
+        [enc setBytes:&x_off length:sizeof(x_off) atIndex:6];
+        [enc setBytes:&y_off length:sizeof(y_off) atIndex:7];
+        [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)rows, 1, 1)
+            threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+        return tm_frame_commit(ctx, &f, err, err_cap, what);
+    }
+}
+
+int tm_metal_q8_0_gemm(tm_metal_ctx *ctx, tm_metal_buffer *w, tm_metal_buffer *x,
+                       tm_metal_buffer *y, uint32_t rows, uint32_t cols, uint32_t batch,
+                       uint32_t x_off, uint32_t y_off, char *err, size_t err_cap) {
+    if (cols == 0 || (cols % 32u) != 0u) {
+        return tm_fail(err, err_cap, TM_METAL_ERR_UNSUPPORTED,
+                       @"q8_0_gemm: cols must be a positive multiple of 32");
+    }
+    size_t w_need = (size_t)rows * ((size_t)cols / 32u) * 34u;
+    return tm_gemm_dispatch(ctx, ctx->pso_q8gemm, w, w_need, x, y, rows, cols, batch, x_off,
+                            y_off, err, err_cap, "q8_0_gemm");
+}
+
+int tm_metal_f16_gemm(tm_metal_ctx *ctx, tm_metal_buffer *w, tm_metal_buffer *x,
+                      tm_metal_buffer *y, uint32_t rows, uint32_t cols, uint32_t batch,
+                      uint32_t x_off, uint32_t y_off, char *err, size_t err_cap) {
+    size_t w_need = (size_t)rows * (size_t)cols * 2u;
+    return tm_gemm_dispatch(ctx, ctx->pso_f16gemm, w, w_need, x, y, rows, cols, batch, x_off,
+                            y_off, err, err_cap, "f16_gemm");
+}
+
+int tm_metal_rope_batch_f32(tm_metal_ctx *ctx, tm_metal_buffer *q, tm_metal_buffer *k,
+                            tm_metal_buffer *inv_freq, uint32_t start_pos, uint32_t n_tokens,
+                            uint32_t n_q_heads, uint32_t n_kv_heads, uint32_t head_dim,
+                            char *err, size_t err_cap) {
+    if (tm_check_ctx(ctx, err, err_cap, "rope_batch") != TM_METAL_OK) {
+        return TM_METAL_ERR_UNSUPPORTED;
+    }
+    if (head_dim == 0 || (head_dim % 2u) != 0u || n_tokens == 0 || n_q_heads == 0) {
+        return tm_fail(err, err_cap, TM_METAL_ERR_UNSUPPORTED, @"rope_batch: shape");
+    }
+    size_t q_need = (size_t)n_tokens * n_q_heads * head_dim * 4u;
+    size_t k_need = (size_t)n_tokens * n_kv_heads * head_dim * 4u;
+    if (tm_check_buffer(ctx, q, q_need, err, err_cap, "rope_batch.q") != TM_METAL_OK ||
+        tm_check_buffer(ctx, k, k_need, err, err_cap, "rope_batch.k") != TM_METAL_OK ||
+        tm_check_buffer(ctx, inv_freq, (size_t)(head_dim / 2u) * 4u, err, err_cap, "rope_batch.inv_freq") != TM_METAL_OK) {
+        return TM_METAL_ERR_BOUNDS;
+    }
+    @autoreleasepool {
+        tm_frame f;
+        id<MTLComputeCommandEncoder> enc = tm_frame_open(ctx, &f);
+        if (enc == nil) {
+            return tm_fail(err, err_cap, TM_METAL_ERR_INTERNAL, @"rope_batch: no encoder");
+        }
+        [enc setComputePipelineState:ctx->pso_rope_batch];
+        [enc setBuffer:q->buffer offset:0 atIndex:0];
+        [enc setBuffer:k->buffer offset:0 atIndex:1];
+        [enc setBuffer:inv_freq->buffer offset:0 atIndex:2];
+        [f.keep addObject:q->buffer];
+        [f.keep addObject:k->buffer];
+        [f.keep addObject:inv_freq->buffer];
+        [enc setBytes:&start_pos length:sizeof(start_pos) atIndex:3];
+        [enc setBytes:&n_tokens length:sizeof(n_tokens) atIndex:4];
+        [enc setBytes:&n_q_heads length:sizeof(n_q_heads) atIndex:5];
+        [enc setBytes:&n_kv_heads length:sizeof(n_kv_heads) atIndex:6];
+        [enc setBytes:&head_dim length:sizeof(head_dim) atIndex:7];
+        [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)n_tokens * (n_q_heads + n_kv_heads), 1, 1)
+            threadsPerThreadgroup:MTLSizeMake(head_dim / 2u, 1, 1)];
+        return tm_frame_commit(ctx, &f, err, err_cap, "rope_batch");
+    }
+}
+
+int tm_metal_kv_store_batch_f32(tm_metal_ctx *ctx, tm_metal_buffer *k_src, tm_metal_buffer *v_src,
+                                tm_metal_buffer *k_cache, tm_metal_buffer *v_cache,
+                                uint32_t n_tokens, uint32_t start_pos, uint32_t cap,
+                                uint32_t head_dim, uint32_t kv_heads, uint32_t round_f16,
+                                char *err, size_t err_cap) {
+    if (tm_check_ctx(ctx, err, err_cap, "kv_store_batch") != TM_METAL_OK) {
+        return TM_METAL_ERR_UNSUPPORTED;
+    }
+    if (n_tokens == 0 || start_pos + n_tokens > cap || head_dim == 0) {
+        return tm_fail(err, err_cap, TM_METAL_ERR_BOUNDS, @"kv_store_batch: range");
+    }
+    size_t src_need = (size_t)n_tokens * kv_heads * head_dim * 4u;
+    size_t cache_need = (size_t)kv_heads * cap * head_dim * 4u;
+    if (tm_check_buffer(ctx, k_src, src_need, err, err_cap, "kv_store_batch.k_src") != TM_METAL_OK ||
+        tm_check_buffer(ctx, v_src, src_need, err, err_cap, "kv_store_batch.v_src") != TM_METAL_OK ||
+        tm_check_buffer(ctx, k_cache, cache_need, err, err_cap, "kv_store_batch.k_cache") != TM_METAL_OK ||
+        tm_check_buffer(ctx, v_cache, cache_need, err, err_cap, "kv_store_batch.v_cache") != TM_METAL_OK) {
+        return TM_METAL_ERR_BOUNDS;
+    }
+    @autoreleasepool {
+        tm_frame f;
+        id<MTLComputeCommandEncoder> enc = tm_frame_open(ctx, &f);
+        if (enc == nil) {
+            return tm_fail(err, err_cap, TM_METAL_ERR_INTERNAL, @"kv_store_batch: no encoder");
+        }
+        [enc setComputePipelineState:ctx->pso_kvstore_batch];
+        [enc setBuffer:k_src->buffer offset:0 atIndex:0];
+        [enc setBuffer:v_src->buffer offset:0 atIndex:1];
+        [enc setBuffer:k_cache->buffer offset:0 atIndex:2];
+        [enc setBuffer:v_cache->buffer offset:0 atIndex:3];
+        [f.keep addObject:k_src->buffer];
+        [f.keep addObject:v_src->buffer];
+        [f.keep addObject:k_cache->buffer];
+        [f.keep addObject:v_cache->buffer];
+        [enc setBytes:&n_tokens length:sizeof(n_tokens) atIndex:4];
+        [enc setBytes:&start_pos length:sizeof(start_pos) atIndex:5];
+        [enc setBytes:&cap length:sizeof(cap) atIndex:6];
+        [enc setBytes:&head_dim length:sizeof(head_dim) atIndex:7];
+        [enc setBytes:&kv_heads length:sizeof(kv_heads) atIndex:8];
+        [enc setBytes:&round_f16 length:sizeof(round_f16) atIndex:9];
+        [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)n_tokens * kv_heads, 1, 1)
+            threadsPerThreadgroup:MTLSizeMake((NSUInteger)head_dim, 1, 1)];
+        return tm_frame_commit(ctx, &f, err, err_cap, "kv_store_batch");
+    }
+}
+
+int tm_metal_attention_batch_f32(tm_metal_ctx *ctx, tm_metal_buffer *q, tm_metal_buffer *k_cache,
+                                 tm_metal_buffer *v_cache, tm_metal_buffer *out,
+                                 tm_metal_buffer *scratch, uint32_t heads, uint32_t n_tokens,
+                                 uint32_t start_pos, uint32_t cap, uint32_t head_dim,
+                                 uint32_t group, float scale, char *err, size_t err_cap) {
+    if (tm_check_ctx(ctx, err, err_cap, "attention_batch") != TM_METAL_OK) {
+        return TM_METAL_ERR_UNSUPPORTED;
+    }
+    if (heads == 0 || group == 0 || n_tokens == 0 || head_dim == 0 ||
+        start_pos + n_tokens > cap) {
+        return tm_fail(err, err_cap, TM_METAL_ERR_BOUNDS, @"attention_batch: shape");
+    }
+    uint32_t kv_heads = heads / group;
+    if (kv_heads * group != heads) {
+        return tm_fail(err, err_cap, TM_METAL_ERR_UNSUPPORTED, @"attention_batch: heads/group");
+    }
+    size_t q_need = (size_t)n_tokens * heads * head_dim * 4u;
+    size_t cache_need = (size_t)kv_heads * cap * head_dim * 4u;
+    size_t scratch_need = (size_t)n_tokens * heads * cap * 4u;
+    if (tm_check_buffer(ctx, q, q_need, err, err_cap, "attention_batch.q") != TM_METAL_OK ||
+        tm_check_buffer(ctx, k_cache, cache_need, err, err_cap, "attention_batch.k_cache") != TM_METAL_OK ||
+        tm_check_buffer(ctx, v_cache, cache_need, err, err_cap, "attention_batch.v_cache") != TM_METAL_OK ||
+        tm_check_buffer(ctx, out, q_need, err, err_cap, "attention_batch.out") != TM_METAL_OK ||
+        tm_check_buffer(ctx, scratch, scratch_need, err, err_cap, "attention_batch.scratch") != TM_METAL_OK) {
+        return TM_METAL_ERR_BOUNDS;
+    }
+    @autoreleasepool {
+        tm_frame f;
+        id<MTLComputeCommandEncoder> enc = tm_frame_open(ctx, &f);
+        if (enc == nil) {
+            return tm_fail(err, err_cap, TM_METAL_ERR_INTERNAL, @"attention_batch: no encoder");
+        }
+        [enc setComputePipelineState:ctx->pso_attention_batch];
+        [enc setBuffer:q->buffer offset:0 atIndex:0];
+        [enc setBuffer:k_cache->buffer offset:0 atIndex:1];
+        [enc setBuffer:v_cache->buffer offset:0 atIndex:2];
+        [enc setBuffer:out->buffer offset:0 atIndex:3];
+        [enc setBuffer:scratch->buffer offset:0 atIndex:4];
+        [f.keep addObject:q->buffer];
+        [f.keep addObject:k_cache->buffer];
+        [f.keep addObject:v_cache->buffer];
+        [f.keep addObject:out->buffer];
+        [f.keep addObject:scratch->buffer];
+        [enc setBytes:&heads length:sizeof(heads) atIndex:5];
+        [enc setBytes:&n_tokens length:sizeof(n_tokens) atIndex:6];
+        [enc setBytes:&start_pos length:sizeof(start_pos) atIndex:7];
+        [enc setBytes:&cap length:sizeof(cap) atIndex:8];
+        [enc setBytes:&head_dim length:sizeof(head_dim) atIndex:9];
+        [enc setBytes:&group length:sizeof(group) atIndex:10];
+        [enc setBytes:&scale length:sizeof(scale) atIndex:11];
+        [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)n_tokens * heads, 1, 1)
+            threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+        return tm_frame_commit(ctx, &f, err, err_cap, "attention_batch");
     }
 }
 
@@ -1005,4 +1260,8 @@ double tm_metal_last_gpu_ms(const tm_metal_ctx *ctx) {
 
 uint64_t tm_metal_allocated_bytes(const tm_metal_ctx *ctx) {
     return ctx == NULL ? 0 : atomic_load_explicit(&ctx->allocated, memory_order_relaxed);
+}
+
+uint64_t tm_metal_in_flight_bytes(const tm_metal_ctx *ctx) {
+    return ctx == NULL ? 0 : atomic_load_explicit(&ctx->leased, memory_order_relaxed);
 }

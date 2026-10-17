@@ -98,6 +98,7 @@ kernel void tm_q8_0_row_f32(device const uchar *w [[buffer(0)]],
                             device float *out [[buffer(1)]],
                             constant uint &row [[buffer(2)]],
                             constant uint &cols [[buffer(3)]],
+                            constant uint &out_off [[buffer(4)]],
                             uint gid [[thread_position_in_grid]]) {
     if (gid >= cols) {
         return;
@@ -109,7 +110,7 @@ kernel void tm_q8_0_row_f32(device const uchar *w [[buffer(0)]],
     const device uchar *blk = wrow + (size_t)b * 34u;
     const float d = (float)(*(const device half *)blk);
     const float q = (float)((const device char *)(blk + 2))[lane];
-    out[gid] = d * q;
+    out[out_off + gid] = d * q;
 }
 
 /* F16 matvec: y[r] = dot(f32(w_row_r), x). Lane-strided within one SIMD
@@ -351,11 +352,12 @@ kernel void tm_f16_row_f32(device const half *w [[buffer(0)]],
                            device float *out [[buffer(1)]],
                            constant uint &row [[buffer(2)]],
                            constant uint &cols [[buffer(3)]],
+                           constant uint &out_off [[buffer(4)]],
                            uint gid [[thread_position_in_grid]]) {
     if (gid >= cols) {
         return;
     }
-    out[gid] = (float)w[(size_t)row * (size_t)cols + gid];
+    out[out_off + gid] = (float)w[(size_t)row * (size_t)cols + gid];
 }
 
 /* RMSNorm with an F16-weight table (fixture/F16-twin artifacts). */
@@ -379,5 +381,248 @@ kernel void tm_rmsnorm_f16w(device const float *x [[buffer(0)]],
     const float rms = 1.0f / sqrt(sumsq / (float)cols + eps);
     for (uint i = tid; i < cols; i += 128u) {
         yrow[i] = xrow[i] * rms * (float)weight[i];
+    }
+}
+
+/* ---------------- C3: batched prefill kernels ---------------- */
+
+/*
+ * Batched packed Q8_0 GEMM: Y[b, :] = W · X[b, :] for b < batch. One SIMD
+ * group per output row; each q element is loaded once and FMA'd across the
+ * whole batch, so weight traffic does not multiply with batch size. Per-b
+ * accumulation order is identical to the single-token GEMV (blocks in
+ * order, same simd_sum), so batch=1 is bit-identical to tm_q8_0_gemv.
+ * X is [batch, cols] at element offset `x_off`; Y is [batch, rows] at
+ * `y_off`; batch must be 1..=32 (validated C-side).
+ */
+kernel void tm_q8_0_gemm(device const uchar *w [[buffer(0)]],
+                         device const float *x [[buffer(1)]],
+                         device float *y [[buffer(2)]],
+                         constant uint &rows [[buffer(3)]],
+                         constant uint &cols [[buffer(4)]],
+                         constant uint &batch [[buffer(5)]],
+                         constant uint &x_off [[buffer(6)]],
+                         constant uint &y_off [[buffer(7)]],
+                         uint row [[threadgroup_position_in_grid]],
+                         uint lane [[thread_position_in_threadgroup]]) {
+    if (row >= rows || batch == 0u || batch > 32u) {
+        return;
+    }
+    const uint blocks = cols / 32u;
+    const device uchar *wrow = w + (size_t)row * (size_t)blocks * 34u;
+    float acc[32];
+    for (uint b = 0; b < batch; ++b) {
+        acc[b] = 0.0f;
+    }
+    for (uint blk = 0; blk < blocks; ++blk) {
+        const device uchar *block = wrow + (size_t)blk * 34u;
+        const float d = (float)(*(const device half *)block);
+        const float q = (float)((const device char *)(block + 2))[lane];
+        const uint col = blk * 32u + lane;
+        for (uint b = 0; b < batch; ++b) {
+            acc[b] += d * q * x[x_off + b * cols + col];
+        }
+    }
+    for (uint b = 0; b < batch; ++b) {
+        const float total = simd_sum(acc[b]);
+        if (lane == 0u) {
+            y[y_off + b * rows + row] = total;
+        }
+    }
+}
+
+/* Batched F16 GEMM with the same contract as tm_q8_0_gemm. */
+kernel void tm_f16_gemm(device const half *w [[buffer(0)]],
+                        device const float *x [[buffer(1)]],
+                        device float *y [[buffer(2)]],
+                        constant uint &rows [[buffer(3)]],
+                        constant uint &cols [[buffer(4)]],
+                        constant uint &batch [[buffer(5)]],
+                        constant uint &x_off [[buffer(6)]],
+                        constant uint &y_off [[buffer(7)]],
+                        uint row [[threadgroup_position_in_grid]],
+                        uint lane [[thread_position_in_threadgroup]]) {
+    if (row >= rows || batch == 0u || batch > 32u) {
+        return;
+    }
+    const device half *wrow = w + (size_t)row * (size_t)cols;
+    float acc[32];
+    for (uint b = 0; b < batch; ++b) {
+        acc[b] = 0.0f;
+    }
+    for (uint i = lane; i < cols; i += 32u) {
+        const float wv = (float)wrow[i];
+        for (uint b = 0; b < batch; ++b) {
+            acc[b] += wv * x[x_off + b * cols + i];
+        }
+    }
+    for (uint b = 0; b < batch; ++b) {
+        const float total = simd_sum(acc[b]);
+        if (lane == 0u) {
+            y[y_off + b * rows + row] = total;
+        }
+    }
+}
+
+/*
+ * Batched NeoX RoPE: rows = n_tokens * (n_q_heads + n_kv_heads); the first
+ * n_tokens*n_q_heads rows rotate q, the rest rotate k. Token t is rotated
+ * at position start_pos + t, so a prefilled chunk matches single-token
+ * semantics exactly (same angles, same pair order).
+ */
+kernel void tm_rope_batch_f32(device float *q [[buffer(0)]],
+                              device float *k [[buffer(1)]],
+                              device const float *inv_freq [[buffer(2)]],
+                              constant uint &start_pos [[buffer(3)]],
+                              constant uint &n_tokens [[buffer(4)]],
+                              constant uint &n_q_heads [[buffer(5)]],
+                              constant uint &n_kv_heads [[buffer(6)]],
+                              constant uint &head_dim [[buffer(7)]],
+                              uint row [[threadgroup_position_in_grid]],
+                              uint lane [[thread_position_in_threadgroup]]) {
+    const uint half_dim = head_dim / 2u;
+    if (lane >= half_dim) {
+        return;
+    }
+    const uint q_rows = n_tokens * n_q_heads;
+    const uint total_rows = q_rows + n_tokens * n_kv_heads;
+    if (row >= total_rows) {
+        return;
+    }
+    const bool is_q = row < q_rows;
+    const uint t = is_q ? row / n_q_heads : (row - q_rows) / n_kv_heads;
+    const uint head = is_q ? row % n_q_heads : (row - q_rows) % n_kv_heads;
+    const uint heads = is_q ? n_q_heads : n_kv_heads;
+    device float *base = is_q ? q : k;
+    device float *r = base + ((size_t)t * heads + head) * (size_t)head_dim;
+    const float angle = (float)(start_pos + t) * inv_freq[lane];
+    const float c = cos(angle);
+    const float s = sin(angle);
+    const float a = r[lane];
+    const float bb = r[lane + half_dim];
+    r[lane] = a * c - bb * s;
+    r[lane + half_dim] = a * s + bb * c;
+}
+
+/* Batched KV writes: rows = n_tokens * kv_heads; token t lands at
+ * start_pos + t. Same f16 rounding contract as the single-token kernel. */
+kernel void tm_kv_store_batch_f32(device const float *k_src [[buffer(0)]],
+                                  device const float *v_src [[buffer(1)]],
+                                  device float *k_cache [[buffer(2)]],
+                                  device float *v_cache [[buffer(3)]],
+                                  constant uint &n_tokens [[buffer(4)]],
+                                  constant uint &start_pos [[buffer(5)]],
+                                  constant uint &cap [[buffer(6)]],
+                                  constant uint &head_dim [[buffer(7)]],
+                                  constant uint &kv_heads [[buffer(8)]],
+                                  constant uint &round_f16 [[buffer(9)]],
+                                  uint row [[threadgroup_position_in_grid]],
+                                  uint lane [[thread_position_in_threadgroup]]) {
+    if (lane >= head_dim) {
+        return;
+    }
+    const uint t = row / kv_heads;
+    const uint head = row % kv_heads;
+    if (t >= n_tokens) {
+        return;
+    }
+    const uint pos = start_pos + t;
+    const size_t src = ((size_t)t * kv_heads + head) * (size_t)head_dim + lane;
+    const size_t dst = ((size_t)head * (size_t)cap + (size_t)pos) * (size_t)head_dim + lane;
+    if (round_f16 != 0u) {
+        k_cache[dst] = (float)(half)k_src[src];
+        v_cache[dst] = (float)(half)v_src[src];
+    } else {
+        k_cache[dst] = k_src[src];
+        v_cache[dst] = v_src[src];
+    }
+}
+
+/*
+ * Batched causal GQA attention: one threadgroup per (token, query head);
+ * query token t attends keys 0..=(start_pos + t) — exactly the masking and
+ * arithmetic of the single-token kernel per (t, head). Scratch region is
+ * (t * heads + head) * cap floats.
+ */
+kernel void tm_attention_batch_f32(device const float *q [[buffer(0)]],
+                                   device const float *k_cache [[buffer(1)]],
+                                   device const float *v_cache [[buffer(2)]],
+                                   device float *out [[buffer(3)]],
+                                   device float *scratch [[buffer(4)]],
+                                   constant uint &heads [[buffer(5)]],
+                                   constant uint &n_tokens [[buffer(6)]],
+                                   constant uint &start_pos [[buffer(7)]],
+                                   constant uint &cap [[buffer(8)]],
+                                   constant uint &head_dim [[buffer(9)]],
+                                   constant uint &group [[buffer(10)]],
+                                   constant float &scale [[buffer(11)]],
+                                   uint gid [[threadgroup_position_in_grid]],
+                                   uint tid [[thread_position_in_threadgroup]],
+                                   uint lane [[thread_index_in_simdgroup]],
+                                   uint simd_group [[simdgroup_index_in_threadgroup]]) {
+    threadgroup float reduce_scratch[4];
+    threadgroup float row_stats[2];
+    const uint t = gid / heads;
+    const uint head = gid % heads;
+    if (t >= n_tokens) {
+        return;
+    }
+    const uint pos = start_pos + t;
+    const uint seq = pos + 1u;
+    const uint kv_head = head / group;
+    const device float *qh = q + ((size_t)t * heads + head) * (size_t)head_dim;
+    const device float *kc = k_cache + ((size_t)kv_head * (size_t)cap) * (size_t)head_dim;
+    const device float *vc = v_cache + ((size_t)kv_head * (size_t)cap) * (size_t)head_dim;
+    device float *oh = out + ((size_t)t * heads + head) * (size_t)head_dim;
+    device float *head_scratch = scratch + ((size_t)t * heads + head) * (size_t)cap;
+
+    for (uint j = 0; j < seq; ++j) {
+        float part = 0.0f;
+        for (uint d = tid; d < head_dim; d += 128u) {
+            part += qh[d] * kc[(size_t)j * (size_t)head_dim + d];
+        }
+        const float s = tm_reduce_sum_128(part, reduce_scratch, lane, simd_group) * scale;
+        if (tid == 0u) {
+            head_scratch[j] = s;
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    float local_max = -INFINITY;
+    for (uint j = tid; j < seq; j += 128u) {
+        local_max = max(local_max, head_scratch[j]);
+    }
+    local_max = simd_max(local_max);
+    if (lane == 0u) {
+        reduce_scratch[simd_group] = local_max;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid == 0u) {
+        float m = reduce_scratch[0];
+        for (uint g = 1u; g < 4u; ++g) {
+            m = max(m, reduce_scratch[g]);
+        }
+        row_stats[0] = m;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const float row_max = row_stats[0];
+
+    float local_sum = 0.0f;
+    for (uint j = tid; j < seq; j += 128u) {
+        local_sum += exp(head_scratch[j] - row_max);
+    }
+    const float denom = tm_reduce_sum_128(local_sum, reduce_scratch, lane, simd_group);
+    if (tid == 0u) {
+        row_stats[1] = denom;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint d = tid; d < head_dim; d += 128u) {
+        float accv = 0.0f;
+        for (uint j = 0; j < seq; ++j) {
+            const float w = exp(head_scratch[j] - row_max) / denom;
+            accv += w * vc[(size_t)j * (size_t)head_dim + d];
+        }
+        oh[d] = accv;
     }
 }

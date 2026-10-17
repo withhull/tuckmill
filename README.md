@@ -39,7 +39,11 @@ quality.
 > silent CPU fallback), matching the CPU scalar oracle within 4.7e-5 on
 > teacher-forced logits with identical greedy output; GPU weights equal the
 > artifact payload and every allocation is checked against the admitted
-> plan. Fast prefill (C3) is not built yet, so TTFT remains prefill-bound. Stage A verification is hardened:
+> plan. C3 makes prefill fast: prompt chunks run as batched packed GEMM +
+> chunked causal attention in one grouped command buffer per chunk, the
+> vocabulary projection runs for the final position only, and the batch is
+> chosen by exact preflight geometry against the admitted plan; measured
+> warm-worker TTFT at 512 tokens dropped from 15.1s to ~1.1s (batch 16). Stage A verification is hardened:
 > malformed scoring fails closed, verification records are immutable with
 > held-out qualification, the governor drives real backend commands
 > (protocol v7), tokenization is reference-first (llama.cpp when configured;
@@ -201,7 +205,7 @@ scripts/            build.sh, test.sh, demo.sh
 ## Verification and benchmarks
 
 `scripts/test.sh` runs formatting, `clippy -D warnings`, and the full test
-suite (380 tests),
+suite (388 tests),
 including adversarial GGUF/Safetensors fixtures, planner math, governor
 semantics, import/pack fault injection, worker-protocol framing, HTTP
 auth/SSE (including long streams through the real endpoint), CLI end-to-end

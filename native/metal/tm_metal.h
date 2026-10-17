@@ -107,7 +107,7 @@ int tm_metal_abort_group(tm_metal_ctx *ctx, char *err, size_t err_cap);
 
 /* Dequantize row `row` of a packed Q8_0 matrix to `cols` f32 values. */
 int tm_metal_q8_0_row_f32(tm_metal_ctx *ctx, tm_metal_buffer *w, tm_metal_buffer *out,
-                          uint32_t row, uint32_t cols, char *err, size_t err_cap);
+                          uint32_t row, uint32_t cols, uint32_t out_off, char *err, size_t err_cap);
 
 /* F16 matvec: y[r] = dot(f32(w_row_r), x); `w` holds rows*cols f16 values. */
 int tm_metal_f16_gemv(tm_metal_ctx *ctx, tm_metal_buffer *w, tm_metal_buffer *x,
@@ -141,12 +141,48 @@ int tm_metal_attention_f32(tm_metal_ctx *ctx, tm_metal_buffer *q, tm_metal_buffe
 
 /* Dequantize row `row` of an F16 matrix to `cols` f32 values. */
 int tm_metal_f16_row_f32(tm_metal_ctx *ctx, tm_metal_buffer *w, tm_metal_buffer *out,
-                         uint32_t row, uint32_t cols, char *err, size_t err_cap);
+                         uint32_t row, uint32_t cols, uint32_t out_off, char *err, size_t err_cap);
 
 /* RMSNorm with an F16-weight table. */
 int tm_metal_rmsnorm_f16w(tm_metal_ctx *ctx, tm_metal_buffer *x, tm_metal_buffer *weight,
                           tm_metal_buffer *y, uint32_t rows, uint32_t cols, float eps,
                           char *err, size_t err_cap);
+
+/* ---------------- C3: batched prefill operations ---------------- */
+
+/* Y[b, :] = W . X[b, :] for b < batch (1..=32); X is [batch, cols] at f32
+ * element offset `x_off`, Y is [batch, rows] at `y_off`. Per-token
+ * arithmetic order matches the single-token GEMV, so batch=1 is
+ * bit-identical to it. */
+int tm_metal_q8_0_gemm(tm_metal_ctx *ctx, tm_metal_buffer *w, tm_metal_buffer *x,
+                       tm_metal_buffer *y, uint32_t rows, uint32_t cols, uint32_t batch,
+                       uint32_t x_off, uint32_t y_off, char *err, size_t err_cap);
+int tm_metal_f16_gemm(tm_metal_ctx *ctx, tm_metal_buffer *w, tm_metal_buffer *x,
+                      tm_metal_buffer *y, uint32_t rows, uint32_t cols, uint32_t batch,
+                      uint32_t x_off, uint32_t y_off, char *err, size_t err_cap);
+
+/* Batched RoPE: token t rotates at start_pos + t (q [n_tokens, n_q_heads,
+ * dim], k [n_tokens, n_kv_heads, dim]). */
+int tm_metal_rope_batch_f32(tm_metal_ctx *ctx, tm_metal_buffer *q, tm_metal_buffer *k,
+                            tm_metal_buffer *inv_freq, uint32_t start_pos, uint32_t n_tokens,
+                            uint32_t n_q_heads, uint32_t n_kv_heads, uint32_t head_dim,
+                            char *err, size_t err_cap);
+
+/* Batched KV writes: row (t, head) lands at position start_pos + t. */
+int tm_metal_kv_store_batch_f32(tm_metal_ctx *ctx, tm_metal_buffer *k_src, tm_metal_buffer *v_src,
+                                tm_metal_buffer *k_cache, tm_metal_buffer *v_cache,
+                                uint32_t n_tokens, uint32_t start_pos, uint32_t cap,
+                                uint32_t head_dim, uint32_t kv_heads, uint32_t round_f16,
+                                char *err, size_t err_cap);
+
+/* Batched causal attention: one threadgroup per (token, query head); query
+ * token t attends keys 0..=(start_pos + t). Scratch is
+ * n_tokens * heads * cap f32. */
+int tm_metal_attention_batch_f32(tm_metal_ctx *ctx, tm_metal_buffer *q, tm_metal_buffer *k_cache,
+                                 tm_metal_buffer *v_cache, tm_metal_buffer *out,
+                                 tm_metal_buffer *scratch, uint32_t heads, uint32_t n_tokens,
+                                 uint32_t start_pos, uint32_t cap, uint32_t head_dim,
+                                 uint32_t group, float scale, char *err, size_t err_cap);
 
 /* out[i] = silu(gate[i]) * up[i]. */
 int tm_metal_silu_mul_f32(tm_metal_ctx *ctx, tm_metal_buffer *gate, tm_metal_buffer *up,
@@ -172,6 +208,13 @@ uint64_t tm_metal_completed_dispatches(const tm_metal_ctx *ctx);
 double tm_metal_last_gpu_ms(const tm_metal_ctx *ctx);
 /* Live bytes currently allocated in buffers from this context. */
 uint64_t tm_metal_allocated_bytes(const tm_metal_ctx *ctx);
+
+/* Bytes leased by pending command buffers (physically alive until their
+ * completion, even after the owning handles were freed). gpu_allocated +
+ * in_flight is a conservative upper bound on live GPU bytes: a buffer that
+ * is both handle-live and awaiting completion is counted twice, so the
+ * bound never understates. */
+uint64_t tm_metal_in_flight_bytes(const tm_metal_ctx *ctx);
 
 #ifdef __cplusplus
 }

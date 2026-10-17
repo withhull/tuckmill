@@ -145,6 +145,11 @@ enum Cmd {
         /// bounded buffers).
         #[arg(long)]
         storage: Option<String>,
+        /// Metal prefill micro-batch for tuckcore (1..=32; default 8). The
+        /// effective size is the largest candidate whose exact workspace
+        /// geometry fits the admitted plan.
+        #[arg(long)]
+        prefill_batch: Option<u32>,
     },
 
     /// Serve the local API on loopback.
@@ -159,6 +164,22 @@ enum Cmd {
         /// Start and exit immediately (used by tests to validate binding).
         #[arg(long, hide = true)]
         probe_only: bool,
+        /// llama.cpp GPU offload layers (Metal performance baseline ONLY;
+        /// never for arithmetic diagnostics). Requires --engine llama.
+        #[arg(long)]
+        gpu_layers: Option<i32>,
+        /// Kernel implementation for tuckcore: auto (default; NEON where
+        /// available), scalar (force the reference kernels), neon, metal.
+        #[arg(long)]
+        kernels: Option<String>,
+        /// Weight-block storage for tuckcore: auto (default; map when
+        /// possible), mapped (require zero-copy views), owned (copied
+        /// bounded buffers).
+        #[arg(long)]
+        storage: Option<String>,
+        /// Metal prefill micro-batch for tuckcore (1..=32; default 8).
+        #[arg(long)]
+        prefill_batch: Option<u32>,
     },
 
     /// Verify equivalence: identical token IDs through resident and
@@ -209,6 +230,9 @@ enum Cmd {
         /// Weight-block storage to exercise: auto (default), mapped, owned.
         #[arg(long)]
         storage: Option<String>,
+        /// Metal prefill micro-batch for tuckcore (1..=32; default 8).
+        #[arg(long)]
+        prefill_batch: Option<u32>,
     },
 
     /// Run the standard benchmark suite and write a machine-readable record.
@@ -247,6 +271,11 @@ enum Cmd {
         /// bounded buffers).
         #[arg(long)]
         storage: Option<String>,
+        /// Metal prefill micro-batch for tuckcore (1..=32; default 8). The
+        /// effective size is the largest candidate whose exact workspace
+        /// geometry fits the admitted plan.
+        #[arg(long)]
+        prefill_batch: Option<u32>,
     },
 
     /// Show backend statistics and profile counters after a short probe run.

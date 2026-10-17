@@ -69,6 +69,7 @@ pub fn dispatch(cmd: &Cmd, json: bool, data_dir: Option<&Path>) -> Result<ExitCo
             gpu_layers,
             kernels,
             storage,
+            prefill_batch,
         } => run(
             model,
             prompt.clone(),
@@ -81,6 +82,7 @@ pub fn dispatch(cmd: &Cmd, json: bool, data_dir: Option<&Path>) -> Result<ExitCo
             *gpu_layers,
             kernels.as_deref(),
             storage.as_deref(),
+            *prefill_batch,
             json,
             data_dir,
         ),
@@ -89,11 +91,19 @@ pub fn dispatch(cmd: &Cmd, json: bool, data_dir: Option<&Path>) -> Result<ExitCo
             allow_test_engine,
             engine,
             probe_only,
+            gpu_layers,
+            kernels,
+            storage,
+            prefill_batch,
         } => serve(
             *port,
             *allow_test_engine,
             engine,
             *probe_only,
+            *gpu_layers,
+            kernels.as_deref(),
+            storage.as_deref(),
+            *prefill_batch,
             json,
             data_dir,
         ),
@@ -110,6 +120,7 @@ pub fn dispatch(cmd: &Cmd, json: bool, data_dir: Option<&Path>) -> Result<ExitCo
             held_out,
             kernels,
             storage,
+            prefill_batch,
         } => verify(
             model,
             memory_budget.as_deref(),
@@ -123,6 +134,7 @@ pub fn dispatch(cmd: &Cmd, json: bool, data_dir: Option<&Path>) -> Result<ExitCo
             *held_out,
             kernels.as_deref(),
             storage.as_deref(),
+            *prefill_batch,
             json,
             data_dir,
         ),
@@ -139,6 +151,7 @@ pub fn dispatch(cmd: &Cmd, json: bool, data_dir: Option<&Path>) -> Result<ExitCo
             gpu_layers,
             kernels,
             storage,
+            prefill_batch,
         } => bench(
             model,
             suite,
@@ -152,6 +165,7 @@ pub fn dispatch(cmd: &Cmd, json: bool, data_dir: Option<&Path>) -> Result<ExitCo
             *gpu_layers,
             kernels.as_deref(),
             storage.as_deref(),
+            *prefill_batch,
             json,
             data_dir,
         ),
@@ -277,6 +291,7 @@ fn execution_options(
     gpu_layers: Option<i32>,
     kernels: Option<&str>,
     storage: Option<&str>,
+    prefill_batch: Option<u32>,
 ) -> Result<tuckmill_supervisor::options::ExecutionOptions> {
     use tuckmill_supervisor::options::ExecutionOptions;
     let (kind, _) = parse_engine(engine)?;
@@ -304,6 +319,7 @@ fn execution_options(
         kernels,
         storage,
         gpu_layers,
+        prefill_batch,
         ..Default::default()
     };
     options.validate(kind)?;
@@ -844,6 +860,7 @@ fn run(
     gpu_layers: Option<i32>,
     kernels: Option<&str>,
     storage: Option<&str>,
+    prefill_batch: Option<u32>,
     json: bool,
     data_dir: Option<&Path>,
 ) -> Result<ExitCode> {
@@ -851,7 +868,7 @@ fn run(
         data_dir,
         engine,
         allow_test_engine,
-        execution_options(engine, gpu_layers, kernels, storage)?,
+        execution_options(engine, gpu_layers, kernels, storage, prefill_batch)?,
     )?;
     let budget = resolve_budget(&runtime, memory_budget)?;
     let (artifact, adapter) = runtime.resolve_artifact(model)?;
@@ -1063,15 +1080,25 @@ fn run(
 
 static SERVE_SHUTDOWN: OnceLock<Arc<AtomicBool>> = OnceLock::new();
 
+#[allow(clippy::too_many_arguments)]
 fn serve(
     port: u16,
     allow_test_engine: bool,
     engine: &str,
     probe_only: bool,
+    gpu_layers: Option<i32>,
+    kernels: Option<&str>,
+    storage: Option<&str>,
+    prefill_batch: Option<u32>,
     json: bool,
     data_dir: Option<&Path>,
 ) -> Result<ExitCode> {
-    let runtime = open_runtime(data_dir, engine, allow_test_engine)?;
+    let runtime = open_runtime_with_options(
+        data_dir,
+        engine,
+        allow_test_engine,
+        execution_options(engine, gpu_layers, kernels, storage, prefill_batch)?,
+    )?;
     let server = tuckmill_supervisor::api::ApiServer::bind(runtime.clone(), port, None)?;
     let addr = server.local_addr();
     let token_file = tuckmill_supervisor::api::token_file_path(&runtime);
@@ -1158,6 +1185,7 @@ fn bench(
     gpu_layers: Option<i32>,
     kernels: Option<&str>,
     storage: Option<&str>,
+    prefill_batch: Option<u32>,
     json: bool,
     data_dir: Option<&Path>,
 ) -> Result<ExitCode> {
@@ -1171,7 +1199,7 @@ fn bench(
         data_dir,
         engine,
         allow_test_engine,
-        execution_options(engine, gpu_layers, kernels, storage)?,
+        execution_options(engine, gpu_layers, kernels, storage, prefill_batch)?,
     )?;
     let budget = resolve_budget(&runtime, memory_budget)?;
     let (artifact, adapter) = runtime.resolve_artifact(model)?;
@@ -1229,10 +1257,11 @@ fn verify(
     held_out: bool,
     kernels: Option<&str>,
     storage: Option<&str>,
+    prefill_batch: Option<u32>,
     json: bool,
     data_dir: Option<&Path>,
 ) -> Result<ExitCode> {
-    let selection = execution_options("tuckcore", None, kernels, storage)?;
+    let selection = execution_options("tuckcore", None, kernels, storage, prefill_batch)?;
     let runtime = open_runtime_with_options(data_dir, "tuckcore", false, selection.clone())?;
     let budget = resolve_budget(&runtime, memory_budget)?;
     let (artifact, adapter) = runtime.resolve_artifact(model)?;
@@ -1316,7 +1345,7 @@ fn stats(
     json: bool,
     data_dir: Option<&Path>,
 ) -> Result<ExitCode> {
-    let mut execution = execution_options(engine, None, kernels, storage)?;
+    let mut execution = execution_options(engine, None, kernels, storage, None)?;
     if !engine.starts_with("llama") {
         execution.profile = Some(true);
     }

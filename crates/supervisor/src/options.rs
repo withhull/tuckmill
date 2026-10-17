@@ -38,6 +38,11 @@ pub struct ExecutionOptions {
     /// governor commands mid-run). Refused for real engines.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub per_token_delay_ms: Option<u64>,
+    /// Metal prefill micro-batch for tuckcore (default 8, bounded 1..=32;
+    /// the effective size is the largest candidate whose exact workspace
+    /// geometry fits the plan). Refused for engines without batched prefill.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prefill_batch: Option<u32>,
 }
 
 impl ExecutionOptions {
@@ -58,6 +63,14 @@ impl ExecutionOptions {
                         "per-token delay is a reference-test-engine test aid; real engines never simulate slowness",
                     ));
                 }
+                if let Some(b) = self.prefill_batch {
+                    if !(1..=32).contains(&b) {
+                        return Err(TuckmillError::new(
+                            ErrorCode::InvalidRequest,
+                            format!("--prefill-batch {b} is outside the supported 1..=32 range"),
+                        ));
+                    }
+                }
                 Ok(())
             }
             EngineKind::LlamaCpp => {
@@ -65,6 +78,12 @@ impl ExecutionOptions {
                     return Err(TuckmillError::new(
                         ErrorCode::InvalidRequest,
                         "--kernels/--storage apply to the tuckcore engine; llama.cpp selects its own kernels",
+                    ));
+                }
+                if self.prefill_batch.is_some() {
+                    return Err(TuckmillError::new(
+                        ErrorCode::InvalidRequest,
+                        "batched prefill is a tuckcore Metal option; llama.cpp manages its own prefill",
                     ));
                 }
                 if self.numerical_profile.is_some() {
@@ -92,6 +111,7 @@ impl ExecutionOptions {
             EngineKind::ReferenceTest => {
                 let mut without_test_aid = self.clone();
                 without_test_aid.per_token_delay_ms = None;
+                without_test_aid.prefill_batch = None;
                 if without_test_aid != Self::default() {
                     return Err(TuckmillError::new(
                         ErrorCode::InvalidRequest,
@@ -110,6 +130,9 @@ impl ExecutionOptions {
         let mut obj = Map::new();
         match kind {
             EngineKind::TuckCore => {
+                if let Some(v) = self.prefill_batch {
+                    obj.insert("prefill_batch".into(), Value::from(v));
+                }
                 if let Some(v) = self.weight_cache_bytes {
                     obj.insert("weight_cache_bytes".into(), Value::from(v));
                 }
@@ -130,6 +153,9 @@ impl ExecutionOptions {
                 }
                 if let Some(v) = self.profile {
                     obj.insert("profile".into(), Value::from(v));
+                }
+                if let Some(v) = self.prefill_batch {
+                    obj.insert("prefill_batch".into(), Value::from(v));
                 }
             }
             EngineKind::LlamaCpp => {

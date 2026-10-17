@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "revision_note": "Work packages K01-K09 from PRD v0.2 section 11.3. K01 has three implemented increments: the aarch64 NEON fused packed dot for Q8_0/F16 with zero-copy mapped weight blocks (CPU, validated against scalar references and the llama.cpp envelope), the first Metal increment from Gate C C0/C1 (device/queue owner, typed resource handles with allocation accounting, grouped dispatch, packed Q8_0 GEMV and F16/F32 utilities), and the C2 increment: the complete dense-Qwen3 decode (RMSNorm, Q/K norm, NeoX RoPE, GQA attention with f16-contract KV, SwiGLU, residuals, final projection) executed on the GPU through crates/metal, validated against the CPU scalar oracle on the pinned Qwen3-0.6B artifact (teacher-forced logits max |diff| 4.7e-5 over scale 16.6, identical top-1 and greedy output). K03 and K08 grow their Metal increments accordingly. A kernel must never be selected before its correctness gate passes; every selection retains a validated reference fallback decision. Fast microbatched prefill remains unbuilt (C3).",
+  "revision_note": "Work packages K01-K09 from PRD v0.2 section 11.3. K01 has three implemented increments: the aarch64 NEON fused packed dot (CPU), the Gate C C0/C1 Metal increment (device/queue owner, typed handles, grouped dispatch, packed Q8_0 GEMV + F16/F32 utilities), and the C2 increment (complete dense-Qwen3 decode on the GPU, validated against the CPU scalar oracle on the pinned Qwen3-0.6B artifact). K02 gains its Metal increment with C3: packed batched GEMM plus chunked causal prefill (batched norms, RoPE, masked GQA attention, KV writes, SwiGLU, residuals), last-position-only vocabulary projection, preflight geometry admission for the micro-batch and chunk-independent numerics (bit-identical logits across batch sizes 1-8). A kernel must never be selected before its correctness gate passes; every selection retains a validated reference fallback decision.",
   "kernels": [
     {
       "id": "K01",
@@ -17,12 +17,13 @@
     {
       "id": "K02",
       "name": "Shape-specific prompt matrix multiplication",
-      "status": "specified",
+      "status": "implemented",
       "reference_fallback": true,
       "gates": [
         "same projection semantics as reference",
         "microbatch size recorded in plan",
-        "no unbounded prompt workspace"
+        "no unbounded prompt workspace",
+        "Metal increment: packed batched GEMM + chunked causal prefill; per-token arithmetic identical across batch sizes; effective batch is the largest candidate whose exact workspace geometry fits the plan (C3)"
       ]
     },
     {

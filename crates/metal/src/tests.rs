@@ -883,7 +883,7 @@ fn silu_mul_and_row_dequant_match_the_scalar_reference() {
     let ob = ctx.buffer(cols * 4, true).unwrap();
     wb.upload(0, &w).unwrap();
     for row in [0u32, 5, 7] {
-        ctx.q8_0_row(&wb, &ob, row, cols as u32).unwrap();
+        ctx.q8_0_row(&wb, &ob, row, cols as u32, 0).unwrap();
         ctx.fence().unwrap();
         let mut out = vec![0u8; cols * 4];
         ob.download(0, &mut out).unwrap();
@@ -1005,5 +1005,401 @@ fn q8_0_gemv_matches_on_real_artifact_bytes() {
             gpu[r],
             cpu[r]
         );
+    }
+}
+
+#[test]
+fn in_flight_bytes_stay_visible_until_completion() {
+    let Some(ctx) = metal_context() else {
+        return;
+    };
+    let x = ctx.buffer(4096, true).unwrap();
+    let y = ctx.buffer(4096, true).unwrap();
+    x.upload(0, &f32_bytes(&[1.0; 1024])).unwrap();
+    assert_eq!(ctx.in_flight_bytes(), 0);
+    ctx.f32_scale(&x, &y, 2.0, 1024).unwrap();
+    // Handles dropped, GPU work still pending: the lease keeps the storage
+    // physically alive and visible to accounting.
+    drop(x);
+    assert_eq!(ctx.allocated_bytes(), 4096, "only y is still handle-live");
+    drop(y);
+    assert_eq!(
+        ctx.allocated_bytes(),
+        0,
+        "handle bytes are released on drop"
+    );
+    let leased_before = ctx.in_flight_bytes();
+    assert!(
+        leased_before >= 8192,
+        "dropped-but-leased buffers must remain visible: {leased_before}"
+    );
+    assert!(ctx.live_gpu_bytes() >= leased_before);
+    ctx.fence().unwrap();
+    assert_eq!(ctx.in_flight_bytes(), 0, "leases release at completion");
+
+    // Correctness after the fully-lease-only run: same math, kept handles.
+    let x2 = ctx.buffer(4096, true).unwrap();
+    let y2 = ctx.buffer(4096, true).unwrap();
+    x2.upload(0, &f32_bytes(&[3.0; 1024])).unwrap();
+    ctx.f32_scale(&x2, &y2, 2.0, 1024).unwrap();
+    ctx.fence().unwrap();
+    let mut out = vec![0u8; 4096];
+    y2.download(0, &mut out).unwrap();
+    for chunk in out.chunks_exact(4).take(1024) {
+        assert_eq!(f32::from_le_bytes(chunk.try_into().unwrap()), 6.0);
+    }
+    drop(x2);
+    drop(y2);
+    assert_eq!(ctx.allocated_bytes(), 0);
+}
+
+#[test]
+fn batched_gemm_matches_the_scalar_reference_for_all_rows() {
+    let Some(ctx) = metal_context() else {
+        return;
+    };
+    // (rows, cols, all-rows?) — realistic projection shapes; the 151936-row
+    // vocabulary projection is spot-checked to keep the reference bounded.
+    let shapes: [(usize, usize, bool); 5] = [
+        (32, 32, true),
+        (64, 1024, true),
+        (2048, 1024, true),
+        (3072, 1024, true),
+        (151_936, 1024, false),
+    ];
+    for (rows, cols, all_rows) in shapes {
+        let w = boundary_weights(rows, cols, 101 + rows as u64);
+        for batch in [1usize, 4, 8, 16] {
+            let xs: Vec<Vec<f32>> = (0..batch)
+                .map(|b| boundary_input(cols, 200 + b as u64))
+                .collect();
+            let mut flat = Vec::with_capacity(batch * cols);
+            for x in &xs {
+                flat.extend_from_slice(x);
+            }
+            let wb = ctx.buffer(w.len(), true).unwrap();
+            let xb = ctx.buffer(flat.len() * 4, true).unwrap();
+            let yb = ctx.buffer(batch * rows * 4, true).unwrap();
+            wb.upload(0, &w).unwrap();
+            xb.upload(0, &f32_bytes(&flat)).unwrap();
+            ctx.q8_0_gemm(&wb, &xb, &yb, rows as u32, cols as u32, batch as u32, 0, 0)
+                .unwrap();
+            ctx.fence().unwrap();
+            let mut out = vec![0u8; batch * rows * 4];
+            yb.download(0, &mut out).unwrap();
+            let gpu: Vec<f32> = out
+                .chunks_exact(4)
+                .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+                .collect();
+            let check_rows: Vec<usize> = if all_rows {
+                (0..rows).collect()
+            } else {
+                vec![0, 1, rows / 2, rows - 2, rows - 1]
+            };
+            for (b, x) in xs.iter().enumerate() {
+                let cpu = cpu_q8_0_gemv(&w, x, rows, cols);
+                let scale = cpu.iter().fold(0f32, |m, v| m.max(v.abs())).max(1.0);
+                for &r in &check_rows {
+                    let diff = (gpu[b * rows + r] - cpu[r]).abs();
+                    assert!(
+                        diff <= 1e-4 * scale,
+                        "({rows},{cols}) batch {batch} b {b} row {r}: {} vs {}",
+                        gpu[b * rows + r],
+                        cpu[r]
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn batched_gemm_batch_one_is_bit_identical_to_the_single_token_gemv() {
+    let Some(ctx) = metal_context() else {
+        return;
+    };
+    let (rows, cols) = (512usize, 1024usize);
+    let w = boundary_weights(rows, cols, 7);
+    let x = boundary_input(cols, 9);
+    let wb = ctx.buffer(w.len(), true).unwrap();
+    let xb = ctx.buffer(cols * 4, true).unwrap();
+    let y_single = ctx.buffer(rows * 4, true).unwrap();
+    let y_batch = ctx.buffer(rows * 4, true).unwrap();
+    wb.upload(0, &w).unwrap();
+    xb.upload(0, &f32_bytes(&x)).unwrap();
+    ctx.q8_0_gemv(&wb, &xb, &y_single, rows as u32, cols as u32)
+        .unwrap();
+    ctx.q8_0_gemm(&wb, &xb, &y_batch, rows as u32, cols as u32, 1, 0, 0)
+        .unwrap();
+    ctx.fence().unwrap();
+    let mut a = vec![0u8; rows * 4];
+    let mut b = vec![0u8; rows * 4];
+    y_single.download(0, &mut a).unwrap();
+    y_batch.download(0, &mut b).unwrap();
+    assert_eq!(
+        a, b,
+        "batch=1 must be bit-identical to the single-token GEMV"
+    );
+}
+
+#[test]
+fn f16_gemm_matches_the_scalar_reference() {
+    let Some(ctx) = metal_context() else {
+        return;
+    };
+    let (rows, cols) = (128usize, 256usize);
+    let mut rng = Rng(31);
+    let wf: Vec<f32> = (0..rows * cols)
+        .map(|_| ((rng.next() % 20_001) as f32 - 10_000.0) / 1000.0)
+        .collect();
+    let w: Vec<u8> = wf
+        .iter()
+        .flat_map(|v| f32_to_f16_bits(*v).to_le_bytes())
+        .collect();
+    let batch = 8usize;
+    let xs: Vec<Vec<f32>> = (0..batch)
+        .map(|b| boundary_input(cols, 41 + b as u64))
+        .collect();
+    let mut flat = Vec::new();
+    for x in &xs {
+        flat.extend_from_slice(x);
+    }
+    let wb = ctx.buffer(w.len(), true).unwrap();
+    let xb = ctx.buffer(flat.len() * 4, true).unwrap();
+    let yb = ctx.buffer(batch * rows * 4, true).unwrap();
+    wb.upload(0, &w).unwrap();
+    xb.upload(0, &f32_bytes(&flat)).unwrap();
+    ctx.f16_gemm(&wb, &xb, &yb, rows as u32, cols as u32, batch as u32, 0, 0)
+        .unwrap();
+    ctx.fence().unwrap();
+    let mut out = vec![0u8; batch * rows * 4];
+    yb.download(0, &mut out).unwrap();
+    let gpu: Vec<f32> = out
+        .chunks_exact(4)
+        .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+        .collect();
+    for (b, x) in xs.iter().enumerate() {
+        for r in [0usize, rows / 2, rows - 1] {
+            let row = &w[r * cols * 2..(r + 1) * cols * 2];
+            let want: f32 = row
+                .chunks_exact(2)
+                .zip(x)
+                .map(|(c, xv)| f16_bits_to_f32(u16::from_le_bytes(c.try_into().unwrap())) * xv)
+                .sum();
+            let got = gpu[b * rows + r];
+            assert!(
+                (got - want).abs() <= 1e-4 * want.abs().max(1.0),
+                "batch {b} row {r}: {got} vs {want}"
+            );
+        }
+    }
+}
+
+#[test]
+fn batched_rope_matches_single_token_rope_per_position() {
+    let Some(ctx) = metal_context() else {
+        return;
+    };
+    let (heads, kv_heads, head_dim) = (16usize, 8usize, 128usize);
+    let inv = rope_freqs(head_dim, 1e6);
+    let n_tokens = 5usize;
+    let start = 7usize;
+    let mut rng = Rng(43);
+    let q: Vec<f32> = (0..n_tokens * heads * head_dim)
+        .map(|_| ((rng.next() % 20_001) as f32 - 10_000.0) / 1000.0)
+        .collect();
+    let k: Vec<f32> = (0..n_tokens * kv_heads * head_dim)
+        .map(|_| ((rng.next() % 20_001) as f32 - 10_000.0) / 1000.0)
+        .collect();
+    let qb = ctx.buffer(q.len() * 4, true).unwrap();
+    let kb = ctx.buffer(k.len() * 4, true).unwrap();
+    let fb = ctx.buffer(inv.len() * 4, true).unwrap();
+    qb.upload(0, &f32_bytes(&q)).unwrap();
+    kb.upload(0, &f32_bytes(&k)).unwrap();
+    fb.upload(0, &f32_bytes(&inv)).unwrap();
+    ctx.rope_batch(
+        &qb,
+        &kb,
+        &fb,
+        start as u32,
+        n_tokens as u32,
+        heads as u32,
+        kv_heads as u32,
+        head_dim as u32,
+    )
+    .unwrap();
+    ctx.fence().unwrap();
+    let mut q_out = vec![0u8; q.len() * 4];
+    let mut k_out = vec![0u8; k.len() * 4];
+    qb.download(0, &mut q_out).unwrap();
+    kb.download(0, &mut k_out).unwrap();
+    let gq: Vec<f32> = q_out
+        .chunks_exact(4)
+        .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+        .collect();
+    let gk: Vec<f32> = k_out
+        .chunks_exact(4)
+        .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+        .collect();
+    for t in 0..n_tokens {
+        let base = t * heads * head_dim;
+        for h in 0..heads {
+            let mut want = q[base + h * head_dim..base + (h + 1) * head_dim].to_vec();
+            cpu_rope(&mut want, start + t, &inv);
+            for d in 0..head_dim {
+                let (g, w) = (gq[base + h * head_dim + d], want[d]);
+                assert!(
+                    (g - w).abs() <= 2e-4 * w.abs().max(1.0),
+                    "t {t} head {h} dim {d}: {g} vs {w}"
+                );
+            }
+        }
+        let kbase = t * kv_heads * head_dim;
+        for h in 0..kv_heads {
+            let mut want = k[kbase + h * head_dim..kbase + (h + 1) * head_dim].to_vec();
+            cpu_rope(&mut want, start + t, &inv);
+            for d in 0..head_dim {
+                let (g, w) = (gk[kbase + h * head_dim + d], want[d]);
+                assert!(
+                    (g - w).abs() <= 2e-4 * w.abs().max(1.0),
+                    "k t {t} head {h} dim {d}: {g} vs {w}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn batched_kv_store_and_attention_match_the_scalar_reference() {
+    let Some(ctx) = metal_context() else {
+        return;
+    };
+    let (heads, kv_heads, head_dim, group) = (16usize, 8usize, 128usize, 2usize);
+    let cap = 64usize;
+    let n_tokens = 6usize;
+    let start = 5usize;
+    let mut rng = Rng(47);
+
+    let mut k_steps: Vec<Vec<f32>> = Vec::new();
+    let mut v_steps: Vec<Vec<f32>> = Vec::new();
+    let mut q_steps: Vec<Vec<f32>> = Vec::new();
+    for _ in 0..n_tokens {
+        k_steps.push(
+            (0..kv_heads * head_dim)
+                .map(|_| ((rng.next() % 20_001) as f32 - 10_000.0) / 1000.0)
+                .collect(),
+        );
+        v_steps.push(
+            (0..kv_heads * head_dim)
+                .map(|_| ((rng.next() % 20_001) as f32 - 10_000.0) / 1000.0)
+                .collect(),
+        );
+        q_steps.push(
+            (0..heads * head_dim)
+                .map(|_| ((rng.next() % 20_001) as f32 - 10_000.0) / 1000.0)
+                .collect(),
+        );
+    }
+    let flat = |steps: &[Vec<f32>]| -> Vec<f32> {
+        let mut out = Vec::new();
+        for s in steps {
+            out.extend_from_slice(s);
+        }
+        out
+    };
+    let k_flat = flat(&k_steps);
+    let v_flat = flat(&v_steps);
+    let q_flat = flat(&q_steps);
+
+    let k_cache = ctx.buffer(kv_heads * cap * head_dim * 4, true).unwrap();
+    let v_cache = ctx.buffer(kv_heads * cap * head_dim * 4, true).unwrap();
+    let scratch = ctx.buffer(n_tokens * heads * cap * 4, true).unwrap();
+    let qb = ctx.buffer(q_flat.len() * 4, true).unwrap();
+    let out = ctx.buffer(q_flat.len() * 4, true).unwrap();
+    let kb = ctx.buffer(k_flat.len() * 4, true).unwrap();
+    let vb = ctx.buffer(v_flat.len() * 4, true).unwrap();
+    qb.upload(0, &f32_bytes(&q_flat)).unwrap();
+    kb.upload(0, &f32_bytes(&k_flat)).unwrap();
+    vb.upload(0, &f32_bytes(&v_flat)).unwrap();
+
+    ctx.begin_group().unwrap();
+    ctx.kv_store_batch(
+        &kb,
+        &vb,
+        &k_cache,
+        &v_cache,
+        n_tokens as u32,
+        start as u32,
+        cap as u32,
+        head_dim as u32,
+        kv_heads as u32,
+        false,
+    )
+    .unwrap();
+    let scale = 1.0f32 / (head_dim as f32).sqrt();
+    ctx.attention_batch(
+        &qb,
+        &k_cache,
+        &v_cache,
+        &out,
+        &scratch,
+        heads as u32,
+        n_tokens as u32,
+        start as u32,
+        cap as u32,
+        head_dim as u32,
+        group as u32,
+        scale,
+    )
+    .unwrap();
+    ctx.end_group().unwrap();
+    ctx.fence().unwrap();
+
+    let mut out_bytes = vec![0u8; q_flat.len() * 4];
+    out.download(0, &mut out_bytes).unwrap();
+    let got: Vec<f32> = out_bytes
+        .chunks_exact(4)
+        .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+        .collect();
+
+    // CPU reference: per token, causal softmax over ALL positions 0..=pos.
+    // Positions before `start` were never written and stay at their zero
+    // initialization, so they contribute score 0 and no value — mirroring
+    // the kernel exactly (the earlier version of this reference forgot the
+    // zero-initialized prefix and disagreed with a correct kernel).
+    for t in 0..n_tokens {
+        let pos = start + t;
+        for h in 0..heads {
+            let kvh = h / group;
+            let qh = &q_steps[t][h * head_dim..(h + 1) * head_dim];
+            let mut scores = Vec::with_capacity(pos + 1);
+            for j in 0..=pos {
+                if j < start {
+                    scores.push(0.0);
+                    continue;
+                }
+                let ks = &k_steps[j - start];
+                let kj = &ks[kvh * head_dim..(kvh + 1) * head_dim];
+                let dot: f32 = qh.iter().zip(kj).map(|(a, b)| a * b).sum();
+                scores.push(dot * scale);
+            }
+            let max = scores.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+            let exps: Vec<f32> = scores.iter().map(|s| (s - max).exp()).collect();
+            let denom: f32 = exps.iter().sum();
+            for d in 0..head_dim {
+                let mut acc = 0.0f32;
+                for (j, e) in exps.iter().enumerate() {
+                    if j < start {
+                        continue;
+                    }
+                    acc += (e / denom) * v_steps[j - start][kvh * head_dim + d];
+                }
+                let got_v = got[(t * heads + h) * head_dim + d];
+                assert!(
+                    (got_v - acc).abs() <= 1e-3,
+                    "t {t} head {h} dim {d}: {got_v} vs {acc}"
+                );
+            }
+        }
     }
 }

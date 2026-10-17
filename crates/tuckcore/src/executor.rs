@@ -64,6 +64,11 @@ struct TuckCoreOptions {
     /// (require the zero-copy mapping), or "owned" (always copy into
     /// bounded buffers).
     storage: Option<StorageSelection>,
+    /// Metal prefill micro-batch (default 8, bounded 1..=32; the effective
+    /// size is the largest candidate whose exact workspace geometry fits
+    /// the admitted workspaces reservation). Applies to `--kernels metal`
+    /// only; refused elsewhere rather than ignored.
+    prefill_batch: Option<u32>,
 }
 
 struct Loaded {
@@ -437,48 +442,108 @@ impl InferenceBackend for TuckCore {
         // ---- Metal resident path (C2): build after identity verification,
         // with the plan's arena classes checked against the exact GPU
         // allocations before anything is accepted. ----
+        let mut note_batch: Option<u32> = None;
         let metal = if metal_mode {
+            if opts.storage.is_some() {
+                return Err(TuckmillError::new(
+                    ErrorCode::InvalidRequest,
+                    "storage selection applies to CPU weight streaming; the Metal path keeps weights resident on the GPU",
+                ));
+            }
+            let weights_reserved = plan.budget.reservation_breakdown.weights.bytes();
+            let ws_reserved = plan.budget.reservation_breakdown.workspaces.bytes();
+            // Preflight (C3.0): choose the largest micro-batch whose exact
+            // resident geometry fits the admitted reservations, from pure
+            // inspected-geometry arithmetic — before any GPU allocation.
+            let requested = opts.prefill_batch.unwrap_or(8).clamp(1, 32);
+            let mut candidates: Vec<u32> = [requested, 16, 8, 4, 2, 1]
+                .into_iter()
+                .filter(|c| *c <= requested)
+                .collect();
+            candidates.dedup();
+            let mut chosen = None;
+            let mut last_miss = (0u64, 0u64);
+            for candidate in candidates {
+                let (w_req, ws_req) = gpu::MetalForward::required_bytes(
+                    &insp,
+                    &cfg,
+                    plan.context.total_context,
+                    candidate,
+                )?;
+                last_miss = (w_req, ws_req);
+                if w_req <= weights_reserved && ws_req <= ws_reserved {
+                    chosen = Some(candidate);
+                    break;
+                }
+            }
+            let batch = chosen.ok_or_else(|| {
+                TuckmillError::new(
+                    ErrorCode::InvalidPlan,
+                    format!(
+                        "even a batch-1 Metal prefill needs {} of weights and {} of workspaces, beyond the plan's {} / {} reservations; refusing to allocate before admission",
+                        Bytes(last_miss.0),
+                        Bytes(last_miss.1),
+                        Bytes(weights_reserved),
+                        Bytes(ws_reserved)
+                    ),
+                )
+                .with_action("Raise --memory-budget or lower --context; the plan must cover the GPU arenas.")
+            })?;
+            // The verified file handle is passed through: Metal weights are
+            // read from the exact opened, digest-verified file — never a
+            // pathname reopen (a rename after verification must not matter).
             let forward = gpu::MetalForward::open(
-                path,
+                &artifact_file,
                 &insp,
                 &names,
                 &cfg,
                 kv_precision,
                 plan.context.total_context,
+                batch,
             )?;
-            let weights_reserved = plan.budget.reservation_breakdown.weights.bytes();
+            // Second verification: the measured allocations must also fit.
             if forward.weights_bytes() > weights_reserved {
                 return Err(TuckmillError::new(
                     ErrorCode::InvalidPlan,
                     format!(
-                        "the plan reserves {} for weights but the Metal path would hold {} resident on the GPU; refusing an unacknowledged GPU allocation",
+                        "the plan reserves {} for weights but the Metal path holds {} resident on the GPU",
                         Bytes(weights_reserved),
                         Bytes(forward.weights_bytes())
                     ),
-                )
-                .with_action(
-                    "Raise --memory-budget so the plan reserves resident weights, or run the CPU kernels.",
                 ));
             }
-            let ws_reserved = plan.budget.reservation_breakdown.workspaces.bytes();
             if forward.workspace_bytes() > ws_reserved {
                 return Err(TuckmillError::new(
                     ErrorCode::InvalidPlan,
                     format!(
-                        "the plan reserves {} for workspaces but the Metal path needs {}; refusing an unacknowledged GPU allocation",
+                        "the plan reserves {} for workspaces but the Metal path holds {}",
                         Bytes(ws_reserved),
                         Bytes(forward.workspace_bytes())
                     ),
                 ));
             }
+            note_batch = Some(batch);
             Some(Arc::new(forward))
         } else {
             None
         };
 
         let entries = forward::tensor_entries(&insp, policy.block_bytes);
+        // The Metal path reads through the same verified handle; the CPU
+        // loader (kept for stats/trim bookkeeping) gets a clone of the same
+        // file description — never a pathname reopen.
+        let loader_file = if metal_mode {
+            artifact_file.try_clone().map_err(|e| {
+                TuckmillError::new(
+                    ErrorCode::Io,
+                    format!("cannot clone the verified artifact handle: {e}"),
+                )
+            })?
+        } else {
+            artifact_file
+        };
         let loader = Arc::new(BlockLoader::open_file(
-            artifact_file,
+            loader_file,
             insp.data_start,
             entries,
             policy,
@@ -522,9 +587,10 @@ impl InferenceBackend for TuckCore {
         };
         if let Some(m) = &metal {
             note.push_str(&format!(
-                "; Metal resident path: {} weights + {} workspaces on the GPU (kernels: metal)",
+                "; Metal resident path: {} weights + {} workspaces on the GPU (kernels: metal, prefill batch {})",
                 Bytes(m.weights_bytes()),
-                Bytes(m.workspace_bytes())
+                Bytes(m.workspace_bytes()),
+                note_batch.unwrap_or(1)
             ));
         }
         self.loaded = Some(Loaded {
@@ -641,11 +707,23 @@ impl InferenceBackend for TuckCore {
         }
 
         (ctl.on_state)(RunState::Prefilling);
+        // Chunked prefill: the Metal path processes up to its prepared
+        // micro-batch per dispatch group; the CPU path keeps single-token
+        // steps. Vocabulary logits are computed for the final chunk only.
+        let prefill_batch = match &loaded.metal {
+            Some(m) => m.prefill_batch() as usize,
+            None => 1,
+        };
         let mut logits: Vec<f32> = Vec::new();
-        for (pos, token) in req.prompt_tokens.iter().enumerate() {
+        let prompt_tokens = &req.prompt_tokens;
+        let mut pos = 0usize;
+        while pos < prompt_tokens.len() {
+            let take = prefill_batch.min(prompt_tokens.len() - pos);
+            let want = pos + take == prompt_tokens.len();
             pause_loop(ctl, Duration::ZERO)?;
-            match engine.step(*token, pos, &cancelled) {
-                Ok(l) => logits = l,
+            match engine.prefill_chunk(&prompt_tokens[pos..pos + take], pos, want, &cancelled) {
+                Ok(Some(l)) => logits = l,
+                Ok(None) => {}
                 Err(e) if e.code() == ErrorCode::Cancelled => {
                     return Ok(
                         GenOutcome::new(FinishReason::Cancelled, 0).with_timing(empty_timing(t0))
@@ -653,6 +731,7 @@ impl InferenceBackend for TuckCore {
                 }
                 Err(e) => return Err(e),
             }
+            pos += take;
         }
         let prefill_ms = t0.elapsed().as_secs_f64() * 1000.0;
 
@@ -955,6 +1034,30 @@ impl StepEngine<'_> {
         match self {
             StepEngine::Cpu { fwd, kv } => fwd.forward_token(kv, token, pos, cancelled),
             StepEngine::Gpu { forward, kv } => forward.forward_token(kv, token, pos, cancelled),
+        }
+    }
+
+    /// Process a prefix chunk; logits are produced only when requested
+    /// (the last chunk of a prefill). The CPU arm keeps its single-token
+    /// semantics; the Metal arm batches the whole chunk.
+    fn prefill_chunk(
+        &mut self,
+        tokens: &[u32],
+        start: usize,
+        want_logits: bool,
+        cancelled: &dyn Fn() -> bool,
+    ) -> Result<Option<Vec<f32>>> {
+        match self {
+            StepEngine::Cpu { fwd, kv } => {
+                let mut last = None;
+                for (i, token) in tokens.iter().enumerate() {
+                    last = Some(fwd.forward_token(kv, *token, start + i, cancelled)?);
+                }
+                Ok(if want_logits { last } else { None })
+            }
+            StepEngine::Gpu { forward, kv } => {
+                forward.prefill_chunk(kv, tokens, start, want_logits, cancelled)
+            }
         }
     }
 }
