@@ -47,6 +47,8 @@ pub struct HybridFixture {
     /// relying on the interval alone. The `U32s` variant writes a malformed
     /// array (non-boolean entries) for refusal tests.
     pub recurrent_layers_array: Option<RecurrentLayerFlags>,
+    /// Write no `full_attention_interval` key at all (array-only artifact).
+    pub omit_interval_key: bool,
 }
 
 /// Per-layer array contents for the hybrid fixture.
@@ -123,6 +125,7 @@ impl SyntheticConfig {
                 ssm_conv_kernel: 4,
                 ssm_time_step_rank: 2,
                 recurrent_layers_array: None,
+                omit_interval_key: false,
             }),
         }
     }
@@ -134,6 +137,29 @@ impl SyntheticConfig {
         if let Some(h) = cfg.hybrid.as_mut() {
             h.recurrent_layers_array =
                 Some(RecurrentLayerFlags::Bools(vec![true, true, true, false]));
+        }
+        cfg
+    }
+
+    /// Non-periodic array: attention sits on the first served layer, which
+    /// the interval rule could never express (periodic attention is the
+    /// last layer of a full group). The array is authoritative.
+    pub fn tiny_qwen35_nonperiodic_array() -> Self {
+        let mut cfg = Self::tiny_qwen35();
+        cfg.name = "tuckmill-fixture-qwen35-nonperiodic".into();
+        if let Some(h) = cfg.hybrid.as_mut() {
+            h.recurrent_layers_array =
+                Some(RecurrentLayerFlags::Bools(vec![false, true, true, true]));
+        }
+        cfg
+    }
+
+    /// Array-only artifact: no `full_attention_interval` key at all.
+    pub fn tiny_qwen35_array_only() -> Self {
+        let mut cfg = Self::tiny_qwen35_nonperiodic_array();
+        cfg.name = "tuckmill-fixture-qwen35-array-only".into();
+        if let Some(h) = cfg.hybrid.as_mut() {
+            h.omit_interval_key = true;
         }
         cfg
     }
@@ -225,14 +251,26 @@ fn build(cfg: &SyntheticConfig) -> Result<Vec<u8>> {
     if let Some(hy) = &cfg.hybrid {
         // qwen35 hybrid layout: Gated DeltaNet layers between full
         // attention layers, plus trailing MTP (`nextn`) blocks that are
-        // not part of the served stack.
+        // not part of the served stack. The declared per-layer array, when
+        // present, decides the layout (it is authoritative over the
+        // interval); malformed-array fixtures keep interval-shaped tensors
+        // because they exist only to be refused before tensors are read.
+        let is_attention = |l: u32| -> bool {
+            match &hy.recurrent_layers_array {
+                Some(RecurrentLayerFlags::Bools(flags)) => {
+                    !flags.get(l as usize).copied().unwrap_or(false)
+                }
+                _ => (l + 1).is_multiple_of(hy.full_attention_interval),
+            }
+        };
         let inner = hy.ssm_inner_size as u64;
         let groups = hy.ssm_group_count as u64;
         let conv_channels = inner + 2 * groups * hy.ssm_state_size as u64;
+        let head_v = inner / hy.ssm_time_step_rank as u64;
         for l in 0..cfg.layers {
             let p = |s: &str| format!("blk.{l}.{s}");
             tensors.push(tensor(&p("attn_norm.weight"), &[h], 0)?);
-            if (l + 1) % hy.full_attention_interval == 0 {
+            if is_attention(l) {
                 push_attention_block(&mut tensors, &p, h, q_out, kv_out, cfg.head_dim as u64)?;
             } else {
                 tensors.push(tensor(&p("attn_qkv.weight"), &[h, 3 * inner], 1)?);
@@ -258,7 +296,7 @@ fn build(cfg: &SyntheticConfig) -> Result<Vec<u8>> {
                     &[hy.ssm_conv_kernel as u64, conv_channels],
                     0,
                 )?);
-                tensors.push(tensor(&p("ssm_norm.weight"), &[inner / groups], 0)?);
+                tensors.push(tensor(&p("ssm_norm.weight"), &[head_v], 0)?);
                 tensors.push(tensor(&p("ssm_out.weight"), &[inner, h], 1)?);
             }
             tensors.push(tensor(&p("ffn_gate.weight"), &[h, cfg.ffn as u64], 1)?);
@@ -387,10 +425,12 @@ fn build(cfg: &SyntheticConfig) -> Result<Vec<u8>> {
             format!("{arch}.rope.dimension_sections"),
             KV::Array(4, vec![KV::U32(1), KV::U32(1), KV::U32(1), KV::U32(0)]),
         ));
-        kvs.push((
-            format!("{arch}.full_attention_interval"),
-            KV::U32(hy.full_attention_interval),
-        ));
+        if !hy.omit_interval_key {
+            kvs.push((
+                format!("{arch}.full_attention_interval"),
+                KV::U32(hy.full_attention_interval),
+            ));
+        }
         if hy.nextn_layers > 0 {
             kvs.push((
                 format!("{arch}.nextn_predict_layers"),

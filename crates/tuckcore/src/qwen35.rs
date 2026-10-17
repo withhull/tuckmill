@@ -31,16 +31,20 @@ pub enum Qwen35LayerKind {
 /// Gated DeltaNet geometry of the linear-attention layers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct GdnConfig {
-    /// Value/key head groups (the delta rule's head count).
+    /// Key-head groups of the delta rule (`ssm.group_count`); used for the
+    /// convolution channel width.
     pub groups: u64,
     /// Per-head key and value state dimension.
     pub state_size: u64,
-    /// Total value width; `inner / groups` is the per-head value dim.
+    /// Total value width.
     pub inner: u64,
     /// Causal convolution kernel length.
     pub conv_kernel: u64,
-    /// Time-step rank (per-head decay parameters).
+    /// Value-head count (`ssm.time_step_rank`); the time-step rank also
+    /// carries the per-head decay parameters.
     pub dt_rank: u64,
+    /// Per-value-head dimension `inner / dt_rank` (validated at resolve).
+    pub head_v: u64,
 }
 
 /// Resolved Qwen3.5 configuration of the served stack.
@@ -66,25 +70,20 @@ pub struct Qwen35Config {
     /// multimodal extension; recorded, never approximated).
     pub rope_sections: Vec<u64>,
     pub rms_eps: f32,
-    /// Full-attention interval over served layers.
-    pub interval: u64,
+    /// Declared full-attention interval; `None` when the layer map comes
+    /// only from an explicit per-layer array.
+    pub interval: Option<u64>,
+    /// Authoritative per-layer kind map: the declared per-layer array when
+    /// present, else the interval rule. Every consumer reads this map, so
+    /// a non-periodic artifact cannot silently fall back to the interval.
+    pub kinds: Vec<Qwen35LayerKind>,
     pub gdn: GdnConfig,
     pub eos_token_id: Option<u32>,
 }
 
 impl Qwen35Config {
-    /// Per-layer kind map: a served layer is full attention iff
-    /// `(i + 1) % interval == 0` (llama.cpp b11695 `qwen35.cpp`).
-    pub fn layer_kinds(&self) -> Vec<Qwen35LayerKind> {
-        (0..self.layers)
-            .map(|i| {
-                if (i + 1) % self.interval == 0 {
-                    Qwen35LayerKind::FullAttention
-                } else {
-                    Qwen35LayerKind::LinearAttention
-                }
-            })
-            .collect()
+    pub fn layer_kinds(&self) -> &[Qwen35LayerKind] {
+        &self.kinds
     }
 
     /// Width of the `ssm_conv1d` channel dimension.
@@ -92,24 +91,26 @@ impl Qwen35Config {
         self.gdn.inner + 2 * self.gdn.groups * self.gdn.state_size
     }
 
-    /// Rows of the GDN QKV projection (q + k + v, all at `inner` width).
+    /// Rows of the GDN QKV projection: the convolution channel width
+    /// (`inner + 2 * groups * state_size`, q + k + v segments).
     pub fn qkv_rows(&self) -> u64 {
-        3 * self.gdn.inner
+        self.conv_channels()
     }
 
     /// Constant per-session state layout (context-independent part).
     pub fn state_layout(&self) -> Qwen35StateLayout {
-        let kinds = self.layer_kinds();
-        let attention_layers = kinds
+        let attention_layers = self
+            .kinds
             .iter()
             .filter(|k| **k == Qwen35LayerKind::FullAttention)
             .count() as u64;
         let recurrent_layers = self.layers - attention_layers;
-        let head_v = self.gdn.inner / self.gdn.groups;
         Qwen35StateLayout {
             recurrent_layers,
             attention_layers,
-            bytes_per_recurrent_layer: self.gdn.groups * self.gdn.state_size * head_v * 4,
+            // Upstream width (llama-hparams.cpp b11695): ssm_d_state *
+            // ssm_d_inner, i.e. time_step_rank x head_v x state_size.
+            bytes_per_recurrent_layer: self.gdn.dt_rank * self.gdn.head_v * self.gdn.state_size * 4,
             bytes_per_conv_layer: (self.gdn.conv_kernel.saturating_sub(1))
                 * self.conv_channels()
                 * 4,
@@ -322,7 +323,77 @@ pub fn resolve(
     let vocab = embd_dims[1];
     index.consumed[token_embd_entry] = true;
 
-    let interval = req("full_attention_interval")?;
+    let interval = inspection
+        .get_u64("qwen35.full_attention_interval")
+        .filter(|v| *v > 0);
+    // The declared per-layer array, when present, is authoritative; the
+    // interval rule (full groups only, llama.cpp `(i + 1) % interval == 0`)
+    // is the fallback. Both paths must leave at least one layer of each
+    // kind — otherwise this is not a hybrid stack.
+    let kinds = match inspection.get("qwen35.attention.recurrent_layers") {
+        None => {
+            let Some(interval) = interval else {
+                return Err(TuckmillError::new(
+                    ErrorCode::UnsupportedArchitecture,
+                    "qwen35: either full_attention_interval or attention.recurrent_layers must be declared",
+                ));
+            };
+            if layers / interval == 0 {
+                return Err(TuckmillError::new(
+                    ErrorCode::UnsupportedArchitecture,
+                    format!(
+                        "qwen35: full-attention interval {interval} exceeds the {layers}-layer served stack"
+                    ),
+                ));
+            }
+            (0..layers)
+                .map(|i| {
+                    if (i + 1) % interval == 0 {
+                        Qwen35LayerKind::FullAttention
+                    } else {
+                        Qwen35LayerKind::LinearAttention
+                    }
+                })
+                .collect::<Vec<_>>()
+        }
+        Some(GgufValue::Array(items)) => {
+            if (items.len() as u64) < layers {
+                return Err(TuckmillError::new(
+                    ErrorCode::UnsupportedArchitecture,
+                    format!(
+                        "qwen35: recurrent layer array has {} entries for {layers} served layers",
+                        items.len()
+                    ),
+                ));
+            }
+            let mut kinds = Vec::with_capacity(layers as usize);
+            for (i, v) in items.iter().take(layers as usize).enumerate() {
+                match v {
+                    GgufValue::Bool(true) => kinds.push(Qwen35LayerKind::LinearAttention),
+                    GgufValue::Bool(false) => kinds.push(Qwen35LayerKind::FullAttention),
+                    other => {
+                        return Err(TuckmillError::new(
+                            ErrorCode::UnsupportedArchitecture,
+                            format!(
+                                "qwen35: recurrent layer array entry {i} is {} but a boolean is required",
+                                other.type_name()
+                            ),
+                        ));
+                    }
+                }
+            }
+            kinds
+        }
+        Some(other) => {
+            return Err(TuckmillError::new(
+                ErrorCode::UnsupportedArchitecture,
+                format!(
+                    "qwen35: recurrent layer key is present but not an array ({})",
+                    other.type_name()
+                ),
+            ));
+        }
+    };
     let sections = match inspection.get("qwen35.rope.dimension_sections") {
         Some(GgufValue::Array(items)) => items
             .iter()
@@ -356,6 +427,16 @@ pub fn resolve(
         None => Vec::new(),
     };
 
+    let inner = req("ssm.inner_size")?;
+    let dt_rank = req("ssm.time_step_rank")?;
+    if !inner.is_multiple_of(dt_rank) {
+        return Err(TuckmillError::new(
+            ErrorCode::UnsupportedArchitecture,
+            format!("qwen35: ssm inner size {inner} is not divisible by time_step_rank {dt_rank}"),
+        ));
+    }
+    let head_v = inner / dt_rank;
+
     let cfg = Qwen35Config {
         layers,
         block_count,
@@ -374,28 +455,20 @@ pub fn resolve(
             .get_f32("qwen35.attention.layer_norm_rms_epsilon")
             .unwrap_or(1e-6),
         interval,
+        kinds,
         gdn: GdnConfig {
             groups: req("ssm.group_count")?,
             state_size: req("ssm.state_size")?,
-            inner: req("ssm.inner_size")?,
+            inner,
             conv_kernel: req("ssm.conv_kernel")?,
-            dt_rank: req("ssm.time_step_rank")?,
+            dt_rank,
+            head_v,
         },
         eos_token_id: inspection
             .get_u64("tokenizer.ggml.eos_token_id")
             .map(|v| v as u32),
     };
-    if !cfg.gdn.inner.is_multiple_of(cfg.gdn.groups) {
-        return Err(TuckmillError::new(
-            ErrorCode::UnsupportedArchitecture,
-            format!(
-                "qwen35: ssm inner size {} is not divisible by group count {}",
-                cfg.gdn.inner, cfg.gdn.groups
-            ),
-        ));
-    }
 
-    let kinds = cfg.layer_kinds();
     let state = cfg.state_layout();
     let attention_layers = state.attention_layers;
     let recurrent_layers = state.recurrent_layers;
@@ -403,7 +476,7 @@ pub fn resolve(
         return Err(TuckmillError::new(
             ErrorCode::UnsupportedArchitecture,
             format!(
-                "qwen35: the interval {interval} splits {layers} served layers into {attention_layers} attention and {recurrent_layers} recurrent layers; a hybrid stack needs both"
+                "qwen35: the resolved layer map splits {layers} served layers into {attention_layers} attention and {recurrent_layers} recurrent layers; a hybrid stack needs both"
             ),
         ));
     }
@@ -432,7 +505,7 @@ pub fn resolve(
 
     // --- tensor map ---
     let mut layers_out = Vec::with_capacity(layers as usize);
-    for (l, kind) in kinds.iter().enumerate() {
+    for (l, kind) in cfg.kinds.iter().enumerate() {
         let p = |s: &str| format!("blk.{l}.{s}");
         let attention = match kind {
             Qwen35LayerKind::LinearAttention => Qwen35AttentionTensors::Linear {
@@ -455,11 +528,7 @@ pub fn resolve(
                     &[cfg.gdn.conv_kernel, cfg.conv_channels()],
                     "GDN conv1d",
                 )?,
-                norm: index.take(
-                    &p("ssm_norm.weight"),
-                    &[cfg.gdn.inner / cfg.gdn.groups],
-                    "GDN norm",
-                )?,
+                norm: index.take(&p("ssm_norm.weight"), &[cfg.gdn.head_v], "GDN norm")?,
                 out: index.take(&p("ssm_out.weight"), &[cfg.gdn.inner, hidden], "GDN out")?,
             },
             Qwen35LayerKind::FullAttention => Qwen35AttentionTensors::Full {
@@ -641,7 +710,7 @@ mod tests {
         let (cfg, layout) = resolve(&insp, &registry()).unwrap();
         assert_eq!(cfg.layers, 4);
         assert_eq!(cfg.block_count, 5, "one MTP block is not served");
-        assert_eq!(cfg.interval, 4);
+        assert_eq!(cfg.interval, Some(4));
         let kinds = cfg.layer_kinds();
         assert_eq!(kinds[0], Qwen35LayerKind::LinearAttention);
         assert_eq!(kinds[1], Qwen35LayerKind::LinearAttention);
@@ -700,6 +769,80 @@ mod tests {
         assert!(err.message().contains("only qwen35"), "{}", err.message());
     }
 
+    /// The declared per-layer array is authoritative even when it is not
+    /// periodic: attention on the first served layer is expressible only
+    /// by the array, and the tensor map follows it.
+    #[test]
+    fn declared_array_is_authoritative_over_the_interval() {
+        let insp = fixture(&SyntheticConfig::tiny_qwen35_nonperiodic_array());
+        let (cfg, layout) = resolve(&insp, &registry()).unwrap();
+        assert_eq!(cfg.interval, Some(4), "the key is still recorded");
+        assert_eq!(cfg.kinds[0], Qwen35LayerKind::FullAttention);
+        assert_eq!(
+            &cfg.kinds[1..],
+            &[Qwen35LayerKind::LinearAttention; 3][..],
+            "the array, not the interval, decides the remaining kinds"
+        );
+        assert_eq!(layout.state.attention_layers, 1);
+        assert_eq!(layout.layers[0].kind(), Qwen35LayerKind::FullAttention);
+        assert!(matches!(
+            layout.layers[0].attention,
+            Qwen35AttentionTensors::Full { .. }
+        ));
+        assert!(matches!(
+            layout.layers[3].attention,
+            Qwen35AttentionTensors::Linear { .. }
+        ));
+    }
+
+    /// A valid array-driven artifact without `full_attention_interval`
+    /// resolves: the array is a complete statement of the layer map.
+    #[test]
+    fn array_only_artifact_resolves_without_an_interval() {
+        let insp = fixture(&SyntheticConfig::tiny_qwen35_array_only());
+        let (cfg, layout) = resolve(&insp, &registry()).unwrap();
+        assert_eq!(cfg.interval, None);
+        assert_eq!(cfg.kinds[0], Qwen35LayerKind::FullAttention);
+        assert_eq!(layout.state.attention_layers, 1);
+        assert_eq!(layout.state.recurrent_layers, 3);
+    }
+
+    /// The value-head geometry comes from `ssm.time_step_rank`, not the
+    /// key-head group count: head_v = inner / dt_rank, and the recurrent
+    /// state width is time_step_rank x head_v x state_size (which equals
+    /// upstream's `ssm_d_state * ssm_d_inner`).
+    #[test]
+    fn value_head_geometry_uses_time_step_rank() {
+        let insp = fixture(&SyntheticConfig::tiny_qwen35());
+        let (cfg, layout) = resolve(&insp, &registry()).unwrap();
+        assert_eq!(cfg.gdn.dt_rank, 2);
+        assert_eq!(cfg.gdn.head_v, 8, "head_v = inner / time_step_rank");
+        assert_eq!(
+            layout.state.bytes_per_recurrent_layer,
+            2 * 8 * 8 * 4,
+            "time_step_rank x head_v x state_size x 4"
+        );
+    }
+
+    /// Malformed arrays refuse in the typed resolver exactly as in the
+    /// adapter: no silent fallback to the interval.
+    #[test]
+    fn malformed_array_is_refused() {
+        let mut cfg = SyntheticConfig::tiny_qwen35();
+        cfg.hybrid.as_mut().unwrap().recurrent_layers_array =
+            Some(tuckmill_manifest::testing::RecurrentLayerFlags::U32s(vec![
+                1, 1, 1, 1,
+            ]));
+        let insp = fixture(&cfg);
+        let err = resolve(&insp, &registry()).unwrap_err();
+        assert_eq!(err.code(), ErrorCode::UnsupportedArchitecture);
+        assert!(
+            err.message().contains("boolean is required"),
+            "{}",
+            err.message()
+        );
+    }
+
     fn real_artifact_path() -> Option<std::path::PathBuf> {
         let p = std::env::var("TUCKMILL_QWEN35_GGUF").ok()?;
         let p = std::path::PathBuf::from(p);
@@ -729,12 +872,13 @@ mod tests {
         assert_eq!(cfg.vocab, 248320);
         assert_eq!(cfg.rope_dims, 64);
         assert_eq!(cfg.rope_sections, vec![11, 11, 10, 0]);
-        assert_eq!(cfg.interval, 4);
+        assert_eq!(cfg.interval, Some(4));
         assert_eq!(cfg.gdn.groups, 16);
         assert_eq!(cfg.gdn.state_size, 128);
         assert_eq!(cfg.gdn.inner, 2048);
         assert_eq!(cfg.gdn.conv_kernel, 4);
         assert_eq!(cfg.gdn.dt_rank, 16);
+        assert_eq!(cfg.gdn.head_v, 128, "head_v = inner / time_step_rank");
         assert_eq!(cfg.eos_token_id, Some(248046));
         assert!(
             layout.output.is_none(),

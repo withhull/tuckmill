@@ -82,3 +82,22 @@ never accepted by any real artifact.
   layout. The adapter's priced geometry and the typed layout are
   cross-checked against each other at resolve time. The loader does not
   call it yet: execution stays refused until the Q35-1 checklist passes.
+
+## Addendum 2 (Q35-1A follow-up)
+
+- **Per-layer arrays are authoritative everywhere.** The adapter already
+  preferred a declared `attention.recurrent_layers` array over the
+  interval; the typed resolver now does the same, so non-periodic maps
+  are honored position-for-position and a valid array-only artifact
+  without `full_attention_interval` resolves. `Qwen35Config` records the
+  interval as optional and stores the resolved kind map that every
+  consumer reads — there is no code path that silently re-derives kinds
+  from the interval.
+- **Value-head geometry derives from `ssm.time_step_rank`.** n_v_heads =
+  time_step_rank, head_v = inner / time_step_rank (validated divisible);
+  upstream `n_embd_s()` is `ssm_d_state * ssm_d_inner`, i.e.
+  time_step_rank x head_v x state_size. The adapter's recurrent-state
+  sizing is now stated with the same derivation (numerically identical to
+  the previous group-based product, which only held because the pinned
+  model has groups == time_step_rank). `ssm_norm` resolves against
+  head_v, not inner/groups.

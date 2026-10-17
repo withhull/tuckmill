@@ -100,11 +100,14 @@ pub struct AttentionLayerSpec {
 
 /// Per-session recurrent state of the linear-attention layers, sized from
 /// the pinned ggml-org Qwen3.5-0.8B GGUF contract (`qwen35.ssm.*` keys;
-/// shapes re-derived from llama.cpp b11695 `src/models/qwen35.cpp` and
-/// registered in ADR-008):
+/// shapes re-derived from llama.cpp b11695 — `src/llama-hparams.cpp`
+/// `n_embd_s()`/`n_embd_r()` and `src/models/qwen35.cpp` — and registered
+/// in ADR-008):
 ///
-/// - delta-rule state per layer: `groups x state_size x (inner_size /
-///   groups)` elements (k-head x v-head matrix per value head);
+/// - delta-rule state per layer: `state_size x inner_size` elements (the
+///   width is `ssm_d_state * ssm_d_inner`; the value-head split
+///   `n_v_heads = ssm.time_step_rank`, `head_v = inner_size / n_v_heads`
+///   multiplies back to `inner_size`, so sizing needs no head split);
 /// - convolution history per layer: `(conv_kernel - 1)` samples of
 ///   `inner_size + 2 * groups * state_size` channels — the width of the
 ///   declared `ssm_conv1d` tensor.
@@ -455,19 +458,12 @@ impl AdapterSpec {
         let state_size = self.get_u64_required(insp, &spec.state_size_key)?;
         let inner = self.get_u64_required(insp, &spec.inner_size_key)?;
         let conv = self.get_u64_required(insp, &spec.conv_kernel_key)?;
-        if inner % groups != 0 {
-            return Err(TuckmillError::new(
-                ErrorCode::UnsupportedArchitecture,
-                format!(
-                    "adapter {}: ssm inner size {inner} is not divisible by group count {groups}",
-                    self.id
-                ),
-            ));
-        }
         let elem = spec.element_bytes as u64;
-        let per_layer_state = groups
+        // Upstream state widths (llama-hparams.cpp b11695): recurrent
+        // `ssm_d_state * ssm_d_inner`, convolution `(d_conv - 1) *
+        // (d_inner + 2 * n_group * d_state)`.
+        let per_layer_state = inner
             .checked_mul(state_size)
-            .and_then(|v| v.checked_mul(inner / groups))
             .and_then(|v| v.checked_mul(elem))
             .ok_or_else(overflow)?;
         let conv_channels = groups
@@ -807,6 +803,20 @@ mod tests {
             "floor(5/4): the trailing partial group adds no attention layer"
         );
         assert_eq!(kv.state_bytes, (512 + 576) * 4, "four recurrent layers");
+    }
+
+    /// A valid array-only artifact (no interval key at all) resolves: the
+    /// declared array is authoritative and the interval is not required.
+    #[test]
+    fn qwen35_array_only_artifact_resolves() {
+        let r = registry();
+        let adapter = r.find("qwen35").unwrap();
+        let insp = inspect_fixture(&SyntheticConfig::tiny_qwen35_array_only());
+        adapter.validate_metadata(&insp).unwrap();
+        let kv = adapter.kv_geometry(&insp).unwrap();
+        assert_eq!(kv.layers, 4);
+        assert_eq!(kv.attention_layers, 1);
+        assert_eq!(kv.state_bytes, (512 + 576) * 3);
     }
 
     /// An interval larger than the served stack leaves no attention layer;
