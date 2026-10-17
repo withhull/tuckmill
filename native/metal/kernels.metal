@@ -967,3 +967,30 @@ kernel void tm_qwen35_attn_gate(device float *attn [[buffer(0)]],
     }
     attn[gid] *= 1.0f / (1.0f + exp(-gate[gid]));
 }
+
+/* x[i] = silu(x[i]) in place (conv output activation, graph order). */
+kernel void tm_qwen35_silu(device float *x [[buffer(0)]],
+                           constant uint &n [[buffer(1)]],
+                           uint gid [[thread_position_in_grid]]) {
+    if (gid >= n) {
+        return;
+    }
+    const float v = x[gid];
+    x[gid] = v / (1.0f + exp(-v));
+}
+
+/* Split the conv output [3*width] into q, k, v [width] each (graph order:
+ * q first, then k, then v). */
+kernel void tm_qwen35_split_qkv(device const float *y [[buffer(0)]],
+                                device float *q [[buffer(1)]],
+                                device float *k [[buffer(2)]],
+                                device float *v [[buffer(3)]],
+                                constant uint &width [[buffer(4)]],
+                                uint gid [[thread_position_in_grid]]) {
+    if (gid >= width) {
+        return;
+    }
+    q[gid] = y[gid];
+    k[gid] = y[width + gid];
+    v[gid] = y[2u * width + gid];
+}

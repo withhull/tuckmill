@@ -268,6 +268,15 @@ int tm_metal_qwen35_attention_f16(tm_metal_ctx *ctx, tm_metal_buffer *q, tm_meta
                                   uint32_t cap, uint32_t head_dim, uint32_t group, float scale,
                                   char *err, size_t err_cap);
 
+/* x[i] = silu(x[i]) in place (conv output activation). */
+int tm_metal_qwen35_silu(tm_metal_ctx *ctx, tm_metal_buffer *x, uint32_t n, char *err,
+                         size_t err_cap);
+
+/* Split the conv output [3*width] into q, k, v [width] each. */
+int tm_metal_qwen35_split_qkv(tm_metal_ctx *ctx, tm_metal_buffer *y, tm_metal_buffer *q,
+                              tm_metal_buffer *k, tm_metal_buffer *v, uint32_t width, char *err,
+                              size_t err_cap);
+
 /* attn[i] *= sigmoid(gate[i]). */
 int tm_metal_qwen35_attn_gate(tm_metal_ctx *ctx, tm_metal_buffer *attn, tm_metal_buffer *gate,
                               uint32_t n, char *err, size_t err_cap);

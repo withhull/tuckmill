@@ -256,3 +256,23 @@ never accepted by any real artifact.
   reference token by token. Recurrent DeltaNet state stays f32. One
   dispatch bug was caught by the pinned shapes and fixed: a 128-thread
   group per head only covered half of the 256-wide rows.
+
+## Addendum 10 (Q35-2B.3: complete device layers)
+
+- **Complete served layers on the device.** `LayerGpu` assembles both
+  layer kinds from the artifact: F16 matrices are uploaded raw and
+  projected with the existing kernels, F32 vectors feed the norm/conv
+  kernels, and every activation stays on the GPU between layers (one
+  Metal context, one allocation ledger). New small kernels: silu in
+  place and the conv-output q/k/v split. All layer state (packed f16
+  KV, f32 delta-rule and convolution state) is device-resident.
+- **Fixture full-model qualification.** A three-token run of the
+  complete fixture model, verified layer by layer against the CPU
+  oracle's activation trace (embedding row and every served layer's
+  hidden state) plus the tied-head logits: worst hidden |diff| 5.4e-7,
+  worst logits |diff| 1.4e-6; registered tolerances 1e-5 / 1e-4.
+- The fixture's distinct GDN state size (8) and attention head dim (16)
+  caught a dimension conflation in the first assembly — exactly the
+  class of bug the pinned-vs-fixture shape pairs exist for.
+- Scope: F16 matrices only; the Q8_0 matrix path and the real-artifact
+  upload/preflight land with Q35-2C.

@@ -447,6 +447,23 @@ mod imp {
             err: *mut c_char,
             err_cap: usize,
         ) -> c_int;
+        pub fn tm_metal_qwen35_silu(
+            ctx: *mut TmMetalCtx,
+            x: *mut TmMetalBuffer,
+            n: u32,
+            err: *mut c_char,
+            err_cap: usize,
+        ) -> c_int;
+        pub fn tm_metal_qwen35_split_qkv(
+            ctx: *mut TmMetalCtx,
+            y: *mut TmMetalBuffer,
+            q: *mut TmMetalBuffer,
+            k: *mut TmMetalBuffer,
+            v: *mut TmMetalBuffer,
+            width: u32,
+            err: *mut c_char,
+            err_cap: usize,
+        ) -> c_int;
         pub fn tm_metal_committed_dispatches(ctx: *const TmMetalCtx) -> u64;
         pub fn tm_metal_completed_dispatches(ctx: *const TmMetalCtx) -> u64;
         pub fn tm_metal_last_gpu_ms(ctx: *const TmMetalCtx) -> f64;
@@ -1232,6 +1249,50 @@ impl MetalContext {
             // SAFETY: raw handles were validated against this context.
             let code = unsafe {
                 imp::tm_metal_qwen35_attn_gate(ctx, ac, gc, n, err.as_mut_ptr(), ERR_CAP)
+            };
+            (code, err)
+        })
+    }
+
+    /// Q35-2B: silu in place (conv output activation).
+    pub fn qwen35_silu(&self, x: &MetalBuffer, n: u32) -> Result<()> {
+        self.check_buffer(x)?;
+        let xc = x.raw;
+        self.operate("qwen35_silu", move |ctx| {
+            let mut err = [0 as c_char; ERR_CAP];
+            // SAFETY: raw handle was validated against this context.
+            let code = unsafe { imp::tm_metal_qwen35_silu(ctx, xc, n, err.as_mut_ptr(), ERR_CAP) };
+            (code, err)
+        })
+    }
+
+    /// Q35-2B: split the conv output into q, k, v planes.
+    pub fn qwen35_split_qkv(
+        &self,
+        y: &MetalBuffer,
+        q: &MetalBuffer,
+        k: &MetalBuffer,
+        v: &MetalBuffer,
+        width: u32,
+    ) -> Result<()> {
+        for buffer in [y, q, k, v] {
+            self.check_buffer(buffer)?;
+        }
+        let (yc, qc, kc, vc) = (y.raw, q.raw, k.raw, v.raw);
+        self.operate("qwen35_split_qkv", move |ctx| {
+            let mut err = [0 as c_char; ERR_CAP];
+            // SAFETY: raw handles were validated against this context.
+            let code = unsafe {
+                imp::tm_metal_qwen35_split_qkv(
+                    ctx,
+                    yc,
+                    qc,
+                    kc,
+                    vc,
+                    width,
+                    err.as_mut_ptr(),
+                    ERR_CAP,
+                )
             };
             (code, err)
         })

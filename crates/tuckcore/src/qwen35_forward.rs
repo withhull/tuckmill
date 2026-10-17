@@ -355,6 +355,31 @@ impl Qwen35Model {
         &self.cfg
     }
 
+    /// Resolved layout (tensor indices per served layer).
+    pub fn layout(&self) -> &Qwen35Layout {
+        &self.layout
+    }
+
+    /// Raw stored bytes of one tensor, exactly as they are on disk (the
+    /// device client uploads these verbatim; no re-quantization).
+    pub fn raw_tensor_bytes(&self, tensor_index: usize) -> Result<Vec<u8>> {
+        let m = *self.meta_of(tensor_index)?;
+        let mut bytes = Vec::new();
+        self.read_bytes(m.offset, m.byte_size as usize, &mut bytes)?;
+        Ok(bytes)
+    }
+
+    /// Stored type id of one tensor.
+    pub fn tensor_type_id(&self, tensor_index: usize) -> Result<u32> {
+        Ok(self.meta_of(tensor_index)?.type_id)
+    }
+
+    /// `(in_dim, out_dim)` of one tensor (1-D tensors read as `(n, 1)`).
+    pub fn tensor_dims(&self, tensor_index: usize) -> Result<(u64, u64)> {
+        let m = self.meta_of(tensor_index)?;
+        Ok((m.in_dim, m.out_dim))
+    }
+
     /// Positions consumed so far (the next token's position).
     pub fn positions(&self) -> usize {
         self.positions
@@ -434,9 +459,9 @@ impl Qwen35Model {
                 }
                 let last = i + 1 == tokens.len();
                 if last {
-                    self.forward_one(*token, Some(logits), Some(cancel))?;
+                    self.forward_one(*token, Some(logits), Some(cancel), None)?;
                 } else {
-                    self.forward_one(*token, None, Some(cancel))?;
+                    self.forward_one(*token, None, Some(cancel), None)?;
                 }
             }
             Ok(())
@@ -447,7 +472,23 @@ impl Qwen35Model {
     /// Single-token step returning that token's logits.
     pub fn forward_token(&mut self, token: u32, logits: &mut Vec<f32>) -> Result<()> {
         self.ensure_valid()?;
-        let result = self.forward_one(token, Some(logits), None);
+        let result = self.forward_one(token, Some(logits), None, None);
+        self.finish(result)
+    }
+
+    /// Single-token step with an activation trace for verification:
+    /// `trace[0]` is the embedding row, `trace[1 + l]` the hidden state
+    /// after served layer `l`. Used to qualify the device layers against
+    /// the oracle layer by layer (Q35-2B.3 / Q35-2C evidence).
+    pub fn forward_token_traced(
+        &mut self,
+        token: u32,
+        logits: &mut Vec<f32>,
+        trace: &mut Vec<Vec<f32>>,
+    ) -> Result<()> {
+        self.ensure_valid()?;
+        trace.clear();
+        let result = self.forward_one(token, Some(logits), None, Some(trace));
         self.finish(result)
     }
 
@@ -456,6 +497,7 @@ impl Qwen35Model {
         token: u32,
         logits: Option<&mut Vec<f32>>,
         cancel: Option<&dyn Fn() -> bool>,
+        mut trace: Option<&mut Vec<Vec<f32>>>,
     ) -> Result<()> {
         let hidden = self.cfg.hidden as usize;
         let vocab = self.cfg.vocab as usize;
@@ -471,6 +513,9 @@ impl Qwen35Model {
         let pos = self.positions;
         let mut x = vec![0.0f32; hidden];
         self.embedding_row(token, &mut x)?;
+        if let Some(t) = trace.as_mut() {
+            t.push(x.clone());
+        }
 
         for l in 0..self.layout.layers.len() {
             if let Some(cancel) = cancel {
@@ -479,6 +524,9 @@ impl Qwen35Model {
                 }
             }
             self.layer(l, &mut x, pos)?;
+            if let Some(t) = trace.as_mut() {
+                t.push(x.clone());
+            }
         }
 
         let norm = self.output_norm.clone();
@@ -595,7 +643,9 @@ impl Qwen35Model {
     }
 
     /// Whole 1-D tensor (or small vector), dequantized.
-    fn read_vector(&self, tensor_index: usize) -> Result<Vec<f32>> {
+    /// Whole 1-D tensor (or small vector), dequantized (device clients
+    /// upload the result for norm/conv/gate kernels).
+    pub fn read_vector(&self, tensor_index: usize) -> Result<Vec<f32>> {
         let m = *self.meta_of(tensor_index)?;
         let mut bytes = Vec::new();
         self.read_bytes(m.offset, m.byte_size as usize, &mut bytes)?;

@@ -1119,3 +1119,607 @@ mod attention_tests {
         assert_close(sigmoid(0.0), 0.5, 1e-7, 1e-7, "sigmoid");
     }
 }
+
+// ---------------------------------------------------------------------------
+// Q35-2B.3: complete device layers (fixture scale: F16 matrices + F32
+// vectors) verified layer-by-layer against the CPU oracle. Q8_0 matrices
+// and the real-artifact upload path land with Q35-2C.
+// ---------------------------------------------------------------------------
+
+use crate::qwen35::Qwen35Layer;
+use crate::qwen35_forward::Qwen35Model;
+
+/// Geometry the device layer dispatch needs, captured from the resolved
+/// config at load time (one source of truth for both layer kinds).
+#[derive(Debug, Clone, Copy)]
+struct LayerGeometry {
+    hidden: usize,
+    ffn: usize,
+    eps: f32,
+    channels: usize,
+    groups: usize,
+    /// GDN delta-rule key/value state size (not the attention head dim).
+    state_size: usize,
+    head_v: usize,
+    dt_rank: usize,
+    conv_kernel: usize,
+    heads: usize,
+    kv_heads: usize,
+    /// Full-attention per-head K/V dimension.
+    head_dim: usize,
+    rope_dims: usize,
+}
+
+impl LayerGeometry {
+    fn from_model(model: &Qwen35Model) -> Self {
+        let cfg = model.config();
+        Self {
+            hidden: cfg.hidden as usize,
+            ffn: cfg.ffn as usize,
+            eps: cfg.rms_eps,
+            channels: cfg.conv_channels() as usize,
+            groups: cfg.gdn.groups as usize,
+            state_size: cfg.gdn.state_size as usize,
+            head_v: cfg.gdn.head_v as usize,
+            dt_rank: cfg.gdn.dt_rank as usize,
+            conv_kernel: cfg.gdn.conv_kernel as usize,
+            heads: cfg.heads as usize,
+            kv_heads: cfg.kv_heads as usize,
+            head_dim: cfg.head_dim as usize,
+            rope_dims: cfg.rope_dims as usize,
+        }
+    }
+}
+
+/// One uploaded weight tensor; matrices stay raw (F16 halves are
+/// uploaded verbatim) and 1-D vectors are raw f32.
+pub struct DeviceTensor {
+    buf: MetalBuffer,
+    in_dim: u64,
+    out_dim: u64,
+}
+
+impl DeviceTensor {
+    fn load(gpu: &Qwen35Gpu, model: &Qwen35Model, index: usize) -> Result<Self> {
+        let bytes = model.raw_tensor_bytes(index)?;
+        let type_id = model.tensor_type_id(index)?;
+        let (in_dim, out_dim) = model.tensor_dims(index)?;
+        if out_dim <= 1 {
+            return Err(TuckmillError::new(
+                ErrorCode::Internal,
+                format!("tensor {index} is 1-D; vectors use the f32 path"),
+            ));
+        }
+        if type_id != 1 {
+            return Err(TuckmillError::new(
+                ErrorCode::UnsupportedQuantization,
+                format!(
+                    "device layer assembly currently wires F16 matrices only; tensor {index} is type {type_id} (Q8_0 lands with Q35-2C)"
+                ),
+            ));
+        }
+        let buf = gpu.buffer(bytes.len())?;
+        buf.upload(0, &bytes)?;
+        Ok(Self {
+            buf,
+            in_dim,
+            out_dim,
+        })
+    }
+
+    fn gemv(&self, gpu: &Qwen35Gpu, x: &MetalBuffer, y: &MetalBuffer) -> Result<()> {
+        gpu.context()
+            .f16_gemv(&self.buf, x, y, self.out_dim as u32, self.in_dim as u32)
+    }
+}
+
+fn vec_buf(gpu: &Qwen35Gpu, values: &[f32]) -> Result<MetalBuffer> {
+    let buf = gpu.buffer(values.len().max(1) * 4)?;
+    buf.upload(0, &f32_bytes(values))?;
+    Ok(buf)
+}
+
+fn zero_buf(gpu: &Qwen35Gpu, elems: usize) -> Result<MetalBuffer> {
+    gpu.buffer(elems.max(1) * 4)
+}
+
+/// Norms, FFN and residual stage shared by both layer kinds.
+struct LayerCommon {
+    geom: LayerGeometry,
+    attn_norm: MetalBuffer,
+    post_norm: MetalBuffer,
+    h: MetalBuffer,
+    h2: MetalBuffer,
+    ffn_gate: DeviceTensor,
+    ffn_up: DeviceTensor,
+    ffn_down: DeviceTensor,
+    ffn_g: MetalBuffer,
+    ffn_u: MetalBuffer,
+    ffn_d: MetalBuffer,
+    proj: MetalBuffer,
+}
+
+impl LayerCommon {
+    fn load(gpu: &Qwen35Gpu, model: &Qwen35Model, layer: &Qwen35Layer) -> Result<Self> {
+        let geom = LayerGeometry::from_model(model);
+        Ok(Self {
+            attn_norm: vec_buf(gpu, &model.read_vector(layer.attn_norm.index)?)?,
+            post_norm: vec_buf(gpu, &model.read_vector(layer.post_attn_norm.index)?)?,
+            h: zero_buf(gpu, geom.hidden)?,
+            h2: zero_buf(gpu, geom.hidden)?,
+            ffn_gate: DeviceTensor::load(gpu, model, layer.ffn_gate.index)?,
+            ffn_up: DeviceTensor::load(gpu, model, layer.ffn_up.index)?,
+            ffn_down: DeviceTensor::load(gpu, model, layer.ffn_down.index)?,
+            ffn_g: zero_buf(gpu, geom.ffn)?,
+            ffn_u: zero_buf(gpu, geom.ffn)?,
+            ffn_d: zero_buf(gpu, geom.hidden)?,
+            proj: zero_buf(gpu, geom.hidden)?,
+            geom,
+        })
+    }
+
+    /// Post-attention norm, SwiGLU FFN, residual add on `x`.
+    fn ffn_residual(&self, gpu: &Qwen35Gpu, x: &MetalBuffer) -> Result<()> {
+        let ctx = gpu.context();
+        ctx.rmsnorm(
+            x,
+            &self.post_norm,
+            &self.h2,
+            1,
+            self.geom.hidden as u32,
+            self.geom.eps,
+        )?;
+        self.ffn_gate.gemv(gpu, &self.h2, &self.ffn_g)?;
+        self.ffn_up.gemv(gpu, &self.h2, &self.ffn_u)?;
+        // SwiGLU in place: `out` aliases `gate`; the kernel reads each
+        // element before writing it.
+        ctx.silu_mul(&self.ffn_g, &self.ffn_u, &self.ffn_g, self.geom.ffn as u32)?;
+        self.ffn_down.gemv(gpu, &self.ffn_g, &self.ffn_d)?;
+        ctx.f32_axpy(&self.ffn_d, x, 1.0, self.geom.hidden as u32)
+    }
+}
+
+pub struct GdnLayerGpu {
+    common: LayerCommon,
+    qkv: DeviceTensor,
+    z: DeviceTensor,
+    alpha: DeviceTensor,
+    beta: DeviceTensor,
+    out_proj: DeviceTensor,
+    ssm_a: MetalBuffer,
+    ssm_dt: MetalBuffer,
+    ssm_norm: MetalBuffer,
+    conv_w: MetalBuffer,
+    state: MetalBuffer,
+    hist: MetalBuffer,
+    qkv_out: MetalBuffer,
+    conv_y: MetalBuffer,
+    q: MetalBuffer,
+    k: MetalBuffer,
+    v: MetalBuffer,
+    z_out: MetalBuffer,
+    alpha_out: MetalBuffer,
+    beta_raw: MetalBuffer,
+    beta_out: MetalBuffer,
+    gate: MetalBuffer,
+    o: MetalBuffer,
+    gated: MetalBuffer,
+}
+
+pub struct AttentionLayerGpu {
+    common: LayerCommon,
+    q_w: DeviceTensor,
+    k_w: DeviceTensor,
+    v_w: DeviceTensor,
+    o_w: DeviceTensor,
+    q_norm: MetalBuffer,
+    k_norm: MetalBuffer,
+    inv_freq: MetalBuffer,
+    k_cache: MetalBuffer,
+    v_cache: MetalBuffer,
+    qg: MetalBuffer,
+    q: MetalBuffer,
+    gate: MetalBuffer,
+    k: MetalBuffer,
+    v: MetalBuffer,
+    attn: MetalBuffer,
+    kv_scratch: MetalBuffer,
+    cache_cap: usize,
+}
+
+/// A complete served layer executed entirely on the device.
+pub enum LayerGpu {
+    Gdn(Box<GdnLayerGpu>),
+    Attention(Box<AttentionLayerGpu>),
+}
+
+impl LayerGpu {
+    /// Upload one served layer's weights and allocate its state and
+    /// scratch (fixture scale: F16 matrices, F32 vectors).
+    pub fn load(gpu: &Qwen35Gpu, model: &Qwen35Model, l: usize, capacity: usize) -> Result<Self> {
+        let layer = &model.layout().layers[l];
+        let common = LayerCommon::load(gpu, model, layer)?;
+        let geom = common.geom;
+        match &layer.attention {
+            crate::qwen35::Qwen35AttentionTensors::Linear {
+                qkv,
+                gate,
+                a,
+                dt,
+                alpha,
+                beta,
+                conv1d,
+                norm,
+                out,
+            } => Ok(LayerGpu::Gdn(Box::new(GdnLayerGpu {
+                qkv: DeviceTensor::load(gpu, model, qkv.index)?,
+                z: DeviceTensor::load(gpu, model, gate.index)?,
+                alpha: DeviceTensor::load(gpu, model, alpha.index)?,
+                beta: DeviceTensor::load(gpu, model, beta.index)?,
+                out_proj: DeviceTensor::load(gpu, model, out.index)?,
+                ssm_a: vec_buf(gpu, &model.read_vector(a.index)?)?,
+                ssm_dt: vec_buf(gpu, &model.read_vector(dt.index)?)?,
+                ssm_norm: vec_buf(gpu, &model.read_vector(norm.index)?)?,
+                conv_w: vec_buf(gpu, &model.read_vector(conv1d.index)?)?,
+                state: zero_buf(gpu, geom.groups * geom.state_size * geom.head_v)?,
+                hist: zero_buf(
+                    gpu,
+                    geom.conv_kernel.saturating_sub(1).max(1) * geom.channels,
+                )?,
+                qkv_out: zero_buf(gpu, geom.channels)?,
+                conv_y: zero_buf(gpu, geom.channels)?,
+                q: zero_buf(gpu, geom.groups * geom.state_size)?,
+                k: zero_buf(gpu, geom.groups * geom.state_size)?,
+                v: zero_buf(gpu, geom.head_v * geom.dt_rank)?,
+                z_out: zero_buf(gpu, geom.head_v * geom.dt_rank)?,
+                alpha_out: zero_buf(gpu, geom.dt_rank)?,
+                beta_raw: zero_buf(gpu, geom.dt_rank)?,
+                beta_out: zero_buf(gpu, geom.dt_rank)?,
+                gate: zero_buf(gpu, geom.dt_rank)?,
+                o: zero_buf(gpu, geom.head_v * geom.dt_rank)?,
+                gated: zero_buf(gpu, geom.head_v * geom.dt_rank)?,
+                common,
+            }))),
+            crate::qwen35::Qwen35AttentionTensors::Full {
+                q,
+                k,
+                v,
+                output,
+                q_norm,
+                k_norm,
+            } => Ok(LayerGpu::Attention(Box::new(AttentionLayerGpu {
+                q_w: DeviceTensor::load(gpu, model, q.index)?,
+                k_w: DeviceTensor::load(gpu, model, k.index)?,
+                v_w: DeviceTensor::load(gpu, model, v.index)?,
+                o_w: DeviceTensor::load(gpu, model, output.index)?,
+                q_norm: vec_buf(gpu, &model.read_vector(q_norm.index)?)?,
+                k_norm: vec_buf(gpu, &model.read_vector(k_norm.index)?)?,
+                inv_freq: vec_buf(
+                    gpu,
+                    &crate::qwen35_ops::rope_inv_freq_partial(
+                        geom.rope_dims,
+                        model.config().rope_base,
+                    ),
+                )?,
+                k_cache: gpu.buffer(geom.kv_heads * capacity * geom.head_dim * 2)?,
+                v_cache: gpu.buffer(geom.kv_heads * capacity * geom.head_dim * 2)?,
+                qg: zero_buf(gpu, geom.heads * geom.head_dim * 2)?,
+                q: zero_buf(gpu, geom.heads * geom.head_dim)?,
+                gate: zero_buf(gpu, geom.heads * geom.head_dim)?,
+                k: zero_buf(gpu, geom.kv_heads * geom.head_dim)?,
+                v: zero_buf(gpu, geom.kv_heads * geom.head_dim)?,
+                attn: zero_buf(gpu, geom.heads * geom.head_dim)?,
+                kv_scratch: zero_buf(gpu, geom.heads * capacity)?,
+                cache_cap: capacity,
+                common,
+            }))),
+        }
+    }
+
+    /// One decode step for this layer, in place on `x`.
+    pub fn forward(&self, gpu: &Qwen35Gpu, x: &MetalBuffer, pos: u32) -> Result<()> {
+        match self {
+            LayerGpu::Gdn(l) => l.forward(gpu, x),
+            LayerGpu::Attention(l) => l.forward(gpu, x, pos),
+        }
+    }
+}
+
+impl GdnLayerGpu {
+    fn forward(&self, gpu: &Qwen35Gpu, x: &MetalBuffer) -> Result<()> {
+        let ctx = gpu.context();
+        let geom = self.common.geom;
+        ctx.rmsnorm(
+            x,
+            &self.common.attn_norm,
+            &self.common.h,
+            1,
+            geom.hidden as u32,
+            geom.eps,
+        )?;
+        self.qkv.gemv(gpu, &self.common.h, &self.qkv_out)?;
+        gpu.conv_step_dev(
+            &self.hist,
+            &self.qkv_out,
+            &self.conv_w,
+            &self.conv_y,
+            geom.channels as u32,
+            geom.conv_kernel as u32,
+        )?;
+        ctx.qwen35_silu(&self.conv_y, geom.channels as u32)?;
+        ctx.qwen35_split_qkv(
+            &self.conv_y,
+            &self.q,
+            &self.k,
+            &self.v,
+            (geom.groups * geom.state_size) as u32,
+        )?;
+        gpu.l2norm_dev(
+            &self.q,
+            &self.q,
+            geom.groups as u32,
+            geom.state_size as u32,
+            geom.eps,
+        )?;
+        gpu.l2norm_dev(
+            &self.k,
+            &self.k,
+            geom.groups as u32,
+            geom.state_size as u32,
+            geom.eps,
+        )?;
+        self.z.gemv(gpu, &self.common.h, &self.z_out)?;
+        self.alpha.gemv(gpu, &self.common.h, &self.alpha_out)?;
+        self.beta.gemv(gpu, &self.common.h, &self.beta_raw)?;
+        gpu.beta_decay_dev(
+            &self.beta_raw,
+            &self.alpha_out,
+            &self.ssm_dt,
+            &self.ssm_a,
+            &self.beta_out,
+            &self.gate,
+            geom.dt_rank as u32,
+        )?;
+        gpu.gdn_step_dev(
+            &self.q,
+            &self.k,
+            &self.v,
+            &self.gate,
+            &self.beta_out,
+            &self.state,
+            &self.o,
+            geom.groups as u32,
+            geom.state_size as u32,
+            geom.head_v as u32,
+            1.0 / (geom.state_size as f32).sqrt(),
+        )?;
+        gpu.gated_norm_dev(
+            &self.o,
+            &self.z_out,
+            &self.ssm_norm,
+            &self.gated,
+            geom.dt_rank as u32,
+            geom.head_v as u32,
+            geom.eps,
+        )?;
+        self.out_proj.gemv(gpu, &self.gated, &self.common.proj)?;
+        ctx.f32_axpy(&self.common.proj, x, 1.0, geom.hidden as u32)?;
+        self.common.ffn_residual(gpu, x)
+    }
+}
+
+impl AttentionLayerGpu {
+    fn forward(&self, gpu: &Qwen35Gpu, x: &MetalBuffer, pos: u32) -> Result<()> {
+        let ctx = gpu.context();
+        let geom = self.common.geom;
+        ctx.rmsnorm(
+            x,
+            &self.common.attn_norm,
+            &self.common.h,
+            1,
+            geom.hidden as u32,
+            geom.eps,
+        )?;
+        self.q_w.gemv(gpu, &self.common.h, &self.qg)?;
+        gpu.q_gate_split_dev(
+            &self.qg,
+            &self.q,
+            &self.gate,
+            geom.heads as u32,
+            geom.head_dim as u32,
+        )?;
+        self.k_w.gemv(gpu, &self.common.h, &self.k)?;
+        self.v_w.gemv(gpu, &self.common.h, &self.v)?;
+        ctx.rmsnorm(
+            &self.q,
+            &self.q_norm,
+            &self.q,
+            geom.heads as u32,
+            geom.head_dim as u32,
+            geom.eps,
+        )?;
+        ctx.rmsnorm(
+            &self.k,
+            &self.k_norm,
+            &self.k,
+            geom.kv_heads as u32,
+            geom.head_dim as u32,
+            geom.eps,
+        )?;
+        gpu.rope_partial_dev(
+            &self.q,
+            &self.k,
+            &self.inv_freq,
+            pos,
+            geom.heads as u32,
+            geom.kv_heads as u32,
+            geom.head_dim as u32,
+            geom.rope_dims as u32,
+        )?;
+        gpu.kv_store_f16_dev(
+            &self.k,
+            &self.v,
+            &self.k_cache,
+            &self.v_cache,
+            pos,
+            self.cache_cap as u32,
+            geom.head_dim as u32,
+            geom.kv_heads as u32,
+        )?;
+        gpu.attention_f16_dev(
+            &self.q,
+            &self.k_cache,
+            &self.v_cache,
+            &self.attn,
+            &self.kv_scratch,
+            geom.heads as u32,
+            pos,
+            self.cache_cap as u32,
+            geom.head_dim as u32,
+            (geom.heads / geom.kv_heads) as u32,
+            1.0 / (geom.head_dim as f32).sqrt(),
+        )?;
+        gpu.attn_gate_dev(&self.attn, &self.gate, (geom.heads * geom.head_dim) as u32)?;
+        self.o_w.gemv(gpu, &self.attn, &self.common.proj)?;
+        ctx.f32_axpy(&self.common.proj, x, 1.0, geom.hidden as u32)?;
+        self.common.ffn_residual(gpu, x)
+    }
+}
+
+#[cfg(test)]
+mod layer_tests {
+    use super::*;
+    use crate::qwen35_kv::KvPrecision;
+    use tuckmill_manifest::testing::{synthetic_qwen3_bytes, SyntheticConfig};
+
+    fn gpu_or_skip() -> Option<()> {
+        let probe = probe();
+        if !probe.available {
+            assert!(
+                std::env::var("TUCKMILL_REQUIRE_METAL").is_err(),
+                "TUCKMILL_REQUIRE_METAL is set but no Metal device is available"
+            );
+            eprintln!("skipping: no Metal device");
+            return None;
+        }
+        Some(())
+    }
+
+    fn assert_close(got: f32, want: f32, abs: f32, rel: f32, what: &str) -> f32 {
+        let tol = abs + rel * want.abs();
+        assert!(
+            (got - want).abs() <= tol,
+            "{what}: {got} vs {want} (tol {tol})"
+        );
+        (got - want).abs()
+    }
+
+    /// Registered device-vs-oracle tolerances for the complete fixture
+    /// model (observed worst: hidden 5.4e-7, logits 1.4e-6 over 3 tokens).
+    const HIDDEN_TOL: f32 = 1e-5;
+    const LOGITS_TOL: f32 = 1e-4;
+
+    fn device_f32(buf: &MetalBuffer, n: usize) -> Vec<f32> {
+        let mut b = vec![0u8; n * 4];
+        buf.download(0, &mut b).unwrap();
+        bytes_f32(&b)
+    }
+
+    /// Complete fixture-model verification: every served layer executes on
+    /// the device (weights and activations stay on the GPU between
+    /// layers) and each hidden state matches the CPU oracle bit-close;
+    /// the final tied logits agree with the oracle's.
+    #[test]
+    fn fixture_device_layers_match_the_cpu_oracle_layer_by_layer() {
+        if gpu_or_skip().is_none() {
+            return;
+        }
+        let bytes = synthetic_qwen3_bytes(&SyntheticConfig::tiny_qwen35());
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("q35.gguf");
+        std::fs::write(&path, &bytes).unwrap();
+        let capacity = 8usize;
+        let mut cpu = Qwen35Model::open(&path, capacity, KvPrecision::F16).unwrap();
+        let gpu = Qwen35Gpu::open().unwrap();
+
+        let hidden = cpu.config().hidden as usize;
+        let vocab = cpu.config().vocab as usize;
+        let eps = cpu.config().rms_eps;
+
+        let layers: Vec<LayerGpu> = (0..cpu.layout().layers.len())
+            .map(|l| LayerGpu::load(&gpu, &cpu, l, capacity).unwrap())
+            .collect();
+        let output_norm = vec_buf(
+            &gpu,
+            &cpu.read_vector(cpu.layout().output_norm.index).unwrap(),
+        )
+        .unwrap();
+        let tied = DeviceTensor::load(&gpu, &cpu, cpu.layout().token_embd.index).unwrap();
+        let x = zero_buf(&gpu, hidden).unwrap();
+        let h = zero_buf(&gpu, hidden).unwrap();
+        let logits_buf = zero_buf(&gpu, vocab).unwrap();
+        let embed_buf = gpu.buffer(hidden * 2).unwrap();
+        let embed_bytes = cpu.raw_tensor_bytes(cpu.layout().token_embd.index).unwrap();
+
+        let tokens = [3u32, 11, 29];
+        let mut worst_hidden = 0.0f32;
+        let mut worst_logits = 0.0f32;
+        for (pos, token) in tokens.iter().enumerate() {
+            let mut cpu_logits = Vec::new();
+            let mut trace = Vec::new();
+            cpu.forward_token_traced(*token, &mut cpu_logits, &mut trace)
+                .unwrap();
+
+            // Embedding row: the fixture's token_embd is F16, uploaded raw.
+            let start = *token as usize * hidden * 2;
+            embed_buf
+                .upload(0, &embed_bytes[start..start + hidden * 2])
+                .unwrap();
+            gpu.context()
+                .cast_f16_to_f32(&embed_buf, &x, hidden as u32)
+                .unwrap();
+            let gx = device_f32(&x, hidden);
+            for (g, c) in gx.iter().zip(trace[0].iter()) {
+                worst_hidden =
+                    worst_hidden.max(assert_close(*g, *c, HIDDEN_TOL, HIDDEN_TOL, "embedding"));
+            }
+
+            for (l, layer) in layers.iter().enumerate() {
+                layer.forward(&gpu, &x, pos as u32).unwrap();
+                let gx = device_f32(&x, hidden);
+                for (g, c) in gx.iter().zip(trace[l + 1].iter()) {
+                    worst_hidden = worst_hidden.max(assert_close(
+                        *g,
+                        *c,
+                        HIDDEN_TOL,
+                        HIDDEN_TOL,
+                        &format!("layer {l}"),
+                    ));
+                }
+            }
+
+            gpu.context()
+                .rmsnorm(&x, &output_norm, &h, 1, hidden as u32, eps)
+                .unwrap();
+            tied.gemv(&gpu, &h, &logits_buf).unwrap();
+            let gpu_logits = device_f32(&logits_buf, vocab);
+            let mut top_gpu = 0usize;
+            let mut top_cpu = 0usize;
+            for i in 0..vocab {
+                if gpu_logits[i] > gpu_logits[top_gpu] {
+                    top_gpu = i;
+                }
+                if cpu_logits[i] > cpu_logits[top_cpu] {
+                    top_cpu = i;
+                }
+                worst_logits = worst_logits.max((gpu_logits[i] - cpu_logits[i]).abs());
+            }
+            assert_eq!(top_gpu, top_cpu, "token {token}: top-1 matches the oracle");
+        }
+        eprintln!(
+            "fixture device model: worst hidden|diff| {worst_hidden:.3e}, worst logits|diff| {worst_logits:.3e} over {tokens:?}"
+        );
+        assert!(worst_hidden <= HIDDEN_TOL, "registered hidden tolerance");
+        assert!(worst_logits <= LOGITS_TOL, "registered logits tolerance");
+    }
+}

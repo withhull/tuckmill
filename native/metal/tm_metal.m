@@ -50,6 +50,8 @@ struct tm_metal_ctx {
     id<MTLComputePipelineState> pso_q35_kv_store_f16;
     id<MTLComputePipelineState> pso_q35_attention_f16;
     id<MTLComputePipelineState> pso_q35_attn_gate;
+    id<MTLComputePipelineState> pso_q35_silu;
+    id<MTLComputePipelineState> pso_q35_split_qkv;
     /* Last committed command buffer (retained); the queue executes in
      * order, so waiting on it fences everything committed before it. */
     id<MTLCommandBuffer> pending;
@@ -290,6 +292,8 @@ tm_metal_ctx *tm_metal_create(const char *msl_source, char *err, size_t err_cap)
         ctx->pso_q35_kv_store_f16 = tm_pipeline(ctx, @"tm_qwen35_kv_store_f16", &error);
         ctx->pso_q35_attention_f16 = tm_pipeline(ctx, @"tm_qwen35_attention_f16", &error);
         ctx->pso_q35_attn_gate = tm_pipeline(ctx, @"tm_qwen35_attn_gate", &error);
+        ctx->pso_q35_silu = tm_pipeline(ctx, @"tm_qwen35_silu", &error);
+        ctx->pso_q35_split_qkv = tm_pipeline(ctx, @"tm_qwen35_split_qkv", &error);
         if (ctx->pso_scale == nil || ctx->pso_axpy == nil || ctx->pso_f16f32 == nil ||
             ctx->pso_f32f16 == nil || ctx->pso_q8gemv == nil || ctx->pso_f16gemv == nil ||
             ctx->pso_q8row == nil || ctx->pso_rmsnorm == nil || ctx->pso_rope == nil ||
@@ -303,7 +307,8 @@ tm_metal_ctx *tm_metal_create(const char *msl_source, char *err, size_t err_cap)
             ctx->pso_q35_gdn_step == nil || ctx->pso_q35_gated_norm == nil ||
             ctx->pso_q35_qg_split == nil || ctx->pso_q35_rope_partial == nil ||
             ctx->pso_q35_kv_store_f16 == nil || ctx->pso_q35_attention_f16 == nil ||
-            ctx->pso_q35_attn_gate == nil) {
+            ctx->pso_q35_attn_gate == nil || ctx->pso_q35_silu == nil ||
+            ctx->pso_q35_split_qkv == nil) {
             tm_set_err(err, err_cap,
                        [NSString stringWithFormat:@"pipeline creation failed: %@",
                                                   error != nil ? [error localizedDescription] : @"unknown"]);
@@ -1763,5 +1768,74 @@ int tm_metal_qwen35_attn_gate(tm_metal_ctx *ctx, tm_metal_buffer *attn, tm_metal
         [enc dispatchThreads:MTLSizeMake((NSUInteger)n, 1, 1)
             threadsPerThreadgroup:MTLSizeMake(tg, 1, 1)];
         return tm_frame_commit(ctx, &f, err, err_cap, "qwen35_attn_gate");
+    }
+}
+
+int tm_metal_qwen35_silu(tm_metal_ctx *ctx, tm_metal_buffer *x, uint32_t n, char *err,
+                         size_t err_cap) {
+    if (tm_check_ctx(ctx, err, err_cap, "q35_silu") != TM_METAL_OK) {
+        return TM_METAL_ERR_UNSUPPORTED;
+    }
+    if (n == 0) {
+        return tm_fail(err, err_cap, TM_METAL_ERR_BOUNDS, @"q35_silu: zero length");
+    }
+    if (tm_check_buffer(ctx, x, (size_t)n * 4u, err, err_cap, "q35_silu.x") != TM_METAL_OK) {
+        return TM_METAL_ERR_BOUNDS;
+    }
+    @autoreleasepool {
+        tm_frame f;
+        id<MTLComputeCommandEncoder> enc = tm_frame_open(ctx, &f);
+        if (enc == nil) {
+            return tm_fail(err, err_cap, TM_METAL_ERR_INTERNAL, @"q35_silu: no encoder");
+        }
+        [enc setComputePipelineState:ctx->pso_q35_silu];
+        [enc setBuffer:x->buffer offset:0 atIndex:0];
+        [f.keep addObject:x->buffer];
+        [enc setBytes:&n length:sizeof(n) atIndex:1];
+        NSUInteger width = ctx->pso_q35_silu.threadExecutionWidth;
+        NSUInteger tg = width > 0 ? width * 8 : 256;
+        [enc dispatchThreads:MTLSizeMake((NSUInteger)n, 1, 1)
+            threadsPerThreadgroup:MTLSizeMake(tg, 1, 1)];
+        return tm_frame_commit(ctx, &f, err, err_cap, "qwen35_silu");
+    }
+}
+
+int tm_metal_qwen35_split_qkv(tm_metal_ctx *ctx, tm_metal_buffer *y, tm_metal_buffer *q,
+                              tm_metal_buffer *k, tm_metal_buffer *v, uint32_t width, char *err,
+                              size_t err_cap) {
+    if (tm_check_ctx(ctx, err, err_cap, "q35_split_qkv") != TM_METAL_OK) {
+        return TM_METAL_ERR_UNSUPPORTED;
+    }
+    if (width == 0) {
+        return tm_fail(err, err_cap, TM_METAL_ERR_BOUNDS, @"q35_split_qkv: zero width");
+    }
+    size_t qk = (size_t)width * 4u;
+    if (tm_check_buffer(ctx, y, qk * 3u, err, err_cap, "split_qkv.y") != TM_METAL_OK ||
+        tm_check_buffer(ctx, q, qk, err, err_cap, "split_qkv.q") != TM_METAL_OK ||
+        tm_check_buffer(ctx, k, qk, err, err_cap, "split_qkv.k") != TM_METAL_OK ||
+        tm_check_buffer(ctx, v, qk, err, err_cap, "split_qkv.v") != TM_METAL_OK) {
+        return TM_METAL_ERR_BOUNDS;
+    }
+    @autoreleasepool {
+        tm_frame f;
+        id<MTLComputeCommandEncoder> enc = tm_frame_open(ctx, &f);
+        if (enc == nil) {
+            return tm_fail(err, err_cap, TM_METAL_ERR_INTERNAL, @"q35_split_qkv: no encoder");
+        }
+        [enc setComputePipelineState:ctx->pso_q35_split_qkv];
+        [enc setBuffer:y->buffer offset:0 atIndex:0];
+        [enc setBuffer:q->buffer offset:0 atIndex:1];
+        [enc setBuffer:k->buffer offset:0 atIndex:2];
+        [enc setBuffer:v->buffer offset:0 atIndex:3];
+        [f.keep addObject:y->buffer];
+        [f.keep addObject:q->buffer];
+        [f.keep addObject:k->buffer];
+        [f.keep addObject:v->buffer];
+        [enc setBytes:&width length:sizeof(width) atIndex:4];
+        NSUInteger tw = ctx->pso_q35_split_qkv.threadExecutionWidth;
+        NSUInteger tg = tw > 0 ? tw * 8 : 256;
+        [enc dispatchThreads:MTLSizeMake((NSUInteger)width, 1, 1)
+            threadsPerThreadgroup:MTLSizeMake(tg, 1, 1)];
+        return tm_frame_commit(ctx, &f, err, err_cap, "qwen35_split_qkv");
     }
 }
