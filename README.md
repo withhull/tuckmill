@@ -208,9 +208,10 @@ are mandatory in the gate (`TUCKMILL_TEST_WORKER_BIN`, with
 `TUCKMILL_REQUIRE_ISOLATED_WORKER=1` making a missing binary a failure, not
 a skip); real-weight reference tests (pinned llama.cpp library,
 `TUCKMILL_REAL_GGUF`) and physical-Mac qualification are separate,
-machine-local gates. GPU tests run whenever a Metal device is present and
-are mandatory in the repository gate (`TUCKMILL_REQUIRE_METAL=1`); absence
-of a device fails there instead of skipping.
+machine-local gates. GPU tests are mandatory in the repository gate and in
+CI (`TUCKMILL_REQUIRE_METAL=1`; the macOS runners expose a Metal GPU — the
+kernel suite executed there, zero skips); absence of a device fails instead
+of skipping.
 `rust-toolchain.toml` pins Rust 1.96.0 and CI runs that same pinned
 toolchain — a floating stable once failed the remote gate on lints the local
 toolchain could not reproduce (run 38910541208). `scripts/demo.sh` exercises

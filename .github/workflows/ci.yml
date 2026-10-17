@@ -34,6 +34,10 @@ jobs:
         env:
           TUCKMILL_TEST_WORKER_BIN: ${{ github.workspace }}/target/debug/tuckmill
           TUCKMILL_REQUIRE_ISOLATED_WORKER: "1"
+          # The macOS runners expose a Metal GPU (verified in run 39021321957:
+          # GPU kernel tests executed, zero skips); a runner without a device
+          # must fail the gate, never silently skip the GPU suite.
+          TUCKMILL_REQUIRE_METAL: "1"
         run: cargo test --workspace
       # The llama.cpp reference backend, the pinned shim, and physical-Mac
       # qualification runs are intentionally NOT part of this workflow:
