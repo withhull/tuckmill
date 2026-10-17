@@ -27,8 +27,15 @@ quality.
 > vectorization from copy-avoidance effects. Kernel implementation and
 > weight storage are explicit, recorded load choices (`--kernels`,
 > `--storage`); eviction counts are never presented as RAM release.
-> Nothing is certified; no Metal kernel exists (K02–K09 specified); no
-> performance comparative claim is made. Stage A verification is hardened:
+> Nothing is certified; no performance comparative claim is made. The
+> TuckCore Metal path started at Gate C: C0/C1 implement one device/queue
+> owner, typed GPU resource handles with live allocation accounting,
+> completion-fenced dispatch, and the first kernels (packed Q8_0
+> matrix-vector decode plus F16/F32 utilities) compiled from
+> `native/metal/kernels.metal` at this revision and validated against the
+> scalar reference on real tensor shapes and real artifact tensor bytes
+> (ADR-007). Model execution on the GPU is not implemented yet (C2 next);
+> K02–K09 remain specified. Stage A verification is hardened:
 > malformed scoring fails closed, verification records are immutable with
 > held-out qualification, the governor drives real backend commands
 > (protocol v7), tokenization is reference-first (llama.cpp when configured;
@@ -177,6 +184,7 @@ crates/llamaref     pinned llama.cpp reference backend (dlopen of the checked tm
 crates/supervisor   queue, ledger, governor, worker protocol/process, API, bench, verify
 crates/cli          the tuckmill binary (incl. hidden __worker-reference)
 native/executor     C ABI header + protocol spec (PROTOCOL.md, v7)
+native/metal        TuckCore Metal path: C ABI (tm_metal.h) + MSL kernels (ADR-007)
 native/llamaref     tm_llama_shim.c: narrow C surface over pinned llama.cpp
 kernels/            K01–K09 work-package registry (K01 implemented increment; K02–K09 specified)
 adapters/           qwen3, qwen3moe, qwen3.5-hybrid, bonsai2-hybrid specs
@@ -189,7 +197,7 @@ scripts/            build.sh, test.sh, demo.sh
 ## Verification and benchmarks
 
 `scripts/test.sh` runs formatting, `clippy -D warnings`, and the full test
-suite (360 tests),
+suite (371 tests),
 including adversarial GGUF/Safetensors fixtures, planner math, governor
 semantics, import/pack fault injection, worker-protocol framing, HTTP
 auth/SSE (including long streams through the real endpoint), CLI end-to-end
@@ -200,7 +208,9 @@ are mandatory in the gate (`TUCKMILL_TEST_WORKER_BIN`, with
 `TUCKMILL_REQUIRE_ISOLATED_WORKER=1` making a missing binary a failure, not
 a skip); real-weight reference tests (pinned llama.cpp library,
 `TUCKMILL_REAL_GGUF`) and physical-Mac qualification are separate,
-machine-local gates.
+machine-local gates. GPU tests run whenever a Metal device is present and
+are mandatory in the repository gate (`TUCKMILL_REQUIRE_METAL=1`); absence
+of a device fails there instead of skipping.
 `rust-toolchain.toml` pins Rust 1.96.0 and CI runs that same pinned
 toolchain — a floating stable once failed the remote gate on lints the local
 toolchain could not reproduce (run 38910541208). `scripts/demo.sh` exercises

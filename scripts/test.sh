@@ -14,6 +14,7 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo build -p tuckmill-cli
 TUCKMILL_TEST_WORKER_BIN="$PWD/target/debug/tuckmill" \
 TUCKMILL_REQUIRE_ISOLATED_WORKER=1 \
+TUCKMILL_REQUIRE_METAL=1 \
 cargo test --workspace
 
 echo "all checks passed"

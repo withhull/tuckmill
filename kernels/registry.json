@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "revision_note": "Work packages K01-K09 from PRD v0.2 section 11.3. K01 has its first implemented increment (aarch64 NEON fused packed dot for Q8_0/F16 + zero-copy mapped weight blocks, validated against scalar references and the llama.cpp envelope); the remaining packages are specified. A kernel must never be selected before its correctness gate passes; every selection retains a validated reference fallback decision. This is a CPU kernel increment; the Metal kernel path remains unbuilt.",
+  "revision_note": "Work packages K01-K09 from PRD v0.2 section 11.3. K01 has two implemented increments: the aarch64 NEON fused packed dot for Q8_0/F16 with zero-copy mapped weight blocks (CPU, validated against scalar references and the llama.cpp envelope) and the first Metal increment added with Gate C (C0/C1): device/queue owner, typed resource handles with allocation accounting, packed Q8_0 matrix-vector decode and F16/F32 utility kernels, validated against the scalar reference on real tensor shapes and real artifact tensor bytes (crates/metal, native/metal, ADR-007). The remaining packages are specified; a kernel must never be selected before its correctness gate passes, and every selection retains a validated reference fallback decision. Model execution on the GPU is not implemented yet (C2).",
   "kernels": [
     {
       "id": "K01",
@@ -10,7 +10,8 @@
       "gates": [
         "exact format/scale decoding",
         "bounded tiles, no full dequantized matrix",
-        "per-operation error checks registered before tuning"
+        "per-operation error checks registered before tuning",
+        "Metal increment: Q8_0 GEMV + F16/F32 utilities match the scalar reference incl. real tensor bytes (C1, tolerance-registered)"
       ]
     },
     {
