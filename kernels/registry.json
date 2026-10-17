@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "revision_note": "Work packages K01-K09 from PRD v0.2 section 11.3. K01 has two implemented increments: the aarch64 NEON fused packed dot for Q8_0/F16 with zero-copy mapped weight blocks (CPU, validated against scalar references and the llama.cpp envelope) and the first Metal increment added with Gate C (C0/C1): device/queue owner, typed resource handles with allocation accounting, packed Q8_0 matrix-vector decode and F16/F32 utility kernels, validated against the scalar reference on real tensor shapes and real artifact tensor bytes (crates/metal, native/metal, ADR-007). The remaining packages are specified; a kernel must never be selected before its correctness gate passes, and every selection retains a validated reference fallback decision. Model execution on the GPU is not implemented yet (C2).",
+  "revision_note": "Work packages K01-K09 from PRD v0.2 section 11.3. K01 has three implemented increments: the aarch64 NEON fused packed dot for Q8_0/F16 with zero-copy mapped weight blocks (CPU, validated against scalar references and the llama.cpp envelope), the first Metal increment from Gate C C0/C1 (device/queue owner, typed resource handles with allocation accounting, grouped dispatch, packed Q8_0 GEMV and F16/F32 utilities), and the C2 increment: the complete dense-Qwen3 decode (RMSNorm, Q/K norm, NeoX RoPE, GQA attention with f16-contract KV, SwiGLU, residuals, final projection) executed on the GPU through crates/metal, validated against the CPU scalar oracle on the pinned Qwen3-0.6B artifact (teacher-forced logits max |diff| 4.7e-5 over scale 16.6, identical top-1 and greedy output). K03 and K08 grow their Metal increments accordingly. A kernel must never be selected before its correctness gate passes; every selection retains a validated reference fallback decision. Fast microbatched prefill remains unbuilt (C3).",
   "kernels": [
     {
       "id": "K01",
@@ -32,7 +32,8 @@
       "reference_fallback": true,
       "gates": [
         "epsilon, operation dependencies and rounding profile preserved",
-        "no approximate activation substitution"
+        "no approximate activation substitution",
+        "Metal increment: RMSNorm/Q-K norm/SwiGLU/residual kernels match the scalar oracle within the registered f32 policy (C2)"
       ]
     },
     {
@@ -86,7 +87,8 @@
       "gates": [
         "positions, masks and native expert set preserved",
         "bounded state and dispatch lifetime",
-        "MoE routing uses the target's native configuration only"
+        "MoE routing uses the target's native configuration only",
+        "Metal increment: NeoX RoPE + GQA causal attention with declared KV precision match the scalar oracle; caches are per-request (C2)"
       ]
     },
     {

@@ -173,6 +173,14 @@ fn probe_reports_device_presence() {
     assert!(!probe.info.is_empty());
     if !probe.available {
         assert!(probe.info.contains("no Metal"));
+    } else {
+        // The figure is Metal's recommended work-set size, not the
+        // machine's total unified memory; the label must say so.
+        assert!(
+            probe.info.contains("recommended GPU working set"),
+            "info must label the working-set figure honestly: {}",
+            probe.info
+        );
     }
     eprintln!(
         "metal probe: available={} info={}",
@@ -463,6 +471,473 @@ fn upload_download_respect_bounds_and_offsets() {
     assert_eq!(&out[..8], &[0u8; 8]);
     assert!(buf.upload(12, &[0u8; 8]).is_err(), "range past the end");
     assert!(buf.download(16, &mut [0u8; 1]).is_err());
+}
+
+#[test]
+fn copy_contract_synchronizes_with_in_flight_compute() {
+    // A download immediately after asynchronous compute must observe the
+    // finished result (the copy contract fences internally); an upload must
+    // not race in-flight work either.
+    let Some(ctx) = metal_context() else {
+        return;
+    };
+    let x = ctx.buffer(64, true).unwrap();
+    let y = ctx.buffer(64, true).unwrap();
+    x.upload(0, &f32_bytes(&[3.0; 16])).unwrap();
+    ctx.f32_scale(&x, &y, 4.0, 16).unwrap();
+    // No explicit fence here: the copy contract orders it.
+    let mut out = vec![0u8; 64];
+    y.download(0, &mut out).unwrap();
+    for chunk in out.chunks_exact(4) {
+        assert_eq!(f32::from_le_bytes(chunk.try_into().unwrap()), 12.0);
+    }
+    // Upload-while-pending: overwrite the input, run again, read back.
+    x.upload(0, &f32_bytes(&[5.0; 16])).unwrap();
+    ctx.f32_scale(&x, &y, 2.0, 16).unwrap();
+    y.download(0, &mut out).unwrap();
+    for chunk in out.chunks_exact(4) {
+        assert_eq!(f32::from_le_bytes(chunk.try_into().unwrap()), 10.0);
+    }
+}
+
+#[test]
+fn dropping_buffers_before_fence_is_safe() {
+    // In-flight leases must keep device resources alive: the handles are
+    // freed here before any fence, and the GPU work must still complete
+    // correctly with the allocation accounting returning to zero.
+    let Some(ctx) = metal_context() else {
+        return;
+    };
+    let x = ctx.buffer(64, true).unwrap();
+    let y = ctx.buffer(64, true).unwrap();
+    let out_keep = ctx.buffer(64, true).unwrap();
+    x.upload(0, &f32_bytes(&[7.0; 16])).unwrap();
+    ctx.f32_scale(&x, &out_keep, 3.0, 16).unwrap();
+    drop(x); // GPU work on `x` is still pending
+    ctx.fence().unwrap();
+    let mut out = vec![0u8; 64];
+    out_keep.download(0, &mut out).unwrap();
+    for chunk in out.chunks_exact(4) {
+        assert_eq!(f32::from_le_bytes(chunk.try_into().unwrap()), 21.0);
+    }
+    drop(y);
+    drop(out_keep);
+    assert_eq!(ctx.allocated_bytes(), 0);
+}
+
+#[test]
+fn grouped_encoding_matches_individual_dispatch_and_aborts_cleanly() {
+    let Some(ctx) = metal_context() else {
+        return;
+    };
+    let a = ctx.buffer(64, true).unwrap();
+    let b = ctx.buffer(64, true).unwrap();
+    a.upload(0, &f32_bytes(&[2.0; 16])).unwrap();
+
+    // Grouped: two operations, one commit.
+    let committed_before = ctx.committed_dispatches();
+    ctx.begin_group().unwrap();
+    ctx.f32_scale(&a, &b, 3.0, 16).unwrap();
+    ctx.f32_axpy(&a, &b, 0.5, 16).unwrap();
+    ctx.end_group().unwrap();
+    assert_eq!(ctx.committed_dispatches(), committed_before + 1);
+    ctx.fence().unwrap();
+    let mut grouped = vec![0u8; 64];
+    b.download(0, &mut grouped).unwrap();
+    for chunk in grouped.chunks_exact(4) {
+        assert_eq!(f32::from_le_bytes(chunk.try_into().unwrap()), 7.0);
+    }
+
+    // Individual: same math, two commits.
+    ctx.f32_scale(&a, &b, 3.0, 16).unwrap();
+    ctx.f32_axpy(&a, &b, 0.5, 16).unwrap();
+    ctx.fence().unwrap();
+    let mut individual = vec![0u8; 64];
+    b.download(0, &mut individual).unwrap();
+    assert_eq!(grouped, individual);
+
+    // Abort: the discarded group never commits and never writes.
+    b.upload(0, &f32_bytes(&[0.0; 16])).unwrap();
+    let committed_before = ctx.committed_dispatches();
+    ctx.begin_group().unwrap();
+    ctx.f32_scale(&a, &b, 99.0, 16).unwrap();
+    ctx.abort_group().unwrap();
+    assert_eq!(ctx.committed_dispatches(), committed_before);
+    let mut aborted = vec![0u8; 64];
+    b.download(0, &mut aborted).unwrap();
+    assert!(aborted.iter().all(|byte| *byte == 0));
+
+    // A fence with an open group is refused rather than guessed.
+    ctx.begin_group().unwrap();
+    assert!(ctx.fence().is_err());
+    ctx.abort_group().unwrap();
+}
+
+/// CPU references for the transformer ops (mirroring tuckcore's scalar
+/// executor semantics: f32, sequential accumulation).
+fn cpu_rmsnorm(x: &[f32], w: &[f32], eps: f32) -> Vec<f32> {
+    let ss: f32 = x.iter().map(|v| v * v).sum();
+    let inv = 1.0f32 / (ss / x.len() as f32 + eps).sqrt();
+    x.iter().zip(w).map(|(v, wv)| v * inv * wv).collect()
+}
+
+fn cpu_rope(row: &mut [f32], pos: usize, inv_freq: &[f32]) {
+    let half = row.len() / 2;
+    for i in 0..half {
+        let theta = pos as f32 * inv_freq[i];
+        let (s, c) = theta.sin_cos();
+        let (x0, x1) = (row[i], row[i + half]);
+        row[i] = x0 * c - x1 * s;
+        row[i + half] = x0 * s + x1 * c;
+    }
+}
+
+fn rope_freqs(head_dim: usize, base: f64) -> Vec<f32> {
+    (0..head_dim / 2)
+        .map(|i| (1.0 / base.powf(2.0 * i as f64 / head_dim as f64)) as f32)
+        .collect()
+}
+
+#[test]
+fn rmsnorm_matches_the_scalar_reference() {
+    let Some(ctx) = metal_context() else {
+        return;
+    };
+    let mut rng = Rng(11);
+    for (rows, cols) in [(1usize, 1024usize), (16, 128), (8, 128), (1, 7)] {
+        let x: Vec<f32> = (0..rows * cols)
+            .map(|_| ((rng.next() % 20_001) as f32 - 10_000.0) / 1000.0)
+            .collect();
+        let w: Vec<f32> = (0..cols)
+            .map(|_| 0.5 + (rng.next() % 1000) as f32 / 1000.0)
+            .collect();
+        let eps = 1e-6f32;
+        let xb = ctx.buffer(rows * cols * 4, true).unwrap();
+        let wb = ctx.buffer(cols * 4, true).unwrap();
+        let yb = ctx.buffer(rows * cols * 4, true).unwrap();
+        xb.upload(0, &f32_bytes(&x)).unwrap();
+        wb.upload(0, &f32_bytes(&w)).unwrap();
+        ctx.rmsnorm(&xb, &wb, &yb, rows as u32, cols as u32, eps)
+            .unwrap();
+        ctx.fence().unwrap();
+        let mut out = vec![0u8; rows * cols * 4];
+        yb.download(0, &mut out).unwrap();
+        let got: Vec<f32> = out
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+            .collect();
+        for r in 0..rows {
+            let want = cpu_rmsnorm(&x[r * cols..(r + 1) * cols], &w, eps);
+            for c in 0..cols {
+                let (g, t) = (got[r * cols + c], want[c]);
+                assert!(
+                    (g - t).abs() <= 1e-5 * t.abs().max(1.0),
+                    "({rows},{cols}) [{r},{c}]: got {g}, want {t}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn rope_matches_the_scalar_reference() {
+    let Some(ctx) = metal_context() else {
+        return;
+    };
+    let (heads, kv_heads, head_dim) = (16usize, 8usize, 128usize);
+    let inv = rope_freqs(head_dim, 1e6);
+    let mut rng = Rng(13);
+    let q: Vec<f32> = (0..heads * head_dim)
+        .map(|_| ((rng.next() % 20_001) as f32 - 10_000.0) / 1000.0)
+        .collect();
+    let k: Vec<f32> = (0..kv_heads * head_dim)
+        .map(|_| ((rng.next() % 20_001) as f32 - 10_000.0) / 1000.0)
+        .collect();
+    for pos in [0usize, 1, 37] {
+        let qb = ctx.buffer(heads * head_dim * 4, true).unwrap();
+        let kb = ctx.buffer(kv_heads * head_dim * 4, true).unwrap();
+        let fb = ctx.buffer(inv.len() * 4, true).unwrap();
+        qb.upload(0, &f32_bytes(&q)).unwrap();
+        kb.upload(0, &f32_bytes(&k)).unwrap();
+        fb.upload(0, &f32_bytes(&inv)).unwrap();
+        ctx.rope(
+            &qb,
+            &kb,
+            &fb,
+            pos as u32,
+            heads as u32,
+            kv_heads as u32,
+            head_dim as u32,
+        )
+        .unwrap();
+        ctx.fence().unwrap();
+        let mut q_out = vec![0u8; heads * head_dim * 4];
+        let mut k_out = vec![0u8; kv_heads * head_dim * 4];
+        qb.download(0, &mut q_out).unwrap();
+        kb.download(0, &mut k_out).unwrap();
+        let gq: Vec<f32> = q_out
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+            .collect();
+        let gk: Vec<f32> = k_out
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+            .collect();
+        for h in 0..heads {
+            let mut want = q[h * head_dim..(h + 1) * head_dim].to_vec();
+            cpu_rope(&mut want, pos, &inv);
+            for d in 0..head_dim {
+                let (g, t) = (gq[h * head_dim + d], want[d]);
+                assert!(
+                    (g - t).abs() <= 1e-5 * t.abs().max(1.0),
+                    "q head {h} pos {pos}: {g} vs {t}"
+                );
+            }
+        }
+        for h in 0..kv_heads {
+            let mut want = k[h * head_dim..(h + 1) * head_dim].to_vec();
+            cpu_rope(&mut want, pos, &inv);
+            for d in 0..head_dim {
+                let (g, t) = (gk[h * head_dim + d], want[d]);
+                assert!(
+                    (g - t).abs() <= 1e-5 * t.abs().max(1.0),
+                    "k head {h} pos {pos}: {g} vs {t}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn kv_store_and_attention_match_the_scalar_reference() {
+    let Some(ctx) = metal_context() else {
+        return;
+    };
+    let (heads, kv_heads, head_dim, group) = (16usize, 8usize, 128usize, 2usize);
+    let cap = 64usize;
+    let mut rng = Rng(17);
+    let pos = 20usize;
+    let seq = pos + 1;
+
+    let mut k_steps: Vec<Vec<f32>> = Vec::new();
+    let mut v_steps: Vec<Vec<f32>> = Vec::new();
+    for _ in 0..seq {
+        k_steps.push(
+            (0..kv_heads * head_dim)
+                .map(|_| ((rng.next() % 20_001) as f32 - 10_000.0) / 1000.0)
+                .collect(),
+        );
+        v_steps.push(
+            (0..kv_heads * head_dim)
+                .map(|_| ((rng.next() % 20_001) as f32 - 10_000.0) / 1000.0)
+                .collect(),
+        );
+    }
+    let q: Vec<f32> = (0..heads * head_dim)
+        .map(|_| ((rng.next() % 20_001) as f32 - 10_000.0) / 1000.0)
+        .collect();
+
+    let k_cache = ctx.buffer(kv_heads * cap * head_dim * 4, true).unwrap();
+    let v_cache = ctx.buffer(kv_heads * cap * head_dim * 4, true).unwrap();
+    let scratch = ctx.buffer(heads * cap * 4, true).unwrap();
+    let qb = ctx.buffer(heads * head_dim * 4, true).unwrap();
+    let out = ctx.buffer(heads * head_dim * 4, true).unwrap();
+    qb.upload(0, &f32_bytes(&q)).unwrap();
+
+    // Stage every step's k/v rows first (copies require no open group),
+    // then store all positions with grouped encoding: one command buffer,
+    // one completion for the whole sequence of stores.
+    let mut k_srcs = Vec::new();
+    let mut v_srcs = Vec::new();
+    for (ks, vs) in k_steps.iter().zip(v_steps.iter()) {
+        let k_src = ctx.buffer(kv_heads * head_dim * 4, true).unwrap();
+        let v_src = ctx.buffer(kv_heads * head_dim * 4, true).unwrap();
+        k_src.upload(0, &f32_bytes(ks)).unwrap();
+        v_src.upload(0, &f32_bytes(vs)).unwrap();
+        k_srcs.push(k_src);
+        v_srcs.push(v_src);
+    }
+    ctx.begin_group().unwrap();
+    for (j, (k_src, v_src)) in k_srcs.iter().zip(v_srcs.iter()).enumerate() {
+        ctx.kv_store(
+            k_src,
+            v_src,
+            &k_cache,
+            &v_cache,
+            kv_heads as u32,
+            j as u32,
+            cap as u32,
+            head_dim as u32,
+            false,
+        )
+        .unwrap();
+    }
+    ctx.end_group().unwrap();
+
+    let scale = 1.0f32 / (head_dim as f32).sqrt();
+    ctx.attention(
+        &qb,
+        &k_cache,
+        &v_cache,
+        &out,
+        &scratch,
+        heads as u32,
+        pos as u32,
+        cap as u32,
+        head_dim as u32,
+        group as u32,
+        scale,
+    )
+    .unwrap();
+    ctx.fence().unwrap();
+
+    let mut out_bytes = vec![0u8; heads * head_dim * 4];
+    out.download(0, &mut out_bytes).unwrap();
+    let got: Vec<f32> = out_bytes
+        .chunks_exact(4)
+        .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+        .collect();
+
+    // CPU reference: softmax(q·k * scale) over 0..=pos, weighted v, GQA map.
+    let mut max_diff = 0f32;
+    let mut max_rel = 0f32;
+    for h in 0..heads {
+        let kvh = h / group;
+        let qh = &q[h * head_dim..(h + 1) * head_dim];
+        let mut scores = Vec::with_capacity(seq);
+        for ks in k_steps.iter().take(seq) {
+            let kj = &ks[kvh * head_dim..(kvh + 1) * head_dim];
+            let dot: f32 = qh.iter().zip(kj).map(|(a, b)| a * b).sum();
+            scores.push(dot * scale);
+        }
+        let max = scores.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+        let exps: Vec<f32> = scores.iter().map(|s| (s - max).exp()).collect();
+        let denom: f32 = exps.iter().sum();
+        for d in 0..head_dim {
+            let mut acc = 0.0f32;
+            for j in 0..seq {
+                acc += (exps[j] / denom) * v_steps[j][kvh * head_dim + d];
+            }
+            let got_v = got[h * head_dim + d];
+            let diff = (got_v - acc).abs();
+            max_diff = max_diff.max(diff);
+            max_rel = max_rel.max(diff / acc.abs().max(1e-3));
+        }
+    }
+    // Registered policy (C2): the 128-term score dot reduces in tree order
+    // on the GPU and sequentially in the reference, so scores differ by
+    // ~1e-4 after the 1/sqrt(d) scale; softmax turns that into weight
+    // deviations of similar relative size, which the weighted-value sum
+    // carries into the output. Measured max |diff| is ~1.2e-4 for inputs
+    // with |v| up to 10; the registered bound is 1e-3 (≈8x margin).
+    eprintln!("attention max |diff| = {max_diff:.3e}, max rel = {max_rel:.3e}");
+    assert!(
+        max_diff <= 1e-3,
+        "attention deviation {max_diff:.3e} exceeds the registered 1e-3 policy"
+    );
+}
+
+#[test]
+fn silu_mul_and_row_dequant_match_the_scalar_reference() {
+    let Some(ctx) = metal_context() else {
+        return;
+    };
+    let mut rng = Rng(19);
+    for n in [3072usize, 3071, 1] {
+        let gate: Vec<f32> = (0..n)
+            .map(|_| ((rng.next() % 20_001) as f32 - 10_000.0) / 1000.0)
+            .collect();
+        let up: Vec<f32> = (0..n)
+            .map(|_| ((rng.next() % 20_001) as f32 - 10_000.0) / 1000.0)
+            .collect();
+        let gb = ctx.buffer(n * 4, true).unwrap();
+        let ub = ctx.buffer(n * 4, true).unwrap();
+        let ob = ctx.buffer(n * 4, true).unwrap();
+        gb.upload(0, &f32_bytes(&gate)).unwrap();
+        ub.upload(0, &f32_bytes(&up)).unwrap();
+        ctx.silu_mul(&gb, &ub, &ob, n as u32).unwrap();
+        ctx.fence().unwrap();
+        let mut out = vec![0u8; n * 4];
+        ob.download(0, &mut out).unwrap();
+        for (i, chunk) in out.chunks_exact(4).enumerate() {
+            let g = f32::from_le_bytes(chunk.try_into().unwrap());
+            let want = (gate[i] / (1.0 + (-gate[i]).exp())) * up[i];
+            assert!(
+                (g - want).abs() <= 1e-5 * want.abs().max(1.0),
+                "n={n} i={i}"
+            );
+        }
+    }
+
+    // Q8_0 row dequantization on boundary weights.
+    let (rows, cols) = (8usize, 64usize);
+    let w = boundary_weights(rows, cols, 23);
+    let wb = ctx.buffer(w.len(), true).unwrap();
+    let ob = ctx.buffer(cols * 4, true).unwrap();
+    wb.upload(0, &w).unwrap();
+    for row in [0u32, 5, 7] {
+        ctx.q8_0_row(&wb, &ob, row, cols as u32).unwrap();
+        ctx.fence().unwrap();
+        let mut out = vec![0u8; cols * 4];
+        ob.download(0, &mut out).unwrap();
+        let blocks = cols / 32;
+        for d in 0..cols {
+            let b = d / 32;
+            let lane = d % 32;
+            let off = (row as usize * blocks + b) * 34;
+            let scale = f16_bits_to_f32(u16::from_le_bytes([w[off], w[off + 1]]));
+            let q = w[off + 2 + lane] as i8 as f32;
+            let got = f32::from_le_bytes(out[d * 4..d * 4 + 4].try_into().unwrap());
+            assert_eq!(got, scale * q, "row {row} dim {d}");
+        }
+    }
+}
+
+#[test]
+fn f16_gemv_matches_the_scalar_reference() {
+    let Some(ctx) = metal_context() else {
+        return;
+    };
+    let mut rng = Rng(29);
+    for (rows, cols, seed) in [(1usize, 32usize, 1u64), (17, 64, 2), (1024, 1024, 3)] {
+        let wf: Vec<f32> = (0..rows * cols)
+            .map(|_| ((rng.next() % 20_001) as f32 - 10_000.0) / 1000.0)
+            .collect();
+        let w: Vec<u8> = wf
+            .iter()
+            .flat_map(|v| f32_to_f16_bits(*v).to_le_bytes())
+            .collect();
+        let x = boundary_input(cols, seed);
+        let wb = ctx.buffer(w.len(), true).unwrap();
+        let xb = ctx.buffer(cols * 4, true).unwrap();
+        let yb = ctx.buffer(rows * 4, true).unwrap();
+        wb.upload(0, &w).unwrap();
+        xb.upload(0, &f32_bytes(&x)).unwrap();
+        ctx.f16_gemv(&wb, &xb, &yb, rows as u32, cols as u32)
+            .unwrap();
+        ctx.fence().unwrap();
+        let mut out = vec![0u8; rows * 4];
+        yb.download(0, &mut out).unwrap();
+        let gpu: Vec<f32> = out
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+            .collect();
+        let mut scale = 1.0f32;
+        for r in [0usize, rows / 2, rows - 1] {
+            let row = &w[r * cols * 2..(r + 1) * cols * 2];
+            let want: f32 = row
+                .chunks_exact(2)
+                .zip(&x)
+                .map(|(c, xv)| f16_bits_to_f32(u16::from_le_bytes(c.try_into().unwrap())) * xv)
+                .sum();
+            scale = scale.max(want.abs());
+            assert!(
+                (gpu[r] - want).abs() <= 1e-4 * scale,
+                "({rows},{cols}) row {r}: {} vs {want}",
+                gpu[r]
+            );
+        }
+    }
 }
 
 /// Real artifact operator check (machine-local): the packed gemv must match

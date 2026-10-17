@@ -227,6 +227,7 @@ impl ExecutionOptions {
                     let want = match explicit {
                         KernelSelection::Scalar => "scalar",
                         KernelSelection::Neon => "neon",
+                        KernelSelection::Metal => "metal",
                         KernelSelection::Auto => unreachable!(),
                     };
                     if ack.kernel_impl.as_deref() != Some(want) {

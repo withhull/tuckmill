@@ -37,6 +37,10 @@ pub enum KernelSelection {
     Auto,
     Scalar,
     Neon,
+    /// TuckCore's Metal resident path (ADR-007): the whole dense-Qwen3 step
+    /// executes on the GPU. Forced selection never falls back silently — a
+    /// machine without a usable Metal device gets a typed refusal at load.
+    Metal,
 }
 
 impl KernelSelection {
@@ -45,6 +49,7 @@ impl KernelSelection {
             "auto" => Some(Self::Auto),
             "scalar" => Some(Self::Scalar),
             "neon" => Some(Self::Neon),
+            "metal" => Some(Self::Metal),
             _ => None,
         }
     }
@@ -55,6 +60,17 @@ impl KernelSelection {
         match self {
             Self::Scalar => Ok(ResolvedKernels::Scalar),
             Self::Auto => Ok(ResolvedKernels::default_for_target()),
+            Self::Metal => {
+                if cfg!(target_os = "macos") {
+                    Ok(ResolvedKernels::Metal)
+                } else {
+                    Err(TuckmillError::new(
+                        ErrorCode::Unavailable,
+                        "the Metal kernel implementation requires macOS",
+                    )
+                    .with_action("Select --kernels auto, neon, or scalar on this machine."))
+                }
+            }
             Self::Neon => {
                 if cfg!(target_arch = "aarch64") {
                     Ok(ResolvedKernels::Neon)
@@ -75,6 +91,7 @@ impl KernelSelection {
 pub enum ResolvedKernels {
     Scalar,
     Neon,
+    Metal,
 }
 
 impl ResolvedKernels {
@@ -90,6 +107,7 @@ impl ResolvedKernels {
         match self {
             Self::Scalar => "scalar",
             Self::Neon => "neon",
+            Self::Metal => "metal",
         }
     }
 }
@@ -355,6 +373,10 @@ pub fn dot_q8_0_x_f32(impl_: ResolvedKernels, row: &[u8], x: &[f32]) -> Result<f
         ResolvedKernels::Neon => neon::dot_q8_0_x_f32(row, x),
         #[cfg(not(target_arch = "aarch64"))]
         ResolvedKernels::Neon => unreachable!("resolution refuses NEON on this target"),
+        // Unreachable by construction: with Metal resolved, the executor
+        // routes the whole token step through the GPU and never calls the
+        // per-row CPU kernels. Reaching here would be an executor bug.
+        ResolvedKernels::Metal => unreachable!("metal executes whole steps, not rows"),
     })
 }
 
@@ -372,6 +394,8 @@ pub fn dot_q8_0_q8_0(
         ResolvedKernels::Neon => neon::dot_q8_0_q8_0(row, x_qs, x_d),
         #[cfg(not(target_arch = "aarch64"))]
         ResolvedKernels::Neon => unreachable!("resolution refuses NEON on this target"),
+        // Unreachable by construction; see dot_q8_0_x_f32.
+        ResolvedKernels::Metal => unreachable!("metal executes whole steps, not rows"),
     })
 }
 
@@ -384,6 +408,8 @@ pub fn dot_f16_x_f32(impl_: ResolvedKernels, row: &[u8], x: &[f32]) -> Result<f3
         ResolvedKernels::Neon => neon::dot_f16_x_f32(row, x),
         #[cfg(not(target_arch = "aarch64"))]
         ResolvedKernels::Neon => unreachable!("resolution refuses NEON on this target"),
+        // Unreachable by construction; see dot_q8_0_x_f32.
+        ResolvedKernels::Metal => unreachable!("metal executes whole steps, not rows"),
     })
 }
 

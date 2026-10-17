@@ -576,6 +576,7 @@ dependencies = [
  "tempfile",
  "tuckmill-backend",
  "tuckmill-manifest",
+ "tuckmill-metal",
 ]
 
 [[package]]

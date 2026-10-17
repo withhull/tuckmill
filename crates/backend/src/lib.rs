@@ -419,6 +419,11 @@ pub struct BackendStats {
     /// `trim-caches` commands that reached the engine and were acted on).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub trims_applied: Option<u64>,
+    /// Live GPU bytes held by the engine's Metal context (resident weights,
+    /// workspaces); absent for CPU-only paths. Evidence that GPU
+    /// allocations match the admitted plan.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gpu_allocated_bytes: Option<u64>,
     /// Thread count in use for compute, when the backend is threaded.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub threads: Option<u32>,

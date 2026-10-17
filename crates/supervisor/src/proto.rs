@@ -347,6 +347,7 @@ mod tests {
                     session_kv_bytes: Some(1 << 15),
                     retained_weight_bytes: Some(1 << 22),
                     trims_applied: Some(3),
+                    gpu_allocated_bytes: Some(1 << 24),
                     threads: Some(4),
                     kernel_impl: Some("neon".into()),
                     numerical_profile: Some("oracle-f32".into()),

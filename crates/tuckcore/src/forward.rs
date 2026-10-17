@@ -95,11 +95,7 @@ impl ModelWeights {
             }
         }
 
-        let mut rope_inv_freq = Vec::with_capacity((cfg.key_length / 2) as usize);
-        for i in 0..cfg.key_length / 2 {
-            let exponent = 2.0 * i as f64 / cfg.key_length as f64;
-            rope_inv_freq.push((1.0 / (cfg.rope_base as f64).powf(exponent)) as f32);
-        }
+        let rope_inv_freq = rope_inv_freq(&cfg);
 
         let output_name = names.output.clone();
         let ids = TensorIds {
@@ -269,6 +265,17 @@ impl KvState {
         let off = ((head as usize) * self.cap + pos) * self.value_len as usize;
         &self.v[layer][off..off + self.value_len as usize]
     }
+}
+
+/// RoPE inverse-frequency table: `theta^(-2i/head_dim)` in f32, the single
+/// source shared by the CPU executor and the Metal path.
+pub fn rope_inv_freq(cfg: &Qwen3Config) -> Vec<f32> {
+    (0..cfg.key_length / 2)
+        .map(|i| {
+            let exponent = 2.0 * i as f64 / cfg.key_length as f64;
+            (1.0 / (cfg.rope_base as f64).powf(exponent)) as f32
+        })
+        .collect()
 }
 
 /// Declared numerical profile for weight×activation products.

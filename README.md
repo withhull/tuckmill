@@ -34,8 +34,12 @@ quality.
 > matrix-vector decode plus F16/F32 utilities) compiled from
 > `native/metal/kernels.metal` at this revision and validated against the
 > scalar reference on real tensor shapes and real artifact tensor bytes
-> (ADR-007). Model execution on the GPU is not implemented yet (C2 next);
-> K02–K09 remain specified. Stage A verification is hardened:
+> (ADR-007). C2 completes the path: the pinned Qwen3-0.6B Q8_0 artifact
+> decodes end-to-end on the GPU under `--kernels metal` (fail-closed; no
+> silent CPU fallback), matching the CPU scalar oracle within 4.7e-5 on
+> teacher-forced logits with identical greedy output; GPU weights equal the
+> artifact payload and every allocation is checked against the admitted
+> plan. Fast prefill (C3) is not built yet, so TTFT remains prefill-bound. Stage A verification is hardened:
 > malformed scoring fails closed, verification records are immutable with
 > held-out qualification, the governor drives real backend commands
 > (protocol v7), tokenization is reference-first (llama.cpp when configured;
@@ -197,7 +201,7 @@ scripts/            build.sh, test.sh, demo.sh
 ## Verification and benchmarks
 
 `scripts/test.sh` runs formatting, `clippy -D warnings`, and the full test
-suite (371 tests),
+suite (380 tests),
 including adversarial GGUF/Safetensors fixtures, planner math, governor
 semantics, import/pack fault injection, worker-protocol framing, HTTP
 auth/SSE (including long streams through the real endpoint), CLI end-to-end

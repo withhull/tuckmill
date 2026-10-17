@@ -26,6 +26,7 @@ use crate::completion::CompletionTracker;
 use crate::forward::{
     self, Forward, KvPrecision, KvState, ModelWeights, NumericalProfile, ProfileCounters,
 };
+use crate::gpu;
 use crate::kernels::{KernelSelection, ResolvedKernels};
 use crate::loader::{BlockLoader, BlockPolicy, StorageSelection};
 use crate::model;
@@ -85,7 +86,12 @@ struct Loaded {
     /// transient overhead. This is exactly the quantity the load-time
     /// arena check validated against the plan, reported so the supervisor
     /// can re-check it against every later plan before reusing the worker.
+    /// On the Metal path this is the resident GPU weight footprint instead
+    /// (the CPU cache is not built).
     retained_weight_bytes: u64,
+    /// Resident Metal forward path (C2): present only when `--kernels
+    /// metal` was resolved; there is no silent fallback to the CPU.
+    metal: Option<Arc<gpu::MetalForward>>,
 }
 
 /// The experimental custom native executor.
@@ -233,7 +239,21 @@ impl InferenceBackend for TuckCore {
             ..Default::default()
         };
         let kernels = opts.kernels.unwrap_or(KernelSelection::Auto).resolve()?;
+        let metal_mode = kernels == ResolvedKernels::Metal;
         let storage_selection = opts.storage.unwrap_or(StorageSelection::Auto);
+        if metal_mode && storage_selection != StorageSelection::Auto {
+            return Err(TuckmillError::new(
+                ErrorCode::InvalidRequest,
+                "storage selection applies to CPU weight streaming; the Metal path keeps weights resident on the GPU",
+            ));
+        }
+        if metal_mode && profile != NumericalProfile::OracleF32 {
+            return Err(TuckmillError::new(
+                ErrorCode::UnsupportedArchitecture,
+                "the Metal path implements the oracle-f32 numerical profile only; the llama-cpu activation-quantization profile is CPU-only",
+            )
+            .with_action("Select --numerical-profile oracle-f32 (the default) for --kernels metal."));
+        }
         let load_start = Instant::now();
         let kv_precision = match opts.kv_precision.as_deref() {
             None | Some("f32") => KvPrecision::F32,
@@ -394,7 +414,7 @@ impl InferenceBackend for TuckCore {
         // charging it so the check prices the allocation that can happen.
         let effective_cache = policy.cache_bytes.min(payload);
         let cache_wanted = effective_cache.saturating_add(policy.block_bytes);
-        if cache_wanted > weight_allowance {
+        if !metal_mode && cache_wanted > weight_allowance {
             return Err(TuckmillError::new(
                 ErrorCode::InvalidPlan,
                 format!(
@@ -413,6 +433,48 @@ impl InferenceBackend for TuckCore {
         let mut names = model::TensorNames::for_layers(cfg.layers);
         names.resolve(&insp)?;
         let tokenizer = Tokenizer::from_gguf(&insp)?;
+
+        // ---- Metal resident path (C2): build after identity verification,
+        // with the plan's arena classes checked against the exact GPU
+        // allocations before anything is accepted. ----
+        let metal = if metal_mode {
+            let forward = gpu::MetalForward::open(
+                path,
+                &insp,
+                &names,
+                &cfg,
+                kv_precision,
+                plan.context.total_context,
+            )?;
+            let weights_reserved = plan.budget.reservation_breakdown.weights.bytes();
+            if forward.weights_bytes() > weights_reserved {
+                return Err(TuckmillError::new(
+                    ErrorCode::InvalidPlan,
+                    format!(
+                        "the plan reserves {} for weights but the Metal path would hold {} resident on the GPU; refusing an unacknowledged GPU allocation",
+                        Bytes(weights_reserved),
+                        Bytes(forward.weights_bytes())
+                    ),
+                )
+                .with_action(
+                    "Raise --memory-budget so the plan reserves resident weights, or run the CPU kernels.",
+                ));
+            }
+            let ws_reserved = plan.budget.reservation_breakdown.workspaces.bytes();
+            if forward.workspace_bytes() > ws_reserved {
+                return Err(TuckmillError::new(
+                    ErrorCode::InvalidPlan,
+                    format!(
+                        "the plan reserves {} for workspaces but the Metal path needs {}; refusing an unacknowledged GPU allocation",
+                        Bytes(ws_reserved),
+                        Bytes(forward.workspace_bytes())
+                    ),
+                ));
+            }
+            Some(Arc::new(forward))
+        } else {
+            None
+        };
 
         let entries = forward::tensor_entries(&insp, policy.block_bytes);
         let loader = Arc::new(BlockLoader::open_file(
@@ -452,6 +514,19 @@ impl InferenceBackend for TuckCore {
             note.push_str(&extra);
         }
         ProfileCounters::record(&counters.load_nanos, load_start);
+        // On the Metal path the retained allocation is the resident GPU
+        // weight footprint; the CPU weight cache is never exercised.
+        let retained_weight_bytes = match &metal {
+            Some(m) => m.weights_bytes(),
+            None => cache_wanted,
+        };
+        if let Some(m) = &metal {
+            note.push_str(&format!(
+                "; Metal resident path: {} weights + {} workspaces on the GPU (kernels: metal)",
+                Bytes(m.weights_bytes()),
+                Bytes(m.workspace_bytes())
+            ));
+        }
         self.loaded = Some(Loaded {
             loader,
             tracker,
@@ -463,7 +538,8 @@ impl InferenceBackend for TuckCore {
             counters,
             kernels,
             session_kv_bytes: Arc::new(AtomicU64::new(0)),
-            retained_weight_bytes: cache_wanted,
+            retained_weight_bytes,
+            metal,
         });
         Ok(note)
     }
@@ -518,20 +594,34 @@ impl InferenceBackend for TuckCore {
         loaded
             .session_kv_bytes
             .store(session_kv_bytes, Ordering::Relaxed);
-        let mut kv = KvState::new(&loaded.weights.cfg, session_context, loaded.kv_precision)?;
-        let fwd = Forward {
-            loader: &loaded.loader,
-            tracker: &loaded.tracker,
-            weights: &loaded.weights,
-            profile: loaded.profile,
-            kernels: loaded.kernels,
-            kv_precision: loaded.kv_precision,
-            control: &control,
-            counters: if loaded.counters.enabled {
-                Some(&loaded.counters)
-            } else {
-                None
-            },
+        let mut engine = match &loaded.metal {
+            Some(metal) => {
+                // GPU session: fresh per-request KV (f32 entries, matching
+                // KvState::bytes_for exactly), no shared state across runs.
+                let kv = metal.new_kv(session_context)?;
+                debug_assert_eq!(kv.allocated_bytes(), session_kv_bytes);
+                StepEngine::Gpu { forward: metal, kv }
+            }
+            None => {
+                let kv = KvState::new(&loaded.weights.cfg, session_context, loaded.kv_precision)?;
+                StepEngine::Cpu {
+                    fwd: Box::new(Forward {
+                        loader: &loaded.loader,
+                        tracker: &loaded.tracker,
+                        weights: &loaded.weights,
+                        profile: loaded.profile,
+                        kernels: loaded.kernels,
+                        kv_precision: loaded.kv_precision,
+                        control: &control,
+                        counters: if loaded.counters.enabled {
+                            Some(&loaded.counters)
+                        } else {
+                            None
+                        },
+                    }),
+                    kv,
+                }
+            }
         };
 
         // Worker-side timing: measured inside the request, so supervisor
@@ -554,7 +644,7 @@ impl InferenceBackend for TuckCore {
         let mut logits: Vec<f32> = Vec::new();
         for (pos, token) in req.prompt_tokens.iter().enumerate() {
             pause_loop(ctl, Duration::ZERO)?;
-            match fwd.forward_token(&mut kv, *token, pos, &cancelled) {
+            match engine.step(*token, pos, &cancelled) {
                 Ok(l) => logits = l,
                 Err(e) if e.code() == ErrorCode::Cancelled => {
                     return Ok(
@@ -671,7 +761,7 @@ impl InferenceBackend for TuckCore {
                 if i + 1 < req.max_output_tokens {
                     // The generated token i occupies position prompt_len + i.
                     let pos = (prompt_len + i) as usize;
-                    match fwd.forward_token(&mut kv, token, pos, &cancelled) {
+                    match engine.step(token, pos, &cancelled) {
                         Ok(l) => logits = l,
                         Err(e) if e.code() == ErrorCode::Cancelled => {
                             let r = buffer.flush();
@@ -743,7 +833,10 @@ impl InferenceBackend for TuckCore {
                 ));
             }
             let pos = *position as usize;
-            let logits = fwd.logits_at(tokens, pos, cancelled)?;
+            let logits = match &loaded.metal {
+                Some(metal) => metal.logits_at(tokens, pos, cancelled)?,
+                None => fwd.logits_at(tokens, pos, cancelled)?,
+            };
             scored += 1;
             if !sink(*position, &logits) {
                 break;
@@ -761,16 +854,10 @@ impl InferenceBackend for TuckCore {
             Some(loaded) => {
                 let s = loaded.loader.stats();
                 let residency = loaded.loader.residency();
-                BackendStats {
-                    logical_read_bytes: s.logical_read_bytes,
-                    blocks_loaded: s.blocks_loaded,
-                    cache_hits: s.cache_hits,
-                    cache_misses: s.cache_misses,
-                    evictions: s.cache_entry_evictions,
-                    in_flight_leases: loaded.tracker.in_flight() as u64,
-                    buffer_releases: Some(loaded.tracker.completed()),
-                    released_bytes: Some(loaded.tracker.released_bytes()),
-                    storage: Some(StorageStats {
+                let storage = if loaded.metal.is_some() {
+                    None
+                } else {
+                    Some(StorageStats {
                         mode: s.storage_mode.clone(),
                         owned_cache_bytes: s.owned_cache_bytes,
                         owned_in_flight_bytes: loaded.tracker.in_flight_owned_bytes(),
@@ -782,7 +869,18 @@ impl InferenceBackend for TuckCore {
                             .unwrap_or(false),
                         page_size_bytes: residency.as_ref().map(|r| r.page_size_bytes).unwrap_or(0),
                         page_advice_bytes: s.page_advice_bytes,
-                    }),
+                    })
+                };
+                BackendStats {
+                    logical_read_bytes: s.logical_read_bytes,
+                    blocks_loaded: s.blocks_loaded,
+                    cache_hits: s.cache_hits,
+                    cache_misses: s.cache_misses,
+                    evictions: s.cache_entry_evictions,
+                    in_flight_leases: loaded.tracker.in_flight() as u64,
+                    buffer_releases: Some(loaded.tracker.completed()),
+                    released_bytes: Some(loaded.tracker.released_bytes()),
+                    storage,
                     footprint_bytes: None,
                     kv_precision: Some(loaded.kv_precision.as_str().to_string()),
                     kv_state_bytes: Some(KvState::bytes_for(
@@ -795,6 +893,7 @@ impl InferenceBackend for TuckCore {
                     },
                     retained_weight_bytes: Some(loaded.retained_weight_bytes),
                     trims_applied: Some(loaded.counters.trims_applied.load(Ordering::Relaxed)),
+                    gpu_allocated_bytes: loaded.metal.as_ref().map(|m| m.allocated_bytes()),
                     threads: Some(1), // scalar executor is single-threaded
                     kernel_impl: Some(loaded.kernels.as_str().to_string()),
                     numerical_profile: Some(loaded.profile.as_str().to_string()),
@@ -833,6 +932,29 @@ impl InferenceBackend for TuckCore {
             loaded.loader.evict_all();
             // Leases must have drained; anything left would be a bug.
             debug_assert_eq!(loaded.tracker.in_flight(), 0);
+        }
+    }
+}
+
+/// One request's execution session: the CPU scalar forward with its f32
+/// KV, or the Metal resident forward with its GPU KV. Selection happened at
+/// load (`--kernels`); there is no per-step fallback.
+enum StepEngine<'a> {
+    Cpu {
+        fwd: Box<Forward<'a>>,
+        kv: KvState,
+    },
+    Gpu {
+        forward: &'a gpu::MetalForward,
+        kv: gpu::MetalKv,
+    },
+}
+
+impl StepEngine<'_> {
+    fn step(&mut self, token: u32, pos: usize, cancelled: &dyn Fn() -> bool) -> Result<Vec<f32>> {
+        match self {
+            StepEngine::Cpu { fwd, kv } => fwd.forward_token(kv, token, pos, cancelled),
+            StepEngine::Gpu { forward, kv } => forward.forward_token(kv, token, pos, cancelled),
         }
     }
 }
@@ -930,6 +1052,10 @@ mod tests {
         plan.budget.add_reservation(
             tuckmill_manifest::records::ReserveClass::IoBuffers,
             Bytes(16 * 1024 * 1024),
+        );
+        plan.budget.add_reservation(
+            tuckmill_manifest::records::ReserveClass::Workspaces,
+            Bytes(64 * 1024 * 1024),
         );
         plan.plan_id = plan.compute_id().unwrap();
         (dir, artifact, plan)
@@ -1102,6 +1228,267 @@ mod tests {
             Some(payload.min(DEFAULT_CACHE_BYTES) + DEFAULT_BLOCK_BYTES),
             "the retained weight allocation is the cache clamped to the payload plus one block"
         );
+    }
+
+    /// Gate C2 end-to-end on the fixture: the Metal resident path must
+    /// produce teacher-forced logits and greedy output matching the CPU
+    /// scalar reference exactly where required (top-1, finish reason) and
+    /// within the registered f32 reduction-order tolerance where GPU
+    /// summation order legitimately differs. CI runs this because the
+    /// runner has a GPU; a dev machine without one skips loudly.
+    #[test]
+    fn metal_forward_matches_scalar_on_fixture() {
+        if !tuckmill_metal::probe().available {
+            assert!(
+                std::env::var("TUCKMILL_REQUIRE_METAL").is_err(),
+                "TUCKMILL_REQUIRE_METAL is set but no Metal device is available"
+            );
+            eprintln!("skipping: no Metal device");
+            return;
+        }
+        let (_dir, artifact, plan) = fixture();
+        let mut cpu = TuckCore::new();
+        cpu.load(
+            &plan,
+            &artifact,
+            Some(&serde_json::json!({"kernels": "scalar"})),
+        )
+        .unwrap();
+        let mut gpu = TuckCore::new();
+        let note = gpu
+            .load(
+                &plan,
+                &artifact,
+                Some(&serde_json::json!({"kernels": "metal"})),
+            )
+            .unwrap();
+        assert!(note.contains("Metal resident path"), "{note}");
+
+        // Teacher-forced logits on a fixed sequence (held positions).
+        let tokens: Vec<u32> = vec![1, 9, 4, 17, 5, 23];
+        let positions = [0u64, 2, 4];
+        let collect = |engine: &mut TuckCore| -> Vec<(u64, Vec<f32>)> {
+            let mut out = Vec::new();
+            {
+                let mut sink = |pos: u64, logits: &[f32]| {
+                    out.push((pos, logits.to_vec()));
+                    true
+                };
+                engine
+                    .score(&tokens, &positions, &|| false, &mut sink)
+                    .unwrap();
+            }
+            out
+        };
+        let cpu_logits = collect(&mut cpu);
+        let gpu_logits = collect(&mut gpu);
+        assert_eq!(cpu_logits.len(), 3);
+        assert_eq!(gpu_logits.len(), 3);
+        for ((pos, a), (_, b)) in cpu_logits.iter().zip(gpu_logits.iter()) {
+            assert_eq!(a.len(), b.len());
+            let scale = a.iter().fold(0f32, |m, v| m.max(v.abs())).max(1.0);
+            let max_diff = a
+                .iter()
+                .zip(b.iter())
+                .fold(0f32, |m, (x, y)| m.max((x - y).abs()));
+            // Registered fixture policy: same f32 arithmetic, different
+            // summation order; ~1e-4 relative is expected, 1e-2 is margin.
+            assert!(
+                max_diff <= 1e-2 * scale,
+                "position {pos}: max |diff| {max_diff} over scale {scale}"
+            );
+            assert_eq!(
+                sampling::argmax(a),
+                sampling::argmax(b),
+                "position {pos}: top-1 must agree"
+            );
+        }
+
+        // Greedy generation path: same tokens and finish through both.
+        let (cpu_outcome, cpu_text) = run_generate_with(
+            &mut cpu,
+            tokens.clone(),
+            6,
+            vec![],
+            0,
+            SamplingPolicy::default(),
+        );
+        let (gpu_outcome, gpu_text) =
+            run_generate_with(&mut gpu, tokens, 6, vec![], 0, SamplingPolicy::default());
+        assert_eq!(cpu_outcome.finish_reason, gpu_outcome.finish_reason);
+        assert_eq!(
+            cpu_text, gpu_text,
+            "greedy visible text must match the scalar reference"
+        );
+
+        // Honest stats: the GPU path reports itself and its live bytes.
+        let st = gpu.stats();
+        assert_eq!(st.kernel_impl.as_deref(), Some("metal"));
+        assert!(st.gpu_allocated_bytes.unwrap_or(0) > 0);
+        assert!(
+            st.storage.is_none(),
+            "GPU resident path has no CPU storage mode"
+        );
+        assert!(st.retained_weight_bytes.unwrap_or(0) > 0);
+    }
+
+    /// Gate C2 milestone (release-gated, real weights): the Metal resident
+    /// path must reproduce the CPU scalar oracle on the pinned Qwen3-0.6B
+    /// Q8_0 artifact — teacher-forced logits at held positions and greedy
+    /// generation — within a registered f32 reduction-order policy.
+    /// Debug builds skip it (the CPU oracle is ~10x slower there); run with
+    /// `cargo test --release -p tuckmill-tuckcore real_model_metal` and
+    /// TUCKMILL_REAL_GGUF pointing at the pinned artifact.
+    #[cfg(not(debug_assertions))]
+    #[test]
+    fn real_model_metal_matches_the_cpu_oracle() {
+        let Ok(gguf) = std::env::var("TUCKMILL_REAL_GGUF") else {
+            eprintln!("skipping: TUCKMILL_REAL_GGUF not set (real-weight label)");
+            return;
+        };
+        if !tuckmill_metal::probe().available {
+            assert!(
+                std::env::var("TUCKMILL_REQUIRE_METAL").is_err(),
+                "TUCKMILL_REQUIRE_METAL is set but no Metal device is available"
+            );
+            eprintln!("skipping: no Metal device");
+            return;
+        }
+        let path = std::path::PathBuf::from(&gguf);
+        let insp =
+            tuckmill_manifest::gguf::inspect(&path, &tuckmill_manifest::gguf::Limits::default())
+                .unwrap();
+        let registry = AdapterRegistry::builtin().unwrap();
+        let (cfg, _) = crate::model::resolve(&insp, &registry).unwrap();
+        // Fixed in-vocabulary token sequence: the comparison is about
+        // arithmetic, not tokenization (which reference-first encoding
+        // covers separately in the supervisor).
+        let tokens: Vec<u32> = vec![9707, 11, 1879, 0, 374, 264, 1879];
+        for t in &tokens {
+            assert!((*t as u64) < cfg.vocab, "token {t} in vocabulary");
+        }
+
+        let artifact = {
+            let meta = insp.metadata_hash().unwrap();
+            let index = insp.tensor_index_hash().unwrap();
+            tuckmill_backend::ArtifactRef {
+                path: path.display().to_string(),
+                file_bytes: insp.file_len,
+                metadata_hash: meta.as_str().to_string(),
+                tensor_index_hash: index.as_str().to_string(),
+                tokenizer_hash: None,
+                arch_id: Some("qwen3".into()),
+                content_hash: None,
+            }
+        };
+        let payload: u64 = insp.tensors.iter().map(|t| t.byte_size).sum();
+        let context = 2048u64;
+        let plan = {
+            let mut p = tuckmill_manifest::plan::ExecutionPlan::new_skeleton(
+                artifact_artifact_id(),
+                tuckmill_manifest::ids::Id::new("d".repeat(64)).unwrap(),
+                "qwen3".into(),
+            );
+            p.mode = tuckmill_manifest::plan::ExecutionMode::Resident;
+            p.context = tuckmill_manifest::plan::PlanContext::new(context, 64);
+            p.budget.requested_budget = tuckmill_manifest::units::Bytes::parse("2GiB").unwrap();
+            p.budget.add_reservation(
+                tuckmill_manifest::records::ReserveClass::Weights,
+                tuckmill_manifest::units::Bytes(payload),
+            );
+            p.budget.add_reservation(
+                tuckmill_manifest::records::ReserveClass::KvState,
+                tuckmill_manifest::units::Bytes(KvState::bytes_for(&cfg, context)),
+            );
+            p.budget.add_reservation(
+                tuckmill_manifest::records::ReserveClass::Workspaces,
+                tuckmill_manifest::units::Bytes(64 * 1024 * 1024),
+            );
+            p.budget.add_reservation(
+                tuckmill_manifest::records::ReserveClass::IoBuffers,
+                tuckmill_manifest::units::Bytes(16 * 1024 * 1024),
+            );
+            p.budget.reservation = p.budget.reservation_breakdown.total();
+            p.plan_id = p.compute_id().unwrap();
+            p
+        };
+
+        let mut cpu = TuckCore::new();
+        cpu.load(
+            &plan,
+            &artifact,
+            Some(&serde_json::json!({"kernels": "scalar", "verify_content_hash": false})),
+        )
+        .unwrap();
+        let mut gpu = TuckCore::new();
+        gpu.load(
+            &plan,
+            &artifact,
+            Some(&serde_json::json!({"kernels": "metal", "verify_content_hash": false})),
+        )
+        .unwrap();
+
+        // Teacher-forced logits at held positions.
+        let positions: Vec<u64> = vec![(tokens.len() - 1) as u64];
+        let collect = |engine: &mut TuckCore| -> Vec<(u64, Vec<f32>)> {
+            let mut out = Vec::new();
+            {
+                let mut sink = |pos: u64, logits: &[f32]| {
+                    out.push((pos, logits.to_vec()));
+                    true
+                };
+                engine
+                    .score(&tokens, &positions, &|| false, &mut sink)
+                    .unwrap();
+            }
+            out
+        };
+        let cpu_logits = collect(&mut cpu);
+        let gpu_logits = collect(&mut gpu);
+        for ((pos, a), (_, b)) in cpu_logits.iter().zip(gpu_logits.iter()) {
+            let scale = a.iter().fold(0f32, |m, v| m.max(v.abs())).max(1.0);
+            let max_diff = a
+                .iter()
+                .zip(b.iter())
+                .fold(0f32, |m, (x, y)| m.max((x - y).abs()));
+            let top1_a = sampling::argmax(a).unwrap();
+            let top1_b = sampling::argmax(b).unwrap();
+            println!(
+                "position {pos}: max |diff| {max_diff:.4e} over scale {scale:.4e}; top1 {top1_a} vs {top1_b}"
+            );
+            assert_eq!(top1_a, top1_b, "position {pos}: top-1 must agree");
+            assert!(
+                max_diff <= 5e-2 * scale,
+                "position {pos}: max |diff| {max_diff} over scale {scale}"
+            );
+        }
+
+        // Greedy generation through both paths.
+        let (cpu_outcome, cpu_text) = run_generate_with(
+            &mut cpu,
+            tokens.clone(),
+            6,
+            vec![],
+            0,
+            SamplingPolicy::default(),
+        );
+        let (gpu_outcome, gpu_text) =
+            run_generate_with(&mut gpu, tokens, 6, vec![], 0, SamplingPolicy::default());
+        println!("cpu text: {cpu_text:?}");
+        println!("gpu text: {gpu_text:?}");
+        assert_eq!(cpu_outcome.finish_reason, gpu_outcome.finish_reason);
+        assert_eq!(cpu_text, gpu_text, "greedy output must match the oracle");
+        let st = gpu.stats();
+        println!(
+            "gpu stats: kernel_impl {:?}, gpu_allocated_bytes {:?}, retained {:?}",
+            st.kernel_impl, st.gpu_allocated_bytes, st.retained_weight_bytes
+        );
+        assert_eq!(st.kernel_impl.as_deref(), Some("metal"));
+    }
+
+    #[cfg(not(debug_assertions))]
+    fn artifact_artifact_id() -> tuckmill_manifest::ids::Id {
+        tuckmill_manifest::ids::Id::new("a".repeat(64)).unwrap()
     }
 
     #[test]

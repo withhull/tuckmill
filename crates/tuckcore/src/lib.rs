@@ -12,6 +12,7 @@
 
 pub mod completion;
 pub mod forward;
+pub mod gpu;
 pub mod kernels;
 pub mod loader;
 pub mod model;

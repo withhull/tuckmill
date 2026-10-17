@@ -125,6 +125,118 @@ mod imp {
             err_cap: usize,
         ) -> c_int;
         pub fn tm_metal_fence(ctx: *mut TmMetalCtx, err: *mut c_char, err_cap: usize) -> c_int;
+        pub fn tm_metal_begin_group(
+            ctx: *mut TmMetalCtx,
+            err: *mut c_char,
+            err_cap: usize,
+        ) -> c_int;
+        pub fn tm_metal_end_group(ctx: *mut TmMetalCtx, err: *mut c_char, err_cap: usize) -> c_int;
+        pub fn tm_metal_abort_group(
+            ctx: *mut TmMetalCtx,
+            err: *mut c_char,
+            err_cap: usize,
+        ) -> c_int;
+        pub fn tm_metal_q8_0_row_f32(
+            ctx: *mut TmMetalCtx,
+            w: *mut TmMetalBuffer,
+            out: *mut TmMetalBuffer,
+            row: u32,
+            cols: u32,
+            err: *mut c_char,
+            err_cap: usize,
+        ) -> c_int;
+        pub fn tm_metal_f16_gemv(
+            ctx: *mut TmMetalCtx,
+            w: *mut TmMetalBuffer,
+            x: *mut TmMetalBuffer,
+            y: *mut TmMetalBuffer,
+            rows: u32,
+            cols: u32,
+            err: *mut c_char,
+            err_cap: usize,
+        ) -> c_int;
+        pub fn tm_metal_rmsnorm_f32(
+            ctx: *mut TmMetalCtx,
+            x: *mut TmMetalBuffer,
+            weight: *mut TmMetalBuffer,
+            y: *mut TmMetalBuffer,
+            rows: u32,
+            cols: u32,
+            eps: f32,
+            err: *mut c_char,
+            err_cap: usize,
+        ) -> c_int;
+        pub fn tm_metal_rope_f32(
+            ctx: *mut TmMetalCtx,
+            q: *mut TmMetalBuffer,
+            k: *mut TmMetalBuffer,
+            inv_freq: *mut TmMetalBuffer,
+            pos: u32,
+            n_q_heads: u32,
+            n_kv_heads: u32,
+            head_dim: u32,
+            err: *mut c_char,
+            err_cap: usize,
+        ) -> c_int;
+        pub fn tm_metal_kv_store_f32(
+            ctx: *mut TmMetalCtx,
+            k_src: *mut TmMetalBuffer,
+            v_src: *mut TmMetalBuffer,
+            k_cache: *mut TmMetalBuffer,
+            v_cache: *mut TmMetalBuffer,
+            kv_heads: u32,
+            pos: u32,
+            cap: u32,
+            head_dim: u32,
+            round_f16: u32,
+            err: *mut c_char,
+            err_cap: usize,
+        ) -> c_int;
+        pub fn tm_metal_attention_f32(
+            ctx: *mut TmMetalCtx,
+            q: *mut TmMetalBuffer,
+            k_cache: *mut TmMetalBuffer,
+            v_cache: *mut TmMetalBuffer,
+            out: *mut TmMetalBuffer,
+            scratch: *mut TmMetalBuffer,
+            heads: u32,
+            pos: u32,
+            cap: u32,
+            head_dim: u32,
+            group: u32,
+            scale: f32,
+            err: *mut c_char,
+            err_cap: usize,
+        ) -> c_int;
+        pub fn tm_metal_f16_row_f32(
+            ctx: *mut TmMetalCtx,
+            w: *mut TmMetalBuffer,
+            out: *mut TmMetalBuffer,
+            row: u32,
+            cols: u32,
+            err: *mut c_char,
+            err_cap: usize,
+        ) -> c_int;
+        pub fn tm_metal_rmsnorm_f16w(
+            ctx: *mut TmMetalCtx,
+            x: *mut TmMetalBuffer,
+            weight: *mut TmMetalBuffer,
+            y: *mut TmMetalBuffer,
+            rows: u32,
+            cols: u32,
+            eps: f32,
+            err: *mut c_char,
+            err_cap: usize,
+        ) -> c_int;
+        pub fn tm_metal_silu_mul_f32(
+            ctx: *mut TmMetalCtx,
+            gate: *mut TmMetalBuffer,
+            up: *mut TmMetalBuffer,
+            out: *mut TmMetalBuffer,
+            n: u32,
+            err: *mut c_char,
+            err_cap: usize,
+        ) -> c_int;
         pub fn tm_metal_committed_dispatches(ctx: *const TmMetalCtx) -> u64;
         pub fn tm_metal_completed_dispatches(ctx: *const TmMetalCtx) -> u64;
         pub fn tm_metal_last_gpu_ms(ctx: *const TmMetalCtx) -> f64;
@@ -460,6 +572,314 @@ impl MetalContext {
             // SAFETY: raw handles were validated against this context.
             let code = unsafe {
                 imp::tm_metal_q8_0_gemv(ctx, wc, xc, yc, rows, cols, err.as_mut_ptr(), ERR_CAP)
+            };
+            (code, err)
+        })
+    }
+
+    /// Open a grouped-encoding scope: subsequent operations encode into one
+    /// command buffer, committed (and completion-tracked) by `end_group`
+    /// instead of one command buffer per operator.
+    pub fn begin_group(&self) -> Result<()> {
+        self.operate("begin_group", |ctx| {
+            let mut err = [0 as c_char; ERR_CAP];
+            // SAFETY: caller holds the lock; ctx is valid.
+            let code = unsafe { imp::tm_metal_begin_group(ctx, err.as_mut_ptr(), ERR_CAP) };
+            (code, err)
+        })
+    }
+
+    /// Commit the open group: one command buffer, one completion.
+    pub fn end_group(&self) -> Result<()> {
+        self.operate("end_group", |ctx| {
+            let mut err = [0 as c_char; ERR_CAP];
+            // SAFETY: caller holds the lock; ctx is valid.
+            let code = unsafe { imp::tm_metal_end_group(ctx, err.as_mut_ptr(), ERR_CAP) };
+            (code, err)
+        })
+    }
+
+    /// Discard the open group's work without committing it (cancellation at
+    /// a step boundary; no partial GPU work is ever submitted).
+    pub fn abort_group(&self) -> Result<()> {
+        self.operate("abort_group", |ctx| {
+            let mut err = [0 as c_char; ERR_CAP];
+            // SAFETY: caller holds the lock; ctx is valid.
+            let code = unsafe { imp::tm_metal_abort_group(ctx, err.as_mut_ptr(), ERR_CAP) };
+            (code, err)
+        })
+    }
+
+    /// Dequantize one packed Q8_0 matrix row to f32.
+    pub fn q8_0_row(&self, w: &MetalBuffer, out: &MetalBuffer, row: u32, cols: u32) -> Result<()> {
+        self.check_pair(w, out)?;
+        let (wc, oc) = (w.raw, out.raw);
+        self.operate("q8_0_row", move |ctx| {
+            let mut err = [0 as c_char; ERR_CAP];
+            // SAFETY: raw handles were validated against this context.
+            let code = unsafe {
+                imp::tm_metal_q8_0_row_f32(ctx, wc, oc, row, cols, err.as_mut_ptr(), ERR_CAP)
+            };
+            (code, err)
+        })
+    }
+
+    /// F16 matvec (fixture/F16-twin artifacts).
+    pub fn f16_gemv(
+        &self,
+        w: &MetalBuffer,
+        x: &MetalBuffer,
+        y: &MetalBuffer,
+        rows: u32,
+        cols: u32,
+    ) -> Result<()> {
+        for (buffer, name) in [(w, "weights"), (x, "x"), (y, "y")] {
+            self.check_owned(buffer, name)?;
+        }
+        let (wc, xc, yc) = (w.raw, x.raw, y.raw);
+        self.operate("f16_gemv", move |ctx| {
+            let mut err = [0 as c_char; ERR_CAP];
+            // SAFETY: raw handles were validated against this context.
+            let code = unsafe {
+                imp::tm_metal_f16_gemv(ctx, wc, xc, yc, rows, cols, err.as_mut_ptr(), ERR_CAP)
+            };
+            (code, err)
+        })
+    }
+
+    /// Dequantize one F16 matrix row to f32.
+    pub fn f16_row(&self, w: &MetalBuffer, out: &MetalBuffer, row: u32, cols: u32) -> Result<()> {
+        self.check_pair(w, out)?;
+        let (wc, oc) = (w.raw, out.raw);
+        self.operate("f16_row", move |ctx| {
+            let mut err = [0 as c_char; ERR_CAP];
+            // SAFETY: raw handles were validated against this context.
+            let code = unsafe {
+                imp::tm_metal_f16_row_f32(ctx, wc, oc, row, cols, err.as_mut_ptr(), ERR_CAP)
+            };
+            (code, err)
+        })
+    }
+
+    /// Row-wise RMSNorm with an F16-weight table.
+    pub fn rmsnorm_f16w(
+        &self,
+        x: &MetalBuffer,
+        weight: &MetalBuffer,
+        y: &MetalBuffer,
+        rows: u32,
+        cols: u32,
+        eps: f32,
+    ) -> Result<()> {
+        for (buffer, name) in [(x, "x"), (weight, "weight"), (y, "y")] {
+            self.check_owned(buffer, name)?;
+        }
+        let (xc, wc, yc) = (x.raw, weight.raw, y.raw);
+        self.operate("rmsnorm_f16w", move |ctx| {
+            let mut err = [0 as c_char; ERR_CAP];
+            // SAFETY: raw handles were validated against this context.
+            let code = unsafe {
+                imp::tm_metal_rmsnorm_f16w(
+                    ctx,
+                    xc,
+                    wc,
+                    yc,
+                    rows,
+                    cols,
+                    eps,
+                    err.as_mut_ptr(),
+                    ERR_CAP,
+                )
+            };
+            (code, err)
+        })
+    }
+
+    /// Row-wise RMSNorm: y[row] = rmsnorm(x[row], weight, eps).
+    pub fn rmsnorm(
+        &self,
+        x: &MetalBuffer,
+        weight: &MetalBuffer,
+        y: &MetalBuffer,
+        rows: u32,
+        cols: u32,
+        eps: f32,
+    ) -> Result<()> {
+        for (buffer, name) in [(x, "x"), (weight, "weight"), (y, "y")] {
+            self.check_owned(buffer, name)?;
+        }
+        let (xc, wc, yc) = (x.raw, weight.raw, y.raw);
+        self.operate("rmsnorm", move |ctx| {
+            let mut err = [0 as c_char; ERR_CAP];
+            // SAFETY: raw handles were validated against this context.
+            let code = unsafe {
+                imp::tm_metal_rmsnorm_f32(
+                    ctx,
+                    xc,
+                    wc,
+                    yc,
+                    rows,
+                    cols,
+                    eps,
+                    err.as_mut_ptr(),
+                    ERR_CAP,
+                )
+            };
+            (code, err)
+        })
+    }
+
+    /// NeoX RoPE in place over q (n_q_heads) and k (n_kv_heads) at `pos`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn rope(
+        &self,
+        q: &MetalBuffer,
+        k: &MetalBuffer,
+        inv_freq: &MetalBuffer,
+        pos: u32,
+        n_q_heads: u32,
+        n_kv_heads: u32,
+        head_dim: u32,
+    ) -> Result<()> {
+        for (buffer, name) in [(q, "q"), (k, "k"), (inv_freq, "inv_freq")] {
+            self.check_owned(buffer, name)?;
+        }
+        let (qc, kc, fc) = (q.raw, k.raw, inv_freq.raw);
+        self.operate("rope", move |ctx| {
+            let mut err = [0 as c_char; ERR_CAP];
+            // SAFETY: raw handles were validated against this context.
+            let code = unsafe {
+                imp::tm_metal_rope_f32(
+                    ctx,
+                    qc,
+                    kc,
+                    fc,
+                    pos,
+                    n_q_heads,
+                    n_kv_heads,
+                    head_dim,
+                    err.as_mut_ptr(),
+                    ERR_CAP,
+                )
+            };
+            (code, err)
+        })
+    }
+
+    /// Append k/v rows into the KV caches at `pos`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn kv_store(
+        &self,
+        k_src: &MetalBuffer,
+        v_src: &MetalBuffer,
+        k_cache: &MetalBuffer,
+        v_cache: &MetalBuffer,
+        kv_heads: u32,
+        pos: u32,
+        cap: u32,
+        head_dim: u32,
+        round_f16: bool,
+    ) -> Result<()> {
+        for (buffer, name) in [
+            (k_src, "k_src"),
+            (v_src, "v_src"),
+            (k_cache, "k_cache"),
+            (v_cache, "v_cache"),
+        ] {
+            self.check_owned(buffer, name)?;
+        }
+        let (ks, vs, kcat, vcat) = (k_src.raw, v_src.raw, k_cache.raw, v_cache.raw);
+        self.operate("kv_store", move |ctx| {
+            let mut err = [0 as c_char; ERR_CAP];
+            // SAFETY: raw handles were validated against this context.
+            let code = unsafe {
+                imp::tm_metal_kv_store_f32(
+                    ctx,
+                    ks,
+                    vs,
+                    kcat,
+                    vcat,
+                    kv_heads,
+                    pos,
+                    cap,
+                    head_dim,
+                    u32::from(round_f16),
+                    err.as_mut_ptr(),
+                    ERR_CAP,
+                )
+            };
+            (code, err)
+        })
+    }
+
+    /// Causal GQA attention for one position; `scratch` holds heads*cap f32.
+    #[allow(clippy::too_many_arguments)]
+    pub fn attention(
+        &self,
+        q: &MetalBuffer,
+        k_cache: &MetalBuffer,
+        v_cache: &MetalBuffer,
+        out: &MetalBuffer,
+        scratch: &MetalBuffer,
+        heads: u32,
+        pos: u32,
+        cap: u32,
+        head_dim: u32,
+        group: u32,
+        scale: f32,
+    ) -> Result<()> {
+        for (buffer, name) in [
+            (q, "q"),
+            (k_cache, "k_cache"),
+            (v_cache, "v_cache"),
+            (out, "out"),
+            (scratch, "scratch"),
+        ] {
+            self.check_owned(buffer, name)?;
+        }
+        let (qc, kc, vc, oc, sc) = (q.raw, k_cache.raw, v_cache.raw, out.raw, scratch.raw);
+        self.operate("attention", move |ctx| {
+            let mut err = [0 as c_char; ERR_CAP];
+            // SAFETY: raw handles were validated against this context.
+            let code = unsafe {
+                imp::tm_metal_attention_f32(
+                    ctx,
+                    qc,
+                    kc,
+                    vc,
+                    oc,
+                    sc,
+                    heads,
+                    pos,
+                    cap,
+                    head_dim,
+                    group,
+                    scale,
+                    err.as_mut_ptr(),
+                    ERR_CAP,
+                )
+            };
+            (code, err)
+        })
+    }
+
+    /// out[i] = silu(gate[i]) * up[i].
+    pub fn silu_mul(
+        &self,
+        gate: &MetalBuffer,
+        up: &MetalBuffer,
+        out: &MetalBuffer,
+        n: u32,
+    ) -> Result<()> {
+        for (buffer, name) in [(gate, "gate"), (up, "up"), (out, "out")] {
+            self.check_owned(buffer, name)?;
+        }
+        let (gc, uc, oc) = (gate.raw, up.raw, out.raw);
+        self.operate("silu_mul", move |ctx| {
+            let mut err = [0 as c_char; ERR_CAP];
+            // SAFETY: raw handles were validated against this context.
+            let code = unsafe {
+                imp::tm_metal_silu_mul_f32(ctx, gc, uc, oc, n, err.as_mut_ptr(), ERR_CAP)
             };
             (code, err)
         })

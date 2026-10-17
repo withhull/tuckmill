@@ -94,6 +94,64 @@ int tm_metal_cast_f16_f32(tm_metal_ctx *ctx, tm_metal_buffer *x, tm_metal_buffer
 int tm_metal_cast_f32_f16(tm_metal_ctx *ctx, tm_metal_buffer *x, tm_metal_buffer *y,
                           uint32_t n, char *err, size_t err_cap);
 
+/*
+ * Grouped encoding (C2): operations between begin_group/end_group encode
+ * into ONE command buffer committed at end_group, instead of one commit per
+ * operator. abort_group discards the open group's work without committing
+ * (cancellation at a step boundary; no partial GPU work is submitted).
+ * Copies and fence require no open group.
+ */
+int tm_metal_begin_group(tm_metal_ctx *ctx, char *err, size_t err_cap);
+int tm_metal_end_group(tm_metal_ctx *ctx, char *err, size_t err_cap);
+int tm_metal_abort_group(tm_metal_ctx *ctx, char *err, size_t err_cap);
+
+/* Dequantize row `row` of a packed Q8_0 matrix to `cols` f32 values. */
+int tm_metal_q8_0_row_f32(tm_metal_ctx *ctx, tm_metal_buffer *w, tm_metal_buffer *out,
+                          uint32_t row, uint32_t cols, char *err, size_t err_cap);
+
+/* F16 matvec: y[r] = dot(f32(w_row_r), x); `w` holds rows*cols f16 values. */
+int tm_metal_f16_gemv(tm_metal_ctx *ctx, tm_metal_buffer *w, tm_metal_buffer *x,
+                      tm_metal_buffer *y, uint32_t rows, uint32_t cols,
+                      char *err, size_t err_cap);
+
+/* y[row] = rmsnorm(x[row], weight, eps) for `rows` rows of `cols`. */
+int tm_metal_rmsnorm_f32(tm_metal_ctx *ctx, tm_metal_buffer *x, tm_metal_buffer *weight,
+                         tm_metal_buffer *y, uint32_t rows, uint32_t cols, float eps,
+                         char *err, size_t err_cap);
+
+/* NeoX RoPE in place over n_q_heads of q and n_kv_heads of k at `pos`,
+ * using host-precomputed inv_freq[head_dim/2]. */
+int tm_metal_rope_f32(tm_metal_ctx *ctx, tm_metal_buffer *q, tm_metal_buffer *k,
+                      tm_metal_buffer *inv_freq, uint32_t pos, uint32_t n_q_heads,
+                      uint32_t n_kv_heads, uint32_t head_dim, char *err, size_t err_cap);
+
+/* k_cache[h][pos][:] = k_src[h][:], same for v; `round_f16` stores
+ * f16-representable f32 values (the declared f16 cache contract). */
+int tm_metal_kv_store_f32(tm_metal_ctx *ctx, tm_metal_buffer *k_src, tm_metal_buffer *v_src,
+                          tm_metal_buffer *k_cache, tm_metal_buffer *v_cache,
+                          uint32_t kv_heads, uint32_t pos, uint32_t cap, uint32_t head_dim,
+                          uint32_t round_f16, char *err, size_t err_cap);
+
+/* Causal GQA attention at `pos`; `scratch` holds heads*cap f32. */
+int tm_metal_attention_f32(tm_metal_ctx *ctx, tm_metal_buffer *q, tm_metal_buffer *k_cache,
+                           tm_metal_buffer *v_cache, tm_metal_buffer *out,
+                           tm_metal_buffer *scratch, uint32_t heads, uint32_t pos,
+                           uint32_t cap, uint32_t head_dim, uint32_t group, float scale,
+                           char *err, size_t err_cap);
+
+/* Dequantize row `row` of an F16 matrix to `cols` f32 values. */
+int tm_metal_f16_row_f32(tm_metal_ctx *ctx, tm_metal_buffer *w, tm_metal_buffer *out,
+                         uint32_t row, uint32_t cols, char *err, size_t err_cap);
+
+/* RMSNorm with an F16-weight table. */
+int tm_metal_rmsnorm_f16w(tm_metal_ctx *ctx, tm_metal_buffer *x, tm_metal_buffer *weight,
+                          tm_metal_buffer *y, uint32_t rows, uint32_t cols, float eps,
+                          char *err, size_t err_cap);
+
+/* out[i] = silu(gate[i]) * up[i]. */
+int tm_metal_silu_mul_f32(tm_metal_ctx *ctx, tm_metal_buffer *gate, tm_metal_buffer *up,
+                          tm_metal_buffer *out, uint32_t n, char *err, size_t err_cap);
+
 /* Packed Q8_0 matrix-vector decode: y[r] = dot(dequant_q8_0(w_row_r), x).
  * `w` holds `rows * cols / 32` blocks of 34 bytes ([f16 d][i8 qs; 32]).
  * `cols` must be a positive multiple of 32; `x` is f32 of length `cols`;
