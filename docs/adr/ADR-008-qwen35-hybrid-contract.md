@@ -119,3 +119,23 @@ never accepted by any real artifact.
   decay-1 identities; state sizes tie exactly to the contract's pricing
   (18 x (1,048,576 + 73,728) = 20,201,472 B). Still not wired into the
   loader.
+
+## Addendum 4 (Q35-1C)
+
+- Full-attention and FFN operators join the scalar reference library
+  (`crates/tuckcore/src/qwen35_ops.rs`): weighted per-head RMS norm via
+  the shared `rmsnorm_in_place` primitive; partial split-half RoPE that
+  rotates only the declared span (`rope.dimension_count` = 64 of 256),
+  with the frequency table spaced over the rotated dims exactly as
+  `ggml_mrope_cache_init` does — for text positions every IMRoPE axis
+  carries the same position, which reduces to this standard pairing;
+  numerically stable softmax; grouped causal decode attention with
+  consecutive-head KV mapping (`h / (heads_q / heads_kv)`); the joint
+  Q-projection sigmoid gate applied before the output projection; SwiGLU
+  and the residual adds.
+- Evidence: hand-computed partial-RoPE rotation (rotated pairs and
+  untouched tail), softmax limits, GQA hand case plus head-mapping case,
+  gate/FFN/residual hand values, and the weighted head norm. Operator
+  contracts are architecture-neutral where the mathematics is (norm,
+  RoPE, softmax, attention, SwiGLU, residual), per the operator-first
+  direction in the Q35 roadmap review.

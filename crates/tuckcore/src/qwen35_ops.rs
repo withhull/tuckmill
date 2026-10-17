@@ -1,5 +1,5 @@
-//! Scalar reference operators for the Qwen3.5 Gated DeltaNet layers
-//! (Q35-1B, ADR-008).
+//! Scalar reference operators for the Qwen3.5 hybrid layers
+//! (Q35-1B/1C, ADR-008).
 //!
 //! Semantics re-derived from llama.cpp b11695 and exercised by
 //! deterministic operator and recurrent-state tests:
@@ -13,7 +13,14 @@
 //!   `s~ = s * exp(g)`, `sk = s~^T k`, `d = beta * (v - sk)`,
 //!   `s = s~ + k d^T`, `o = s^T (q / sqrt(S_k))`;
 //! - scalars match ggml: `silu(x) = x * sigmoid(x)`, `softplus(x) =
-//!   x > 20 ? x : ln(1 + e^x)`, `sigmoid(x) = 1 / (1 + e^-x)`.
+//!   x > 20 ? x : ln(1 + e^x)`, `sigmoid(x) = 1 / (1 + e^-x)`;
+//! - full attention (Q35-1C): weighted per-head RMS norm for Q/K
+//!   (`rmsnorm_in_place`, the shared Qwen3 primitive), partial split-half
+//!   RoPE over the rotated span only (`n_rot` = `rope.dimension_count`;
+//!   IMRoPE with text positions reduces to this), grouped causal
+//!   decode attention with consecutive-head KV mapping, and the joint
+//!   Q-projection sigmoid gate applied before the output projection;
+//! - FFN (Q35-1C): SwiGLU (`silu(gate) * up`) and the residual adds.
 //!
 //! The operators are portable, f32, and deterministic; they are the
 //! reference the Q35-1C assembly and later Metal kernels are validated
@@ -230,6 +237,167 @@ impl GdnState {
                 }
             }
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Full-attention, RoPE and FFN operators (Q35-1C)
+// ---------------------------------------------------------------------------
+
+use crate::forward::{rmsnorm_in_place, rope_apply};
+
+/// RoPE inverse-frequency table for a partially-rotated head.
+///
+/// `rope_dims` is the number of rotated dims (the pinned model rotates 64
+/// of 256 full-attention dims). ggml spaces the frequencies over the
+/// *rotated* dim count, not the head width: `theta^(-2i/rope_dims)`,
+/// which matches `ggml_mrope_cache_init` for text positions (identical
+/// positions on every IMRoPE axis reduce to the standard table).
+pub fn rope_inv_freq_partial(rope_dims: usize, base: f32) -> Vec<f32> {
+    (0..rope_dims / 2)
+        .map(|i| {
+            let exponent = 2.0 * i as f64 / rope_dims as f64;
+            (1.0 / (base as f64).powf(exponent)) as f32
+        })
+        .collect()
+}
+
+/// Split-half (NeoX / IMRoPE) RoPE for one head vector, in place: pairs
+/// `(i, i + rope_dims/2)` rotate by `pos * inv_freq[i]`; dims at or beyond
+/// `2 * inv_freq.len()` pass through untouched. This is ggml's
+/// `rotate_pairs` with `n_offset = n_dims / 2`.
+pub fn partial_rope_in_place(head: &mut [f32], pos: usize, inv_freq: &[f32]) {
+    let rope_dims = inv_freq.len() * 2;
+    assert!(
+        head.len() >= rope_dims,
+        "head shorter than the rotated span"
+    );
+    rope_apply(&mut head[..rope_dims], pos, inv_freq);
+}
+
+/// RMS norm with an explicit weight vector (ggml `LLM_NORM_RMS`): the
+/// attention path's Q/K head norms and the layer norms all share this.
+pub fn rms_norm_weighted_in_place(x: &mut [f32], weight: &[f32], eps: f32) {
+    rmsnorm_in_place(x, weight, eps);
+}
+
+/// Numerically stable softmax over one score row (subtract the max,
+/// mirroring `ggml_compute_forward_softmax_f32`).
+pub fn softmax_in_place(row: &mut [f32]) {
+    if row.is_empty() {
+        return;
+    }
+    let mut max = f32::NEG_INFINITY;
+    for v in row.iter() {
+        max = max.max(*v);
+    }
+    let mut sum = 0.0f32;
+    for v in row.iter_mut() {
+        *v = (*v - max).exp();
+        sum += *v;
+    }
+    let inv = 1.0 / sum;
+    for v in row.iter_mut() {
+        *v *= inv;
+    }
+}
+
+/// GQA mapping: consecutive query heads share a KV head,
+/// `h / (heads_q / heads_kv)` (llama.cpp grouped attention).
+pub fn kv_head_for(head: usize, heads_q: usize, heads_kv: usize) -> usize {
+    assert!(heads_kv > 0 && heads_q.is_multiple_of(heads_kv));
+    head / (heads_q / heads_kv)
+}
+
+/// Query/KV geometry of one full-attention layer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GqaGeometry {
+    pub heads_q: usize,
+    pub heads_kv: usize,
+    pub head_dim: usize,
+}
+
+/// One decode step of grouped causal attention.
+///
+/// `q` is `heads_q x head_dim` for the newest token; `k_cache`/`v_cache`
+/// are `heads_kv x seq x head_dim` and already include that token, so
+/// every position in the cache is causally visible. `scale` is the
+/// graph's query scale (`1 / sqrt(head_dim)` for the pinned model).
+pub fn gqa_cache_attention(
+    q: &[f32],
+    k_cache: &[f32],
+    v_cache: &[f32],
+    geometry: GqaGeometry,
+    seq: usize,
+    scale: f32,
+    out: &mut [f32],
+) {
+    let GqaGeometry {
+        heads_q,
+        heads_kv,
+        head_dim,
+    } = geometry;
+    assert!(seq > 0, "attention needs at least one cached position");
+    assert_eq!(q.len(), heads_q * head_dim, "q must be [heads_q, head_dim]");
+    assert_eq!(k_cache.len(), heads_kv * seq * head_dim);
+    assert_eq!(v_cache.len(), k_cache.len());
+    assert_eq!(out.len(), heads_q * head_dim);
+
+    let mut scores = vec![0.0f32; seq];
+    for h in 0..heads_q {
+        let kv = kv_head_for(h, heads_q, heads_kv);
+        let qh = &q[h * head_dim..(h + 1) * head_dim];
+        for t in 0..seq {
+            let kt = &k_cache[(kv * seq + t) * head_dim..][..head_dim];
+            let mut acc = 0.0f32;
+            for d in 0..head_dim {
+                acc += qh[d] * kt[d];
+            }
+            scores[t] = acc * scale;
+        }
+        softmax_in_place(&mut scores);
+        let o = &mut out[h * head_dim..(h + 1) * head_dim];
+        o.fill(0.0);
+        for t in 0..seq {
+            let vt = &v_cache[(kv * seq + t) * head_dim..][..head_dim];
+            let w = scores[t];
+            for d in 0..head_dim {
+                o[d] += w * vt[d];
+            }
+        }
+    }
+}
+
+/// Qwen3.5's gated attention output: `attn[i] *= sigmoid(gate[i])`. The
+/// gate is the second half of the joint Q projection and is applied
+/// before the output projection.
+pub fn apply_sigmoid_gate(attn: &mut [f32], gate: &[f32]) {
+    assert_eq!(
+        attn.len(),
+        gate.len(),
+        "gate must match the attention output"
+    );
+    for (a, g) in attn.iter_mut().zip(gate.iter()) {
+        *a *= sigmoid(*g);
+    }
+}
+
+/// SwiGLU activation: `gate[i] = silu(gate[i]) * up[i]` (the FFN's
+/// elementwise stage between the gate/up projections and the down
+/// projection).
+pub fn swiglu_in_place(gate: &mut [f32], up: &[f32]) {
+    assert_eq!(gate.len(), up.len());
+    for (g, u) in gate.iter_mut().zip(up.iter()) {
+        *g = silu(*g) * *u;
+    }
+}
+
+/// Residual accumulation: `dst[i] += src[i]` (the layer's two residual
+/// adds).
+pub fn residual_add_in_place(dst: &mut [f32], src: &[f32]) {
+    assert_eq!(dst.len(), src.len());
+    for (d, s) in dst.iter_mut().zip(src.iter()) {
+        *d += *s;
     }
 }
 
@@ -490,5 +658,165 @@ mod tests {
         conv.reset();
         assert_eq!(conv.state_bytes(), 73_728);
         assert_eq!(18 * (gdn.state_bytes() + conv.state_bytes()), 20_201_472);
+    }
+}
+
+#[cfg(test)]
+mod attention_tests {
+    use super::*;
+
+    #[test]
+    fn partial_rope_frequencies_use_the_rotated_span() {
+        let inv = rope_inv_freq_partial(4, 1e7);
+        assert_eq!(inv.len(), 2);
+        assert_eq!(inv[0], 1.0);
+        let expect = (1e7f64).powf(-2.0 / 4.0) as f32;
+        assert!((inv[1] - expect).abs() < 1e-12, "{}", inv[1]);
+    }
+
+    #[test]
+    fn partial_rope_rotates_only_the_declared_dims() {
+        let inv = rope_inv_freq_partial(4, 1e7); // 2 pairs within 4 dims
+        let mut head = [1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0];
+
+        // pos 0 is the identity.
+        let mut at_zero = head;
+        partial_rope_in_place(&mut at_zero, 0, &inv);
+        assert_eq!(at_zero, head);
+
+        // pos 1: pairs (0, 2) and (1, 3) rotate; dims 4..8 pass through.
+        partial_rope_in_place(&mut head, 1, &inv);
+        let (s0, c0) = 1.0f32.sin_cos();
+        let (s1, c1) = inv[1].sin_cos();
+        let expected = [
+            1.0 * c0 - 3.0 * s0,
+            2.0 * c1 - 4.0 * s1,
+            1.0 * s0 + 3.0 * c0,
+            2.0 * s1 + 4.0 * c1,
+            5.0,
+            6.0,
+            7.0,
+            8.0,
+        ];
+        for (got, want) in head.iter().zip(expected.iter()) {
+            assert!((got - want).abs() < 1e-6, "{got} vs {want}");
+        }
+    }
+
+    #[test]
+    fn softmax_matches_manual_computation_and_stays_finite() {
+        let mut row = [1.0f32, 2.0, 3.0];
+        softmax_in_place(&mut row);
+        let e = |x: f32| x.exp();
+        let sum = e(1.0) + e(2.0) + e(3.0);
+        assert!((row[0] - e(1.0) / sum).abs() < 1e-7);
+        assert!((row[1] - e(2.0) / sum).abs() < 1e-7);
+        assert!((row[2] - e(3.0) / sum).abs() < 1e-7);
+
+        let mut large = [1000.0f32, 1001.0];
+        softmax_in_place(&mut large);
+        assert!(large.iter().all(|v| v.is_finite()));
+        assert!(
+            large[1] > large[0],
+            "the larger score keeps the larger weight"
+        );
+        assert!((large[0] + large[1] - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn gqa_decode_attention_matches_the_hand_computed_case() {
+        // 1 head, seq 2, head_dim 2, scale 1.
+        let q = [1.0f32, 0.0];
+        let k = [1.0f32, 0.0, 0.0, 1.0];
+        let v = [1.0f32, 2.0, 3.0, 4.0];
+        let mut out = [0.0f32; 2];
+        gqa_cache_attention(
+            &q,
+            &k,
+            &v,
+            GqaGeometry {
+                heads_q: 1,
+                heads_kv: 1,
+                head_dim: 2,
+            },
+            2,
+            1.0,
+            &mut out,
+        );
+        let w0 = 1.0f32.exp() / (1.0f32.exp() + 1.0);
+        let w1 = 1.0 - w0;
+        assert!((out[0] - (w0 * 1.0 + w1 * 3.0)).abs() < 1e-6, "{}", out[0]);
+        assert!((out[1] - (w0 * 2.0 + w1 * 4.0)).abs() < 1e-6, "{}", out[1]);
+    }
+
+    #[test]
+    fn gqa_maps_consecutive_query_heads_to_one_kv_head() {
+        assert_eq!(kv_head_for(0, 8, 2), 0);
+        assert_eq!(kv_head_for(3, 8, 2), 0);
+        assert_eq!(kv_head_for(4, 8, 2), 1);
+        assert_eq!(kv_head_for(7, 8, 2), 1);
+
+        // heads_q = 2, heads_kv = 1: both heads see kv head 0.
+        let q = [1.0f32, 0.0, 0.0, 1.0];
+        let k = [1.0f32, 0.0, 0.0, 1.0]; // two cached positions
+        let v = [1.0f32, 0.0, 0.0, 1.0];
+        let mut out = [0.0f32; 4];
+        gqa_cache_attention(
+            &q,
+            &k,
+            &v,
+            GqaGeometry {
+                heads_q: 2,
+                heads_kv: 1,
+                head_dim: 2,
+            },
+            2,
+            1.0,
+            &mut out,
+        );
+        // Head 0 scores [1, 0] and head 1 scores [0, 1]; with identity v
+        // the outputs equal the softmax weights themselves.
+        let w0 = 1.0f32.exp() / (1.0f32.exp() + 1.0);
+        let w1 = 1.0 - w0;
+        assert!((out[0] - w0).abs() < 1e-6);
+        assert!((out[1] - w1).abs() < 1e-6);
+        assert!((out[2] - w1).abs() < 1e-6);
+        assert!((out[3] - w0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn sigmoid_gate_matches_the_hand_computed_case() {
+        let mut attn = [1.0f32, 2.0];
+        let gate = [0.0f32, 3.0f32.ln()]; // sigmoid -> 0.5, 0.75
+        apply_sigmoid_gate(&mut attn, &gate);
+        assert!((attn[0] - 0.5).abs() < 1e-7);
+        assert!((attn[1] - 1.5).abs() < 1e-6);
+    }
+
+    #[test]
+    fn swiglu_and_residual_match_the_hand_computed_cases() {
+        let mut gate = [1.0f32, 2.0];
+        let up = [3.0f32, 4.0];
+        swiglu_in_place(&mut gate, &up);
+        assert!((gate[0] - 0.7310586 * 3.0).abs() < 1e-6, "{}", gate[0]);
+        let silu2 = 2.0 / (1.0 + (-2.0f32).exp());
+        assert!((gate[1] - silu2 * 4.0).abs() < 1e-6, "{}", gate[1]);
+
+        let mut residual = [1.0f32, 2.0];
+        residual_add_in_place(&mut residual, &[3.0, 4.0]);
+        assert_eq!(residual, [4.0, 6.0]);
+    }
+
+    /// Q/K head norms use the stored weights as-is (the converter already
+    /// applied the +1 shift); spot-check the weighted RMS math on a head.
+    #[test]
+    fn weighted_head_rms_norm_matches_manual() {
+        let mut head = [3.0f32, 4.0];
+        let weight = [1.0f32, 2.0];
+        rms_norm_weighted_in_place(&mut head, &weight, 0.0);
+        let mean_sq = (9.0f32 + 16.0) / 2.0;
+        let inv = 1.0 / mean_sq.sqrt();
+        assert!((head[0] - 3.0 * inv).abs() < 1e-6);
+        assert!((head[1] - 4.0 * inv * 2.0).abs() < 1e-6);
     }
 }
