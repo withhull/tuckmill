@@ -27,6 +27,8 @@
 //! against. Nothing here is wired into the loader: execution stays
 //! refused until the Q35-1 checklist passes.
 
+use tuckmill_manifest::error::{ErrorCode, Result, TuckmillError};
+
 /// `sigmoid(x) = 1 / (1 + e^-x)` (ggml's f32 sigmoid).
 pub fn sigmoid(x: f32) -> f32 {
     1.0 / (1.0 + (-x).exp())
@@ -283,23 +285,46 @@ pub fn rms_norm_weighted_in_place(x: &mut [f32], weight: &[f32], eps: f32) {
 
 /// Numerically stable softmax over one score row (subtract the max,
 /// mirroring `ggml_compute_forward_softmax_f32`).
-pub fn softmax_in_place(row: &mut [f32]) {
+///
+/// Fail-closed policy (defined before this operator becomes part of
+/// normal model execution): an empty row is a no-op; a row without a
+/// finite maximum, a non-finite exponential, or a non-positive/non-finite
+/// normalizer is refused with a typed error rather than propagating NaN
+/// or zero weights into the attention output.
+pub fn softmax_in_place(row: &mut [f32]) -> Result<()> {
+    let fail = |what: &str| {
+        TuckmillError::new(
+            ErrorCode::Internal,
+            format!("attention score row is invalid: {what}"),
+        )
+        .with_action("Refusing to produce attention weights from non-finite scores.")
+    };
     if row.is_empty() {
-        return;
+        return Ok(());
     }
     let mut max = f32::NEG_INFINITY;
     for v in row.iter() {
         max = max.max(*v);
     }
+    if !max.is_finite() {
+        return Err(fail("no finite maximum"));
+    }
     let mut sum = 0.0f32;
     for v in row.iter_mut() {
         *v = (*v - max).exp();
+        if !v.is_finite() {
+            return Err(fail("non-finite exponential"));
+        }
         sum += *v;
+    }
+    if sum <= 0.0 || !sum.is_finite() {
+        return Err(fail("non-positive normalizer"));
     }
     let inv = 1.0 / sum;
     for v in row.iter_mut() {
         *v *= inv;
     }
+    Ok(())
 }
 
 /// GQA mapping: consecutive query heads share a KV head,
@@ -323,6 +348,7 @@ pub struct GqaGeometry {
 /// are `heads_kv x seq x head_dim` and already include that token, so
 /// every position in the cache is causally visible. `scale` is the
 /// graph's query scale (`1 / sqrt(head_dim)` for the pinned model).
+/// Score rows that are not finite refuse (see [`softmax_in_place`]).
 pub fn gqa_cache_attention(
     q: &[f32],
     k_cache: &[f32],
@@ -331,7 +357,7 @@ pub fn gqa_cache_attention(
     seq: usize,
     scale: f32,
     out: &mut [f32],
-) {
+) -> Result<()> {
     let GqaGeometry {
         heads_q,
         heads_kv,
@@ -355,7 +381,7 @@ pub fn gqa_cache_attention(
             }
             scores[t] = acc * scale;
         }
-        softmax_in_place(&mut scores);
+        softmax_in_place(&mut scores)?;
         let o = &mut out[h * head_dim..(h + 1) * head_dim];
         o.fill(0.0);
         for t in 0..seq {
@@ -366,6 +392,7 @@ pub fn gqa_cache_attention(
             }
         }
     }
+    Ok(())
 }
 
 /// Qwen3.5's gated attention output: `attn[i] *= sigmoid(gate[i])`. The
@@ -706,7 +733,7 @@ mod attention_tests {
     #[test]
     fn softmax_matches_manual_computation_and_stays_finite() {
         let mut row = [1.0f32, 2.0, 3.0];
-        softmax_in_place(&mut row);
+        softmax_in_place(&mut row).unwrap();
         let e = |x: f32| x.exp();
         let sum = e(1.0) + e(2.0) + e(3.0);
         assert!((row[0] - e(1.0) / sum).abs() < 1e-7);
@@ -714,7 +741,7 @@ mod attention_tests {
         assert!((row[2] - e(3.0) / sum).abs() < 1e-7);
 
         let mut large = [1000.0f32, 1001.0];
-        softmax_in_place(&mut large);
+        softmax_in_place(&mut large).unwrap();
         assert!(large.iter().all(|v| v.is_finite()));
         assert!(
             large[1] > large[0],
@@ -742,7 +769,8 @@ mod attention_tests {
             2,
             1.0,
             &mut out,
-        );
+        )
+        .unwrap();
         let w0 = 1.0f32.exp() / (1.0f32.exp() + 1.0);
         let w1 = 1.0 - w0;
         assert!((out[0] - (w0 * 1.0 + w1 * 3.0)).abs() < 1e-6, "{}", out[0]);
@@ -773,7 +801,8 @@ mod attention_tests {
             2,
             1.0,
             &mut out,
-        );
+        )
+        .unwrap();
         // Head 0 scores [1, 0] and head 1 scores [0, 1]; with identity v
         // the outputs equal the softmax weights themselves.
         let w0 = 1.0f32.exp() / (1.0f32.exp() + 1.0);
@@ -818,5 +847,58 @@ mod attention_tests {
         let inv = 1.0 / mean_sq.sqrt();
         assert!((head[0] - 3.0 * inv).abs() < 1e-6);
         assert!((head[1] - 4.0 * inv * 2.0).abs() < 1e-6);
+    }
+}
+
+#[cfg(test)]
+mod softmax_policy_tests {
+    use super::*;
+
+    #[test]
+    fn empty_rows_are_a_noop() {
+        let mut empty: [f32; 0] = [];
+        softmax_in_place(&mut empty).unwrap();
+    }
+
+    #[test]
+    fn non_finite_rows_refuse() {
+        let cases: [&[f32]; 4] = [
+            &[f32::NAN, 1.0],
+            &[1.0, f32::NAN],
+            &[f32::INFINITY, 0.0],
+            &[f32::NEG_INFINITY, f32::NEG_INFINITY],
+        ];
+        for case in cases {
+            let mut row = case.to_vec();
+            let err = softmax_in_place(&mut row).unwrap_err();
+            assert_eq!(err.code(), ErrorCode::Internal);
+            assert!(err.message().contains("invalid"), "{}", err.message());
+        }
+    }
+
+    /// Attention must not leak NaN even if a cache row were corrupted;
+    /// the refusal happens before any output write.
+    #[test]
+    fn attention_refuses_non_finite_scores() {
+        let q = [f32::NAN, 0.0];
+        let k = [1.0f32, 0.0];
+        let v = [1.0f32, 0.0];
+        let mut out = [0.0f32; 2];
+        let err = gqa_cache_attention(
+            &q,
+            &k,
+            &v,
+            GqaGeometry {
+                heads_q: 1,
+                heads_kv: 1,
+                head_dim: 2,
+            },
+            1,
+            1.0,
+            &mut out,
+        )
+        .unwrap_err();
+        assert_eq!(err.code(), ErrorCode::Internal);
+        assert_eq!(out, [0.0, 0.0], "no output is written on refusal");
     }
 }

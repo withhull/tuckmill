@@ -139,3 +139,24 @@ never accepted by any real artifact.
   contracts are architecture-neutral where the mathematics is (norm,
   RoPE, softmax, attention, SwiGLU, residual), per the operator-first
   direction in the Q35 roadmap review.
+
+## Addendum 5 (Q35-1D state contract)
+
+- **Packed KV storage is the declared precision.** `crates/tuckcore/src/
+  qwen35_kv.rs` stores per-attention-layer K/V planes at the declared
+  element width (packed f16 default, f32 selectable) via the shared
+  round-to-nearest-even converters. A cache allocates exactly
+  `attention_layers x kv_heads x capacity x head_dim x element_bytes`
+  per side; a test proves allocation equality against
+  `Qwen35StateLayout::bytes_for` (fixture geometry, f16 and f32) and
+  against the pinned artifact's published numbers (25,165,824 B of
+  attention KV at ctx 2048 plus 20,201,472 B of recurrent/convolution
+  state = 45,367,296 B). Writing at or beyond the admitted capacity
+  refuses with a plan-typed error.
+- **Attention over packed storage agrees with the f32 path** within
+  half-precision tolerance (integration test through the cache); the
+  f16 roundtrip pins the converter precision and f32 stores exactly.
+- **Softmax is fail-closed** before it joins normal execution: empty
+  rows are a no-op; a row without a finite maximum, a non-finite
+  exponential, or a non-positive normalizer refuses with a typed error,
+  and attention writes no output on refusal.
