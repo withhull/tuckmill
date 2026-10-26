@@ -212,7 +212,7 @@ impl InferenceBackend for TuckCore {
             notes: vec![
                 "Stage 0: dense Qwen3 GGUF, scalar f32 reference kernels, bounded weight streaming (ADR-005)"
                     .to_string(),
-                "Qwen3.5 hybrid (qwen35): resident Metal path only (--kernels metal), packed f16 KV, sequential prefill (ADR-008)"
+                "Qwen3.5 hybrid (qwen35): resident Metal path only (--kernels metal), packed f16 KV, batched prefill (ADR-008)"
                     .to_string(),
                 "MoE and ternary profiles remain separately gated; routing is never substituted"
                     .to_string(),
@@ -710,7 +710,7 @@ impl InferenceBackend for TuckCore {
             let spec = SessionSpec {
                 tokenizer: &hybrid.tokenizer,
                 eos_token_id: hybrid.eos_token_id,
-                prefill_batch: 1,
+                prefill_batch: qwen35_gpu::PREFILL_BATCH,
                 per_token_delay: self.per_token_delay,
             };
             return run_session(&mut engine, &spec, req, ctl);
@@ -1180,13 +1180,28 @@ impl StepEngine<'_> {
             StepEngine::Gpu { forward, kv } => {
                 forward.prefill_chunk(kv, tokens, start, want_logits, cancelled)
             }
-            // Sequential prefill (batched prefill is gated: Q35-2D).
+            // Batched prefill (Q35-2D): one command buffer per chunk of at
+            // most PREFILL_BATCH tokens; cancellation is honored between
+            // chunks.
             StepEngine::Hybrid { model } => {
-                let mut last = None;
-                for (i, token) in tokens.iter().enumerate() {
-                    last = Some(hybrid_step(model, *token, start + i, cancelled)?);
+                if cancelled() {
+                    return Err(TuckmillError::new(
+                        ErrorCode::Cancelled,
+                        "prefill cancelled at a chunk boundary",
+                    ));
                 }
-                Ok(if want_logits { last } else { None })
+                if model.positions() != start {
+                    return Err(TuckmillError::new(
+                        ErrorCode::Internal,
+                        format!(
+                            "qwen35 prefill at position {start} but the session holds {} positions",
+                            model.positions()
+                        ),
+                    ));
+                }
+                let mut logits = Vec::new();
+                model.prefill_chunk(tokens, want_logits, &mut logits)?;
+                Ok(if want_logits { Some(logits) } else { None })
             }
         }
     }
@@ -1273,7 +1288,7 @@ impl TuckCore {
         if opts.prefill_batch.is_some() {
             return Err(TuckmillError::new(
                 ErrorCode::InvalidRequest,
-                "batched prefill for qwen35 is gated (Q35-2D); prompts prefill one token per step, so prefill_batch must not be set",
+                "qwen35 prefills in fixed chunks of 16 tokens in this build; prefill_batch must not be set",
             ));
         }
         if opts.weight_cache_bytes.is_some() || opts.block_bytes.is_some() {
@@ -1340,7 +1355,7 @@ impl TuckCore {
         }
         let tokenizer = Tokenizer::from_gguf(insp)?;
         let mut note = format!(
-            "tuckcore (experimental, uncertified): qwen35 hybrid, {} layers, vocab {}, kernels metal [oracle-f32], kv f16 packed, sequential prefill; real weights from {} ({} payload), GPU ledger {} = weights {} + state {} + scratch {}",
+            "tuckcore (experimental, uncertified): qwen35 hybrid, {} layers, vocab {}, kernels metal [oracle-f32], kv f16 packed, batched prefill x16; real weights from {} ({} payload), GPU ledger {} = weights {} + state {} + scratch {}",
             source.layout().layers.len(),
             source.config().vocab,
             artifact.path,
@@ -1431,7 +1446,7 @@ impl TuckCore {
             retained_state_bytes: Some(hybrid.alloc.state),
             trims_applied: Some(hybrid.counters.trims_applied.load(Ordering::Relaxed)),
             gpu_allocated_bytes: Some(hybrid.model.allocated_bytes()),
-            prefill_batch: Some(1),
+            prefill_batch: Some(qwen35_gpu::PREFILL_BATCH as u32),
             kernel_impl: Some(ResolvedKernels::Metal.as_str().to_string()),
             numerical_profile: Some(NumericalProfile::OracleF32.as_str().to_string()),
             ..BackendStats::default()

@@ -116,6 +116,21 @@ kernel void tm_q8_0_gemv(device const uchar *w [[buffer(0)]],
     }
 }
 
+/* dst[dst_off + i] = src[src_off + i] for i < n: a bit-exact f32 copy
+ * between buffers, encodable inside a compute dispatch group (batched
+ * prefill moves per-token slices with it). */
+kernel void tm_copy_f32(device const float *src [[buffer(0)]],
+                        device float *dst [[buffer(1)]],
+                        constant uint &src_off [[buffer(2)]],
+                        constant uint &dst_off [[buffer(3)]],
+                        constant uint &n [[buffer(4)]],
+                        uint gid [[thread_position_in_grid]]) {
+    if (gid >= n) {
+        return;
+    }
+    dst[dst_off + gid] = src[src_off + gid];
+}
+
 /* ---------------- C2: transformer operation kernels ---------------- */
 
 /* Dequantize one Q8_0 matrix row (or embedding row) to f32:
@@ -916,6 +931,12 @@ kernel void tm_qwen35_kv_store_f16(device const float *k_src [[buffer(0)]],
 /*
  * Causal GQA attention over a packed f16 cache (values decode to f32 for
  * the arithmetic, mirroring the CPU reference's packed-cache path).
+ * One threadgroup (4 SIMD groups) per head. Scores: each SIMD group takes
+ * positions sg, sg+4, ... and reduces its dot product with simd_sum (no
+ * threadgroup barrier per position). Softmax weights are normalized once
+ * per position into the scratch row, then every value dim accumulates
+ * them (Phase 1C: the per-position barrier and the per-dim recomputation
+ * of exp() dominated prefill attention).
  */
 kernel void tm_qwen35_attention_f16(device const float *q [[buffer(0)]],
                                     device const half *k_cache [[buffer(1)]],
@@ -940,17 +961,18 @@ kernel void tm_qwen35_attention_f16(device const float *q [[buffer(0)]],
     device float *head_scratch = scratch + (size_t)head * (size_t)cap;
     const uint seq = pos + 1u;
 
-    for (uint j = 0; j < seq; ++j) {
+    for (uint j = simd_group; j < seq; j += 4u) {
+        const device half *kr = kc + (size_t)j * (size_t)head_dim;
         float part = 0.0f;
-        for (uint d = tid; d < head_dim; d += 128u) {
-            part += qh[d] * (float)kc[(size_t)j * (size_t)head_dim + d];
+        for (uint d = lane; d < head_dim; d += 32u) {
+            part += qh[d] * (float)kr[d];
         }
-        const float s = tm_reduce_sum_128(part, reduce_scratch, lane, simd_group) * scale;
-        if (tid == 0u) {
+        const float s = simd_sum(part) * scale;
+        if (lane == 0u) {
             head_scratch[j] = s;
         }
     }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
+    threadgroup_barrier(mem_flags::mem_device | mem_flags::mem_threadgroup);
 
     float local_max = -INFINITY;
     for (uint j = tid; j < seq; j += 128u) {
@@ -980,13 +1002,17 @@ kernel void tm_qwen35_attention_f16(device const float *q [[buffer(0)]],
         row_stats[1] = denom;
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
+    const float norm = row_stats[1];
+    for (uint j = tid; j < seq; j += 128u) {
+        head_scratch[j] = exp(head_scratch[j] - row_max) / norm;
+    }
+    threadgroup_barrier(mem_flags::mem_device | mem_flags::mem_threadgroup);
     device float *oh = out + (size_t)head * (size_t)head_dim;
 
     for (uint d = tid; d < head_dim; d += 128u) {
         float accv = 0.0f;
         for (uint j = 0; j < seq; ++j) {
-            const float w = exp(head_scratch[j] - row_max) / denom;
-            accv += w * (float)vc[(size_t)j * (size_t)head_dim + d];
+            accv += head_scratch[j] * (float)vc[(size_t)j * (size_t)head_dim + d];
         }
         oh[d] = accv;
     }

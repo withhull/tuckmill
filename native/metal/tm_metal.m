@@ -39,6 +39,7 @@ struct tm_metal_ctx {
     id<MTLLibrary> library;
     id<MTLComputePipelineState> pso_scale;
     id<MTLComputePipelineState> pso_axpy;
+    id<MTLComputePipelineState> pso_copy;
     id<MTLComputePipelineState> pso_f16f32;
     id<MTLComputePipelineState> pso_f32f16;
     id<MTLComputePipelineState> pso_q8gemv;
@@ -309,6 +310,7 @@ tm_metal_ctx *tm_metal_create(const char *msl_source, char *err, size_t err_cap)
         /* tm_pipeline returns +1 (New-rule inside). */
         ctx->pso_scale = tm_pipeline(ctx, @"tm_scale_f32", &error);
         ctx->pso_axpy = tm_pipeline(ctx, @"tm_axpy_f32", &error);
+        ctx->pso_copy = tm_pipeline(ctx, @"tm_copy_f32", &error);
         ctx->pso_f16f32 = tm_pipeline(ctx, @"tm_cast_f16_f32", &error);
         ctx->pso_f32f16 = tm_pipeline(ctx, @"tm_cast_f32_f16", &error);
         ctx->pso_q8gemv = tm_pipeline(ctx, @"tm_q8_0_gemv", &error);
@@ -339,7 +341,8 @@ tm_metal_ctx *tm_metal_create(const char *msl_source, char *err, size_t err_cap)
         ctx->pso_q35_attn_gate = tm_pipeline(ctx, @"tm_qwen35_attn_gate", &error);
         ctx->pso_q35_silu = tm_pipeline(ctx, @"tm_qwen35_silu", &error);
         ctx->pso_q35_split_qkv = tm_pipeline(ctx, @"tm_qwen35_split_qkv", &error);
-        if (ctx->pso_scale == nil || ctx->pso_axpy == nil || ctx->pso_f16f32 == nil ||
+        if (ctx->pso_scale == nil || ctx->pso_axpy == nil || ctx->pso_copy == nil ||
+            ctx->pso_f16f32 == nil ||
             ctx->pso_f32f16 == nil || ctx->pso_q8gemv == nil || ctx->pso_f16gemv == nil ||
             ctx->pso_q8row == nil || ctx->pso_rmsnorm == nil || ctx->pso_rope == nil ||
             ctx->pso_kvstore == nil || ctx->pso_attention == nil || ctx->pso_silu == nil ||
@@ -417,6 +420,7 @@ void tm_metal_destroy(tm_metal_ctx *ctx) {
         [ctx->pso_f32f16 release];
         [ctx->pso_f16f32 release];
         [ctx->pso_axpy release];
+        [ctx->pso_copy release];
         [ctx->pso_scale release];
         [ctx->library release];
         [ctx->queue release];
@@ -710,6 +714,43 @@ int tm_metal_f32_axpy(tm_metal_ctx *ctx, tm_metal_buffer *a, tm_metal_buffer *y,
                       float alpha, uint32_t n, char *err, size_t err_cap) {
     return tm_dispatch_1d(ctx, ctx->pso_axpy, a, y, alpha, 1, n, 0, 0, err, err_cap,
                           "f32_axpy");
+}
+
+int tm_metal_copy_f32(tm_metal_ctx *ctx, tm_metal_buffer *src, uint32_t src_off,
+                      tm_metal_buffer *dst, uint32_t dst_off, uint32_t n, char *err,
+                      size_t err_cap) {
+    if (tm_check_ctx(ctx, err, err_cap, "copy_f32") != TM_METAL_OK) {
+        return TM_METAL_ERR_UNSUPPORTED;
+    }
+    if (n == 0) {
+        return tm_fail(err, err_cap, TM_METAL_ERR_BOUNDS, @"copy_f32: zero-length copy");
+    }
+    size_t src_need = ((size_t)src_off + (size_t)n) * 4u;
+    size_t dst_need = ((size_t)dst_off + (size_t)n) * 4u;
+    if (tm_check_buffer(ctx, src, src_need, err, err_cap, "copy_f32.src") != TM_METAL_OK ||
+        tm_check_buffer(ctx, dst, dst_need, err, err_cap, "copy_f32.dst") != TM_METAL_OK) {
+        return TM_METAL_ERR_BOUNDS;
+    }
+    @autoreleasepool {
+        tm_frame f;
+        id<MTLComputeCommandEncoder> enc = tm_frame_open(ctx, &f);
+        if (enc == nil) {
+            return tm_fail(err, err_cap, TM_METAL_ERR_INTERNAL, @"copy_f32: no encoder");
+        }
+        [enc setComputePipelineState:ctx->pso_copy];
+        [enc setBuffer:src->buffer offset:0 atIndex:0];
+        [enc setBuffer:dst->buffer offset:0 atIndex:1];
+        [f.keep addObject:src->buffer];
+        [f.keep addObject:dst->buffer];
+        [enc setBytes:&src_off length:sizeof(src_off) atIndex:2];
+        [enc setBytes:&dst_off length:sizeof(dst_off) atIndex:3];
+        [enc setBytes:&n length:sizeof(n) atIndex:4];
+        NSUInteger width = ctx->pso_copy.threadExecutionWidth;
+        NSUInteger tg = width > 0 ? width * 4 : 128;
+        [enc dispatchThreads:MTLSizeMake((NSUInteger)n, 1, 1)
+            threadsPerThreadgroup:MTLSizeMake(tg, 1, 1)];
+        return tm_frame_commit(ctx, &f, err, err_cap, "copy_f32");
+    }
 }
 
 int tm_metal_cast_f16_f32(tm_metal_ctx *ctx, tm_metal_buffer *x, tm_metal_buffer *y,
@@ -1120,11 +1161,29 @@ int tm_metal_f16_row_f32(tm_metal_ctx *ctx, tm_metal_buffer *w, tm_metal_buffer 
     }
 }
 
+static int tm_gemm_dispatch_rows(tm_metal_ctx *ctx, id<MTLComputePipelineState> pso,
+                                 tm_metal_buffer *w, size_t w_need, tm_metal_buffer *x,
+                                 tm_metal_buffer *y, uint32_t rows, uint32_t cols,
+                                 uint32_t batch, uint32_t x_off, uint32_t y_off,
+                                 NSUInteger rows_per_tg, NSUInteger threads, char *err,
+                                 size_t err_cap, const char *what);
+
 static int tm_gemm_dispatch(tm_metal_ctx *ctx, id<MTLComputePipelineState> pso,
                             tm_metal_buffer *w, size_t w_need, tm_metal_buffer *x,
                             tm_metal_buffer *y, uint32_t rows, uint32_t cols, uint32_t batch,
                             uint32_t x_off, uint32_t y_off, char *err, size_t err_cap,
                             const char *what) {
+    return tm_gemm_dispatch_rows(ctx, pso, w, w_need, x, y, rows, cols, batch, x_off, y_off, 1,
+                                 32, err, err_cap, what);
+}
+
+/* One threadgroup of `threads` lanes per `rows_per_tg` output rows. */
+static int tm_gemm_dispatch_rows(tm_metal_ctx *ctx, id<MTLComputePipelineState> pso,
+                                 tm_metal_buffer *w, size_t w_need, tm_metal_buffer *x,
+                                 tm_metal_buffer *y, uint32_t rows, uint32_t cols,
+                                 uint32_t batch, uint32_t x_off, uint32_t y_off,
+                                 NSUInteger rows_per_tg, NSUInteger threads, char *err,
+                                 size_t err_cap, const char *what) {
     if (tm_check_ctx(ctx, err, err_cap, what) != TM_METAL_OK) {
         return TM_METAL_ERR_UNSUPPORTED;
     }
@@ -1159,8 +1218,9 @@ static int tm_gemm_dispatch(tm_metal_ctx *ctx, id<MTLComputePipelineState> pso,
         [enc setBytes:&batch length:sizeof(batch) atIndex:5];
         [enc setBytes:&x_off length:sizeof(x_off) atIndex:6];
         [enc setBytes:&y_off length:sizeof(y_off) atIndex:7];
-        [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)rows, 1, 1)
-            threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+        NSUInteger groups = ((NSUInteger)rows + rows_per_tg - 1) / rows_per_tg;
+        [enc dispatchThreadgroups:MTLSizeMake(groups, 1, 1)
+            threadsPerThreadgroup:MTLSizeMake(threads, 1, 1)];
         return tm_frame_commit(ctx, &f, err, err_cap, what);
     }
 }

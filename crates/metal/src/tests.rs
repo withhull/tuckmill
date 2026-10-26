@@ -1502,3 +1502,84 @@ fn q8_0_gemv_shape_bandwidth_when_requested() {
     }
     eprintln!("q8_0_gemv total per token: {:.2} ms", per_token_us / 1e3);
 }
+
+#[test]
+fn copy_f32_moves_exact_slices_and_refuses_out_of_range() {
+    let Some(ctx) = metal_context() else {
+        return;
+    };
+    let src: Vec<f32> = (0..64)
+        .map(|i| (i as f32).sin() * 1e-30 + i as f32)
+        .collect();
+    let a = ctx.buffer(64 * 4, true).unwrap();
+    let b = ctx.buffer(64 * 4, true).unwrap();
+    a.upload(0, &f32_bytes(&src)).unwrap();
+    ctx.copy_f32(&a, 8, &b, 40, 16).unwrap();
+    ctx.fence().unwrap();
+    let mut out = vec![0u8; 64 * 4];
+    b.download(0, &mut out).unwrap();
+    let src_bytes = f32_bytes(&src);
+    assert_eq!(
+        &out[40 * 4..56 * 4],
+        &src_bytes[8 * 4..24 * 4],
+        "bit-exact slice"
+    );
+    assert!(
+        out[..40 * 4].iter().all(|v| *v == 0),
+        "nothing outside the slice"
+    );
+    assert!(
+        ctx.copy_f32(&a, 60, &b, 0, 8).is_err(),
+        "source overrun refused"
+    );
+    assert!(
+        ctx.copy_f32(&a, 0, &b, 60, 8).is_err(),
+        "destination overrun refused"
+    );
+    assert!(
+        ctx.copy_f32(&a, 0, &b, 0, 0).is_err(),
+        "zero length refused"
+    );
+}
+
+/// Phase 1C measurement (opt-in, `TUCKMILL_PROFILE=1`): batched Q8_0 GEMM
+/// time per shape at prefill batch sizes, against the single-token GEMV.
+#[test]
+fn q8_0_gemm_batch_timing_when_requested() {
+    if std::env::var("TUCKMILL_PROFILE").ok().as_deref() != Some("1") {
+        eprintln!("skipping: TUCKMILL_PROFILE=1 not set (measurement only)");
+        return;
+    }
+    let Some(ctx) = metal_context() else {
+        return;
+    };
+    for (rows, cols) in [(3584usize, 1024usize), (6144, 1024), (1024, 3584)] {
+        let w = boundary_weights(rows, cols, 3);
+        let wb = ctx.buffer(w.len(), true).unwrap();
+        wb.upload(0, &w).unwrap();
+        for batch in [1usize, 4, 8, 16] {
+            let x = boundary_input(cols * batch, 5);
+            let xb = ctx.buffer(cols * batch * 4, true).unwrap();
+            xb.upload(0, &f32_bytes(&x)).unwrap();
+            let yb = ctx.buffer(rows * batch * 4, true).unwrap();
+            let run = || {
+                ctx.q8_0_gemm(&wb, &xb, &yb, rows as u32, cols as u32, batch as u32, 0, 0)
+                    .unwrap()
+            };
+            run();
+            ctx.fence().unwrap();
+            let iters = 20u32;
+            let g0 = ctx.gpu_nanos_total();
+            for _ in 0..iters {
+                run();
+            }
+            ctx.fence().unwrap();
+            let us = (ctx.gpu_nanos_total() - g0) as f64 / 1e3 / iters as f64;
+            let gflops = 2.0 * (rows * cols * batch) as f64 / (us * 1e-6) / 1e9;
+            eprintln!(
+                "q8_0_gemm {rows:>5}x{cols:<5} batch {batch:>2}: {us:>8.1} us  {:>6.1} us/token  {gflops:>6.0} GFLOP/s",
+                us / batch as f64
+            );
+        }
+    }
+}

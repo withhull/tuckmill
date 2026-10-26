@@ -399,3 +399,34 @@ never accepted by any real artifact.
   (5.6 → 52.0 tok/s); `gdn_step` 153.6 → 1.25 ms. `q8_0_gemv` (15.1 ms,
   81%, ~53 GB/s effective) now dominates. That is the next target (ADR-010
   multi-row GEMV); prefill stays sequential (Q35-2D).
+
+## Addendum 15 (Q35-2D: batched prefill)
+
+- **Design.** `Qwen35GpuModel::prefill_chunk` processes up to
+  `PREFILL_BATCH` (16) prompt tokens as one command buffer:
+  - batched: the input norm, every projection (`q8_0_gemm`/`f16_gemm`),
+    the output projection, the residual add and the whole FFN;
+  - per token, on the same kernels and buffers as decode: each layer's
+    sequential core (convolution, L2 norms, gates, delta rule, gated norm;
+    or gate split, Q/K norms, RoPE, KV store, attention, gate). Slices
+    move with a new bit-exact device copy (`tm_metal_copy_f32`).
+  Decode and prefill share one `core` per layer kind, so they cannot
+  diverge. Logits are computed for the last prompt token only. The shared
+  scratch is priced in `gpu_alloc_plan`, and the ledger still equals the
+  plan.
+- **Exactness.** Batched GEMM rows use the GEMV's per-row arithmetic, so
+  batched prefill is **bit-identical** to token-by-token decode: same
+  last-token logits and same next decode step (recurrent state,
+  convolution history and KV agree). Tested on the fixture (prompts of 1,
+  3, 16 and 20 tokens) and on the pinned Q8_0 artifact (512 tokens).
+- **Attention kernel.** Scores now run one SIMD group per position with
+  `simd_sum`, instead of a threadgroup barrier per position. Softmax
+  weights are normalized once per position, not recomputed per value dim.
+  Registered tolerances unchanged.
+- **Effect (pinned 0.8B, M3 8 GB, in-process).** 512-token prefill 7.3–7.9
+  s sequential → 2.60–2.86 s batched. Prefill is now limited by the
+  batched GEMM (~50%; 220–350 GFLOP/s, ~10% of the GPU's arithmetic peak)
+  and by attention (~15%).
+- **Tried and removed:** a multi-row variant of the batched GEMM
+  (bit-identical, no measurable gain). The GEMM is compute-bound, not
+  bound by activation loads; the next step is a `simdgroup_matrix` kernel.

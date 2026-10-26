@@ -475,6 +475,16 @@ mod imp {
         pub fn tm_metal_committed_dispatches(ctx: *const TmMetalCtx) -> u64;
         pub fn tm_metal_completed_dispatches(ctx: *const TmMetalCtx) -> u64;
         pub fn tm_metal_last_gpu_ms(ctx: *const TmMetalCtx) -> f64;
+        pub fn tm_metal_copy_f32(
+            ctx: *mut TmMetalCtx,
+            src: *mut TmMetalBuffer,
+            src_off: u32,
+            dst: *mut TmMetalBuffer,
+            dst_off: u32,
+            n: u32,
+            err: *mut c_char,
+            err_cap: usize,
+        ) -> c_int;
         pub fn tm_metal_gpu_nanos_total(ctx: *const TmMetalCtx) -> u64;
         pub fn tm_metal_profile_set(ctx: *mut TmMetalCtx, enabled: c_int) -> c_int;
         pub fn tm_metal_profile_read(
@@ -839,6 +849,29 @@ impl MetalContext {
     }
 
     /// y = y + alpha * a over `n` elements.
+    /// `dst[dst_off + i] = src[src_off + i]` for `i < n` f32 elements
+    /// (bit-exact; encodable inside a dispatch group).
+    pub fn copy_f32(
+        &self,
+        src: &MetalBuffer,
+        src_off: u32,
+        dst: &MetalBuffer,
+        dst_off: u32,
+        n: u32,
+    ) -> Result<()> {
+        self.check_pair(src, dst)?;
+        let sc = src.raw;
+        let dc = dst.raw;
+        self.operate("copy_f32", move |ctx| {
+            let mut err = [0 as c_char; ERR_CAP];
+            // SAFETY: raw handles were validated against this context.
+            let code = unsafe {
+                imp::tm_metal_copy_f32(ctx, sc, src_off, dc, dst_off, n, err.as_mut_ptr(), ERR_CAP)
+            };
+            (code, err)
+        })
+    }
+
     pub fn f32_axpy(&self, a: &MetalBuffer, y: &MetalBuffer, alpha: f32, n: u32) -> Result<()> {
         self.check_pair(a, y)?;
         let ac = a.raw;

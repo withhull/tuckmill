@@ -89,6 +89,13 @@ int tm_metal_f32_scale(tm_metal_ctx *ctx, tm_metal_buffer *x, tm_metal_buffer *y
                        float factor, uint32_t n, char *err, size_t err_cap);
 
 /* y[i] = y[i] + alpha * a[i], i < n. */
+/* dst[dst_off + i] = src[src_off + i] for i < n (f32 elements, bit-exact),
+ * encodable inside a dispatch group. Offsets and n are checked against
+ * both buffers. */
+int tm_metal_copy_f32(tm_metal_ctx *ctx, tm_metal_buffer *src, uint32_t src_off,
+                      tm_metal_buffer *dst, uint32_t dst_off, uint32_t n, char *err,
+                      size_t err_cap);
+
 int tm_metal_f32_axpy(tm_metal_ctx *ctx, tm_metal_buffer *a, tm_metal_buffer *y,
                       float alpha, uint32_t n, char *err, size_t err_cap);
 

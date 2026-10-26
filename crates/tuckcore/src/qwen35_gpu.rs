@@ -1263,6 +1263,22 @@ impl DeviceTensor {
         }
     }
 
+    /// Device `Y[b] = W X[b]` for `b < batch` rows of `[batch, in_dim]`
+    /// input. Per-row arithmetic equals [`Self::gemv`] exactly (the batched
+    /// kernels share the single-token kernels' per-row order).
+    fn gemm(&self, gpu: &Qwen35Gpu, x: &MetalBuffer, y: &MetalBuffer, batch: u32) -> Result<()> {
+        let ctx = gpu.context();
+        let (rows, cols) = (self.out_dim as u32, self.in_dim as u32);
+        match self.type_id {
+            1 => ctx.f16_gemm(&self.buf, x, y, rows, cols, batch, 0, 0),
+            8 => ctx.q8_0_gemm(&self.buf, x, y, rows, cols, batch, 0, 0),
+            other => Err(TuckmillError::new(
+                ErrorCode::UnsupportedQuantization,
+                format!("no device projection for stored type {other}"),
+            )),
+        }
+    }
+
     /// Dequantize one matrix row on the device (embedding lookups).
     fn row_into(&self, gpu: &Qwen35Gpu, row: u32, out: &MetalBuffer, out_off: u32) -> Result<()> {
         let ctx = gpu.context();
@@ -1285,6 +1301,81 @@ fn vec_buf(gpu: &Qwen35Gpu, values: &[f32]) -> Result<MetalBuffer> {
 
 fn zero_buf(gpu: &Qwen35Gpu, elems: usize) -> Result<MetalBuffer> {
     gpu.buffer(elems.max(1) * 4)
+}
+
+/// Prompt tokens processed per batched prefill chunk (one command buffer
+/// per chunk; the batched GEMM kernels accept up to 32).
+pub const PREFILL_BATCH: usize = 16;
+
+/// Per-token widths of the shared batched-prefill activations.
+#[derive(Debug, Clone, Copy)]
+struct PrefillWidths {
+    hidden: usize,
+    a: usize,
+    b: usize,
+    c: usize,
+    d: usize,
+    e: usize,
+    ffn: usize,
+}
+
+impl PrefillWidths {
+    fn of(geom: &LayerGeometry) -> Self {
+        let v = geom.head_v * geom.dt_rank;
+        let kv = geom.kv_heads * geom.head_dim;
+        Self {
+            hidden: geom.hidden,
+            a: geom.channels.max(geom.heads * geom.head_dim * 2),
+            b: v.max(kv),
+            c: geom.dt_rank.max(kv),
+            d: geom.dt_rank,
+            e: v.max(geom.heads * geom.head_dim),
+            ffn: geom.ffn,
+        }
+    }
+
+    /// f32 elements per chunk row across every scratch buffer.
+    fn elems_per_token(&self) -> usize {
+        5 * self.hidden + self.a + self.b + self.c + self.d + self.e + 2 * self.ffn
+    }
+}
+
+/// Batched-prefill activations shared by all layers: `[PREFILL_BATCH,
+/// width]` row-major f32. Layers run in order, so one set suffices.
+struct PrefillScratch {
+    x: MetalBuffer,
+    h: MetalBuffer,
+    h2: MetalBuffer,
+    a: MetalBuffer,
+    b: MetalBuffer,
+    c: MetalBuffer,
+    d: MetalBuffer,
+    e: MetalBuffer,
+    proj: MetalBuffer,
+    d2: MetalBuffer,
+    g: MetalBuffer,
+    u: MetalBuffer,
+}
+
+impl PrefillScratch {
+    fn load(gpu: &Qwen35Gpu, geom: &LayerGeometry) -> Result<Self> {
+        let w = PrefillWidths::of(geom);
+        let n = PREFILL_BATCH;
+        Ok(Self {
+            x: zero_buf(gpu, n * w.hidden)?,
+            h: zero_buf(gpu, n * w.hidden)?,
+            h2: zero_buf(gpu, n * w.hidden)?,
+            a: zero_buf(gpu, n * w.a)?,
+            b: zero_buf(gpu, n * w.b)?,
+            c: zero_buf(gpu, n * w.c)?,
+            d: zero_buf(gpu, n * w.d)?,
+            e: zero_buf(gpu, n * w.e)?,
+            proj: zero_buf(gpu, n * w.hidden)?,
+            d2: zero_buf(gpu, n * w.hidden)?,
+            g: zero_buf(gpu, n * w.ffn)?,
+            u: zero_buf(gpu, n * w.ffn)?,
+        })
+    }
 }
 
 /// Norms, FFN and residual stage shared by both layer kinds.
@@ -1340,6 +1431,26 @@ impl LayerCommon {
         ctx.silu_mul(&self.ffn_g, &self.ffn_u, &self.ffn_g, self.geom.ffn as u32)?;
         self.ffn_down.gemv(gpu, &self.ffn_g, &self.ffn_d)?;
         ctx.f32_axpy(&self.ffn_d, x, 1.0, self.geom.hidden as u32)
+    }
+
+    /// [`Self::ffn_residual`] over `n` chunk rows of `s.x`, with the same
+    /// per-row arithmetic.
+    fn ffn_residual_batch(&self, gpu: &Qwen35Gpu, s: &PrefillScratch, n: usize) -> Result<()> {
+        let ctx = gpu.context();
+        let (hidden, ffn, nn) = (self.geom.hidden, self.geom.ffn, n as u32);
+        ctx.rmsnorm(
+            &s.x,
+            &self.post_norm,
+            &s.h2,
+            nn,
+            hidden as u32,
+            self.geom.eps,
+        )?;
+        self.ffn_gate.gemm(gpu, &s.h2, &s.g, nn)?;
+        self.ffn_up.gemm(gpu, &s.h2, &s.u, nn)?;
+        ctx.silu_mul(&s.g, &s.u, &s.g, (n * ffn) as u32)?;
+        self.ffn_down.gemm(gpu, &s.g, &s.d2, nn)?;
+        ctx.f32_axpy(&s.d2, &s.x, 1.0, (n * hidden) as u32)
     }
 }
 
@@ -1490,6 +1601,23 @@ impl LayerGpu {
         match self {
             LayerGpu::Gdn(l) => l.forward(gpu, x),
             LayerGpu::Attention(l) => l.forward(gpu, x, pos),
+        }
+    }
+
+    /// `n` consecutive prompt tokens for this layer, in place on the chunk
+    /// rows of `s.x`, starting at position `pos0`. Projections and the FFN
+    /// run batched; the sequential core runs per token on the same kernels
+    /// and buffers as decode.
+    fn forward_batch(
+        &self,
+        gpu: &Qwen35Gpu,
+        s: &PrefillScratch,
+        n: usize,
+        pos0: u32,
+    ) -> Result<()> {
+        match self {
+            LayerGpu::Gdn(l) => l.forward_batch(gpu, s, n),
+            LayerGpu::Attention(l) => l.forward_batch(gpu, s, n, pos0),
         }
     }
 
@@ -1648,6 +1776,9 @@ pub fn gpu_alloc_plan(src: &dyn TensorSource, capacity: usize) -> Result<GpuAllo
     weights = weights.saturating_add(src.tensor_bytes(layout.token_embd.index)?);
     weights = weights.saturating_add(src.tensor_bytes(layout.output_norm.index)?);
     scratch = scratch.saturating_add(4 * (2 * geom.hidden + geom_vocab(src)) as u64);
+    // Shared batched-prefill activations (PrefillScratch).
+    scratch = scratch
+        .saturating_add(4 * (PREFILL_BATCH * PrefillWidths::of(&geom).elems_per_token()) as u64);
     Ok(GpuAllocPlan {
         weights,
         state,
@@ -1673,6 +1804,7 @@ pub struct Qwen35GpuModel {
     x: MetalBuffer,
     h: MetalBuffer,
     logits_buf: MetalBuffer,
+    prefill: PrefillScratch,
     hidden: usize,
     vocab: usize,
     eps: f32,
@@ -1721,9 +1853,11 @@ impl Qwen35GpuModel {
         let x = zero_buf(&gpu, hidden)?;
         let h = zero_buf(&gpu, hidden)?;
         let logits_buf = zero_buf(&gpu, vocab)?;
+        let prefill = PrefillScratch::load(&gpu, &LayerGeometry::from_source(src))?;
         Ok(Self {
             gpu,
             layers,
+            prefill,
             output_norm,
             tied,
             x,
@@ -1793,6 +1927,91 @@ impl Qwen35GpuModel {
             self.session_valid.set(false);
         }
         result
+    }
+
+    /// Batched prefill of up to [`PREFILL_BATCH`] consecutive prompt
+    /// tokens as one command buffer: projections and FFNs run as batched
+    /// GEMMs over the chunk, and the sequential cores run per token on the
+    /// decode kernels. Logits (for the last token) are computed and
+    /// downloaded only when `want_logits`. Results equal feeding the same
+    /// tokens one by one through [`Self::forward_token`].
+    pub fn prefill_chunk(
+        &self,
+        tokens: &[u32],
+        want_logits: bool,
+        logits: &mut Vec<f32>,
+    ) -> Result<()> {
+        self.ensure_valid()?;
+        let result = (|| {
+            let n = tokens.len();
+            if n == 0 || n > PREFILL_BATCH {
+                return Err(TuckmillError::new(
+                    ErrorCode::InvalidRequest,
+                    format!("prefill chunk of {n} tokens is outside 1..={PREFILL_BATCH}"),
+                ));
+            }
+            if let Some(bad) = tokens.iter().find(|t| **t as usize >= self.vocab) {
+                return Err(TuckmillError::new(
+                    ErrorCode::InvalidRequest,
+                    format!(
+                        "token id {bad} is outside the {}-entry vocabulary",
+                        self.vocab
+                    ),
+                ));
+            }
+            let pos = self.positions.get();
+            if pos + n > self.capacity {
+                return Err(TuckmillError::new(
+                    ErrorCode::InvalidPlan,
+                    format!(
+                        "tokens {pos}..{} exceed the admitted {}-position context",
+                        pos + n,
+                        self.capacity
+                    ),
+                ));
+            }
+            let s = &self.prefill;
+            let hidden = self.hidden;
+            let encode = || -> Result<()> {
+                for (i, token) in tokens.iter().enumerate() {
+                    self.tied
+                        .row_into(&self.gpu, *token, &s.x, (i * hidden) as u32)?;
+                }
+                for layer in &self.layers {
+                    layer.forward_batch(&self.gpu, s, n, pos as u32)?;
+                }
+                if want_logits {
+                    let ctx = self.gpu.context();
+                    ctx.copy_f32(&s.x, ((n - 1) * hidden) as u32, &self.x, 0, hidden as u32)?;
+                    ctx.rmsnorm(
+                        &self.x,
+                        &self.output_norm,
+                        &self.h,
+                        1,
+                        hidden as u32,
+                        self.eps,
+                    )?;
+                    self.tied.gemv(&self.gpu, &self.h, &self.logits_buf)?;
+                }
+                Ok(())
+            };
+            if self.grouped.get() {
+                self.gpu.grouped(encode)?;
+            } else {
+                encode()?;
+            }
+            if want_logits {
+                logits.resize(self.vocab, 0.0);
+                let mut bytes = vec![0u8; self.vocab * 4];
+                self.logits_buf.download(0, &mut bytes)?;
+                logits.copy_from_slice(&bytes_f32(&bytes));
+            }
+            // Without logits nothing waits: the queue orders the next
+            // chunk after this one.
+            self.positions.set(pos + n);
+            Ok(())
+        })();
+        self.finish(result)
     }
 
     /// Encode each decode step as one command buffer (`true`, default) or
@@ -1898,6 +2117,54 @@ impl GdnLayerGpu {
             geom.eps,
         )?;
         self.qkv.gemv(gpu, &self.common.h, &self.qkv_out)?;
+        self.z.gemv(gpu, &self.common.h, &self.z_out)?;
+        self.alpha.gemv(gpu, &self.common.h, &self.alpha_out)?;
+        self.beta.gemv(gpu, &self.common.h, &self.beta_raw)?;
+        self.core(gpu)?;
+        self.out_proj.gemv(gpu, &self.gated, &self.common.proj)?;
+        ctx.f32_axpy(&self.common.proj, x, 1.0, geom.hidden as u32)?;
+        self.common.ffn_residual(gpu, x)
+    }
+
+    fn forward_batch(&self, gpu: &Qwen35Gpu, s: &PrefillScratch, n: usize) -> Result<()> {
+        let ctx = gpu.context();
+        let geom = self.common.geom;
+        let nn = n as u32;
+        ctx.rmsnorm(
+            &s.x,
+            &self.common.attn_norm,
+            &s.h,
+            nn,
+            geom.hidden as u32,
+            geom.eps,
+        )?;
+        self.qkv.gemm(gpu, &s.h, &s.a, nn)?;
+        self.z.gemm(gpu, &s.h, &s.b, nn)?;
+        self.alpha.gemm(gpu, &s.h, &s.c, nn)?;
+        self.beta.gemm(gpu, &s.h, &s.d, nn)?;
+        let ch = geom.channels;
+        let vz = geom.head_v * geom.dt_rank;
+        let dr = geom.dt_rank;
+        for i in 0..n {
+            ctx.copy_f32(&s.a, (i * ch) as u32, &self.qkv_out, 0, ch as u32)?;
+            ctx.copy_f32(&s.b, (i * vz) as u32, &self.z_out, 0, vz as u32)?;
+            ctx.copy_f32(&s.c, (i * dr) as u32, &self.alpha_out, 0, dr as u32)?;
+            ctx.copy_f32(&s.d, (i * dr) as u32, &self.beta_raw, 0, dr as u32)?;
+            self.core(gpu)?;
+            ctx.copy_f32(&self.gated, 0, &s.e, (i * vz) as u32, vz as u32)?;
+        }
+        self.out_proj.gemm(gpu, &s.e, &s.proj, nn)?;
+        ctx.f32_axpy(&s.proj, &s.x, 1.0, (n * geom.hidden) as u32)?;
+        self.common.ffn_residual_batch(gpu, s, n)
+    }
+
+    /// The sequential per-token core, from the projected `qkv_out`,
+    /// `z_out`, `alpha_out` and `beta_raw` to `gated` (convolution,
+    /// L2 norms, gates, delta rule, gated norm). Decode and batched
+    /// prefill both run exactly this.
+    fn core(&self, gpu: &Qwen35Gpu) -> Result<()> {
+        let ctx = gpu.context();
+        let geom = self.common.geom;
         gpu.conv_step_dev(
             &self.hist,
             &self.qkv_out,
@@ -1928,9 +2195,6 @@ impl GdnLayerGpu {
             geom.state_size as u32,
             geom.eps,
         )?;
-        self.z.gemv(gpu, &self.common.h, &self.z_out)?;
-        self.alpha.gemv(gpu, &self.common.h, &self.alpha_out)?;
-        self.beta.gemv(gpu, &self.common.h, &self.beta_raw)?;
         gpu.beta_decay_dev(
             &self.beta_raw,
             &self.alpha_out,
@@ -1961,10 +2225,7 @@ impl GdnLayerGpu {
             geom.dt_rank as u32,
             geom.head_v as u32,
             geom.eps,
-        )?;
-        self.out_proj.gemv(gpu, &self.gated, &self.common.proj)?;
-        ctx.f32_axpy(&self.common.proj, x, 1.0, geom.hidden as u32)?;
-        self.common.ffn_residual(gpu, x)
+        )
     }
 }
 
@@ -1981,6 +2242,57 @@ impl AttentionLayerGpu {
             geom.eps,
         )?;
         self.q_w.gemv(gpu, &self.common.h, &self.qg)?;
+        self.k_w.gemv(gpu, &self.common.h, &self.k)?;
+        self.v_w.gemv(gpu, &self.common.h, &self.v)?;
+        self.core(gpu, pos)?;
+        self.o_w.gemv(gpu, &self.attn, &self.common.proj)?;
+        ctx.f32_axpy(&self.common.proj, x, 1.0, geom.hidden as u32)?;
+        self.common.ffn_residual(gpu, x)
+    }
+
+    fn forward_batch(
+        &self,
+        gpu: &Qwen35Gpu,
+        s: &PrefillScratch,
+        n: usize,
+        pos0: u32,
+    ) -> Result<()> {
+        let ctx = gpu.context();
+        let geom = self.common.geom;
+        let nn = n as u32;
+        ctx.rmsnorm(
+            &s.x,
+            &self.common.attn_norm,
+            &s.h,
+            nn,
+            geom.hidden as u32,
+            geom.eps,
+        )?;
+        self.q_w.gemm(gpu, &s.h, &s.a, nn)?;
+        self.k_w.gemm(gpu, &s.h, &s.b, nn)?;
+        self.v_w.gemm(gpu, &s.h, &s.c, nn)?;
+        let qgw = geom.heads * geom.head_dim * 2;
+        let kvw = geom.kv_heads * geom.head_dim;
+        let aw = geom.heads * geom.head_dim;
+        for i in 0..n {
+            ctx.copy_f32(&s.a, (i * qgw) as u32, &self.qg, 0, qgw as u32)?;
+            ctx.copy_f32(&s.b, (i * kvw) as u32, &self.k, 0, kvw as u32)?;
+            ctx.copy_f32(&s.c, (i * kvw) as u32, &self.v, 0, kvw as u32)?;
+            self.core(gpu, pos0 + i as u32)?;
+            ctx.copy_f32(&self.attn, 0, &s.e, (i * aw) as u32, aw as u32)?;
+        }
+        self.o_w.gemm(gpu, &s.e, &s.proj, nn)?;
+        ctx.f32_axpy(&s.proj, &s.x, 1.0, (n * geom.hidden) as u32)?;
+        self.common.ffn_residual_batch(gpu, s, n)
+    }
+
+    /// The sequential per-token core, from the projected `qg`, `k`, `v`
+    /// to `attn` (gate split, Q/K norms, partial RoPE, packed f16 KV
+    /// store, causal attention, sigmoid gate). Decode and batched prefill
+    /// both run exactly this.
+    fn core(&self, gpu: &Qwen35Gpu, pos: u32) -> Result<()> {
+        let ctx = gpu.context();
+        let geom = self.common.geom;
         gpu.q_gate_split_dev(
             &self.qg,
             &self.q,
@@ -1988,8 +2300,6 @@ impl AttentionLayerGpu {
             geom.heads as u32,
             geom.head_dim as u32,
         )?;
-        self.k_w.gemv(gpu, &self.common.h, &self.k)?;
-        self.v_w.gemv(gpu, &self.common.h, &self.v)?;
         ctx.rmsnorm(
             &self.q,
             &self.q_norm,
@@ -2039,10 +2349,7 @@ impl AttentionLayerGpu {
             (geom.heads / geom.kv_heads) as u32,
             1.0 / (geom.head_dim as f32).sqrt(),
         )?;
-        gpu.attn_gate_dev(&self.attn, &self.gate, (geom.heads * geom.head_dim) as u32)?;
-        self.o_w.gemv(gpu, &self.attn, &self.common.proj)?;
-        ctx.f32_axpy(&self.common.proj, x, 1.0, geom.hidden as u32)?;
-        self.common.ffn_residual(gpu, x)
+        gpu.attn_gate_dev(&self.attn, &self.gate, (geom.heads * geom.head_dim) as u32)
     }
 }
 
@@ -2160,6 +2467,163 @@ mod layer_tests {
         );
         assert!(worst_hidden <= HIDDEN_TOL, "registered hidden tolerance");
         assert!(worst_logits <= LOGITS_TOL, "registered logits tolerance");
+    }
+
+    /// Batched prefill is bit-identical to token-by-token decode: same
+    /// logits for the last prompt token and the same next decode step
+    /// (so recurrent state, convolution history and KV agree), for single,
+    /// partial, full and multi-chunk prompts.
+    #[test]
+    fn batched_prefill_is_bit_identical_to_sequential_decode() {
+        if gpu_or_skip().is_none() {
+            return;
+        }
+        let bytes = synthetic_qwen3_bytes(&SyntheticConfig::tiny_qwen35());
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("q35.gguf");
+        std::fs::write(&path, &bytes).unwrap();
+        let cpu = Qwen35Model::open(&path, 64, KvPrecision::F16).unwrap();
+        let capacity = 48usize;
+        let plan = gpu_alloc_plan(&cpu, capacity).unwrap();
+        let model =
+            Qwen35GpuModel::load(Qwen35Gpu::open().unwrap(), &cpu, capacity, plan.total()).unwrap();
+        assert_eq!(
+            model.allocated_bytes(),
+            plan.total(),
+            "ledger == plan incl. prefill scratch"
+        );
+
+        for len in [1usize, 3, PREFILL_BATCH, PREFILL_BATCH + 4] {
+            let prompt: Vec<u32> = (0..len as u32).map(|i| (i * 37 + 5) % 500).collect();
+            let next = 77u32;
+
+            model.reset().unwrap();
+            let mut seq = Vec::new();
+            for t in &prompt {
+                model.forward_token(*t, &mut seq).unwrap();
+            }
+            let mut seq_next = Vec::new();
+            model.forward_token(next, &mut seq_next).unwrap();
+
+            model.reset().unwrap();
+            let mut batched = Vec::new();
+            let chunks: Vec<&[u32]> = prompt.chunks(PREFILL_BATCH).collect();
+            for (c, chunk) in chunks.iter().enumerate() {
+                model
+                    .prefill_chunk(chunk, c + 1 == chunks.len(), &mut batched)
+                    .unwrap();
+            }
+            assert_eq!(model.positions(), len);
+            let mut batched_next = Vec::new();
+            model.forward_token(next, &mut batched_next).unwrap();
+
+            let bits = |v: &[f32]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+            assert_eq!(
+                bits(&batched),
+                bits(&seq),
+                "prompt {len}: last-token logits"
+            );
+            assert_eq!(
+                bits(&batched_next),
+                bits(&seq_next),
+                "prompt {len}: next decode step"
+            );
+        }
+
+        // Out-of-range chunks are refused and leave the session usable
+        // after reset.
+        model.reset().unwrap();
+        let mut l = Vec::new();
+        assert!(model.prefill_chunk(&[], true, &mut l).is_err());
+        let too_many = vec![1u32; PREFILL_BATCH + 1];
+        assert!(model.prefill_chunk(&too_many, true, &mut l).is_err());
+    }
+
+    /// Machine-local (TUCKMILL_QWEN35_GGUF): on the pinned Q8_0 artifact,
+    /// batched prefill gives bit-identical last-token logits and next
+    /// decode step to sequential decode; prints 512-token prefill time for
+    /// both (measurement, not asserted).
+    #[test]
+    fn real_artifact_batched_prefill_matches_sequential_when_available() {
+        let Some(path) = std::env::var("TUCKMILL_QWEN35_GGUF")
+            .ok()
+            .map(std::path::PathBuf::from)
+            .filter(|p| p.exists())
+        else {
+            eprintln!("skipping: TUCKMILL_QWEN35_GGUF not set");
+            return;
+        };
+        if gpu_or_skip().is_none() {
+            return;
+        }
+        let source = crate::qwen35_forward::ArtifactTensorSource::open(&path).unwrap();
+        let capacity = 640usize;
+        let plan = gpu_alloc_plan(&source, capacity).unwrap();
+        let model =
+            Qwen35GpuModel::load(Qwen35Gpu::open().unwrap(), &source, capacity, plan.total())
+                .unwrap();
+        assert_eq!(model.allocated_bytes(), plan.total());
+        let prompt: Vec<u32> = (0..512u32).map(|i| 1000 + (i * 7919) % 90_000).collect();
+        let bits = |v: &[f32]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+
+        model.reset().unwrap();
+        let t0 = std::time::Instant::now();
+        let mut seq = Vec::new();
+        for t in &prompt {
+            model.forward_token(*t, &mut seq).unwrap();
+        }
+        let seq_ms = t0.elapsed().as_secs_f64() * 1e3;
+        let mut seq_next = Vec::new();
+        model.forward_token(9707, &mut seq_next).unwrap();
+
+        model.reset().unwrap();
+        let t1 = std::time::Instant::now();
+        let mut batched = Vec::new();
+        let chunks: Vec<&[u32]> = prompt.chunks(PREFILL_BATCH).collect();
+        for (c, chunk) in chunks.iter().enumerate() {
+            model
+                .prefill_chunk(chunk, c + 1 == chunks.len(), &mut batched)
+                .unwrap();
+        }
+        let batched_ms = t1.elapsed().as_secs_f64() * 1e3;
+        let mut batched_next = Vec::new();
+        model.forward_token(9707, &mut batched_next).unwrap();
+
+        eprintln!(
+            "512-token prefill: sequential {seq_ms:.0} ms ({:.0} tok/s), batched x{PREFILL_BATCH} {batched_ms:.0} ms ({:.0} tok/s)",
+            512e3 / seq_ms,
+            512e3 / batched_ms
+        );
+        assert_eq!(bits(&batched), bits(&seq), "last-token logits");
+        assert_eq!(bits(&batched_next), bits(&seq_next), "next decode step");
+
+        if std::env::var("TUCKMILL_PROFILE").ok().as_deref() == Some("1") {
+            let ctx = model.context();
+            model.reset().unwrap();
+            model.set_grouped(false);
+            ctx.set_profiling(true);
+            let mut l = Vec::new();
+            for (c, chunk) in chunks.iter().enumerate() {
+                model
+                    .prefill_chunk(chunk, c + 1 == chunks.len(), &mut l)
+                    .unwrap();
+            }
+            ctx.fence().unwrap();
+            let mut table = ctx.profile_snapshot();
+            ctx.set_profiling(false);
+            model.set_grouped(true);
+            table.sort_by_key(|row| std::cmp::Reverse(row.1));
+            let total: u64 = table.iter().map(|r| r.1).sum();
+            eprintln!("ungrouped prefill GPU time per operator (512 tokens):");
+            for (label, nanos, count) in table.iter().take(14) {
+                eprintln!(
+                    "  {label:<28} {:>8.1} ms  {:>5.1}%  {:>6} buffers",
+                    *nanos as f64 / 1e6,
+                    100.0 * *nanos as f64 / total.max(1) as f64,
+                    count
+                );
+            }
+        }
     }
 
     /// Phase 1B measurement (machine-local, opt-in): per-token wall time,
