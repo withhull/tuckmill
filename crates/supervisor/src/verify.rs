@@ -1060,7 +1060,16 @@ impl Runtime {
 
         let side = RunSide {
             label: label.to_string(),
-            cache_bytes: cache_bytes.unwrap_or(0),
+            // The cache actually applied: the Metal path keeps weights
+            // resident and receives no cache geometry.
+            cache_bytes: if matches!(
+                side.kernels,
+                Some(tuckmill_tuckcore::KernelSelection::Metal)
+            ) {
+                0
+            } else {
+                cache_bytes.unwrap_or(0)
+            },
             kv_precision: stats
                 .kv_precision
                 .clone()

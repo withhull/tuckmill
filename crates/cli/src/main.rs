@@ -145,11 +145,6 @@ enum Cmd {
         /// bounded buffers).
         #[arg(long)]
         storage: Option<String>,
-        /// Metal prefill micro-batch for tuckcore (1..=32; default 8). The
-        /// effective size is the largest candidate whose exact workspace
-        /// geometry fits the admitted plan.
-        #[arg(long)]
-        prefill_batch: Option<u32>,
     },
 
     /// Serve the local API on loopback.
@@ -177,9 +172,6 @@ enum Cmd {
         /// bounded buffers).
         #[arg(long)]
         storage: Option<String>,
-        /// Metal prefill micro-batch for tuckcore (1..=32; default 8).
-        #[arg(long)]
-        prefill_batch: Option<u32>,
     },
 
     /// Verify equivalence: identical token IDs through resident and
@@ -230,9 +222,6 @@ enum Cmd {
         /// Weight-block storage to exercise: auto (default), mapped, owned.
         #[arg(long)]
         storage: Option<String>,
-        /// Metal prefill micro-batch for tuckcore (1..=32; default 8).
-        #[arg(long)]
-        prefill_batch: Option<u32>,
     },
 
     /// Run the standard benchmark suite and write a machine-readable record.
@@ -271,11 +260,6 @@ enum Cmd {
         /// bounded buffers).
         #[arg(long)]
         storage: Option<String>,
-        /// Metal prefill micro-batch for tuckcore (1..=32; default 8). The
-        /// effective size is the largest candidate whose exact workspace
-        /// geometry fits the admitted plan.
-        #[arg(long)]
-        prefill_batch: Option<u32>,
     },
 
     /// Show backend statistics and profile counters after a short probe run.

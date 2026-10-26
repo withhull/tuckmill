@@ -2225,7 +2225,8 @@ mod tests {
         })
         .unwrap();
 
-        // Fixture geometry: exact preflight for the batch candidates.
+        // Fixture geometry: the engine's exact preflight (ADR-011): f32 KV
+        // (the dense default), fixed prefill chunk, priced before loading.
         let payload =
             layout.artifact_payload_path(&runtime.resolve_artifact("local").unwrap().0.artifact_id);
         let insp =
@@ -2233,13 +2234,24 @@ mod tests {
                 .unwrap();
         let reg = tuckmill_manifest::adapter::AdapterRegistry::builtin().unwrap();
         let (cfg, _) = tuckmill_tuckcore::model::resolve(&insp, &reg).unwrap();
-        let required = |batch: u32| {
-            tuckmill_tuckcore::gpu::MetalForward::required_bytes(&insp, &cfg, 512, batch).unwrap()
-        };
-        let (weights_req, ws1) = required(1);
-        let (_, ws8) = required(8);
-        assert!(ws8 > ws1);
+        let mut names = tuckmill_tuckcore::model::TensorNames::for_layers(cfg.layers);
+        names.resolve(&insp).unwrap();
+        let graph = tuckmill_tuckcore::engine::adapters::qwen3(&cfg, &names, &insp).unwrap();
+        let file = std::fs::File::open(&payload).unwrap();
+        let weights =
+            tuckmill_tuckcore::engine::GgufWeights::with_inspection(&file, &insp).unwrap();
+        let engine_plan = tuckmill_tuckcore::engine::metal::alloc_plan_with(
+            &graph,
+            &weights,
+            512,
+            tuckmill_tuckcore::engine::metal::KvCache::F32,
+        )
+        .unwrap();
         let kv_req = tuckmill_tuckcore::forward::KvState::bytes_for(&cfg, 512);
+        assert_eq!(
+            engine_plan.state, kv_req,
+            "f32 KV planes == the dense KV bound"
+        );
 
         let device = runtime.device.device_id.clone();
         let plan_with = |ws_reservation: u64| {
@@ -2248,7 +2260,7 @@ mod tests {
                 512,
                 32,
                 "2GiB",
-                weights_req + (1 << 20),
+                engine_plan.weights + (1 << 20),
                 0,
                 1 << 20,
             );
@@ -2264,63 +2276,51 @@ mod tests {
             p.plan_id = p.compute_id().unwrap();
             p
         };
+        let run_with = |plan: ExecutionPlan, output: u64| {
+            runtime.plan_admitted(&plan).unwrap();
+            runtime.admit_engine(&plan).unwrap();
+            let ticket = runtime.submit().unwrap();
+            let run = runtime
+                .start_run(
+                    &ticket,
+                    plan,
+                    artifact_ref_for(&runtime),
+                    RunRequest::greedy(vec![1, 2, 3, 4], output),
+                )
+                .unwrap();
+            collect_run(&run, |_, _| {})
+        };
 
-        // Initial load: generous workspaces allowance -> batch 8 prepared.
-        let plan_a = plan_with(64 * 1024 * 1024);
-        runtime.plan_admitted(&plan_a).unwrap();
-        runtime.admit_engine(&plan_a).unwrap();
-        let ticket = runtime.submit().unwrap();
-        let run = runtime
-            .start_run(
-                &ticket,
-                plan_a,
-                artifact_ref_for(&runtime),
-                RunRequest::greedy(vec![1, 2, 3, 4], 16),
-            )
-            .unwrap();
-        let (reason, committed) = collect_run(&run, |_, _| {});
+        // Initial load under a generous workspaces allowance: the retained
+        // workspace is the engine's exact scratch preflight.
+        let (reason, committed) = run_with(plan_with(64 * 1024 * 1024), 16);
         assert_eq!(reason, FinishReason::Length);
         assert_eq!(committed, 16);
         assert_eq!(runtime.worker_generation(), 1);
         let stats_a = runtime.backend_stats().expect("stats");
-        assert_eq!(stats_a.prefill_batch, Some(8));
-        assert_eq!(stats_a.retained_workspace_bytes, Some(ws8));
-
-        // Smaller plan whose workspaces reservation covers batch 4 but not
-        // the retained batch-8 workspace: reuse must decline and the reload
-        // must prepare the smaller batch within the new reservation.
-        let ws_b = ws1 + (ws8 - ws1) / 2;
-        let plan_b = plan_with(ws_b);
-        runtime.plan_admitted(&plan_b).unwrap();
-        runtime.admit_engine(&plan_b).unwrap();
-        let ticket = runtime.submit().unwrap();
-        let run = runtime
-            .start_run(
-                &ticket,
-                plan_b,
-                artifact_ref_for(&runtime),
-                RunRequest::greedy(vec![1, 2, 3, 4], 32),
-            )
-            .unwrap();
-        let (reason, committed) = collect_run(&run, |_, _| {});
-        assert_eq!(reason, FinishReason::Length);
-        assert_eq!(committed, 32);
-        assert_eq!(runtime.worker_generation(), 2, "declined reuse reloads");
-        let stats_b = runtime.backend_stats().expect("stats");
-        let (_, ws_eff) = required(stats_b.prefill_batch.expect("batch"));
-        assert!(
-            stats_b.prefill_batch.unwrap() < 8,
-            "the reload re-preflights a smaller batch"
-        );
         assert_eq!(
-            stats_b.retained_workspace_bytes,
-            Some(ws_eff),
-            "the reused load's actual workspace equals its preflight"
+            stats_a.prefill_batch,
+            Some(tuckmill_tuckcore::engine::metal::PREFILL_BATCH as u32)
         );
-        assert!(
-            ws_eff <= ws_b,
-            "the prepared workspace fits the smaller plan's reservation"
+        assert_eq!(stats_a.retained_workspace_bytes, Some(engine_plan.scratch));
+
+        // A smaller plan that still covers the retained scratch keeps the
+        // warm worker.
+        let (reason, committed) = run_with(plan_with(engine_plan.scratch), 16);
+        assert_eq!(reason, FinishReason::Length);
+        assert_eq!(committed, 16);
+        assert_eq!(runtime.worker_generation(), 1, "covered reuse is kept");
+
+        // One byte short: reuse must decline, and the reload under the new
+        // plan is refused (the engine's scratch never shrinks to fit), so
+        // nothing is generated.
+        let (reason, committed) = run_with(plan_with(engine_plan.scratch - 1), 16);
+        assert_ne!(
+            reason,
+            FinishReason::Length,
+            "an understated plan never runs"
         );
+        assert_eq!(committed, 0);
         runtime.shutdown();
     }
 

@@ -44,6 +44,40 @@ mod imp {
         _private: [u8; 0],
     }
 
+    /// `tm_metal_qwen35_kv_store_{f16,f32}_chunk`.
+    pub type KvChunkFn = unsafe extern "C" fn(
+        *mut TmMetalCtx,
+        *mut TmMetalBuffer,
+        *mut TmMetalBuffer,
+        *mut TmMetalBuffer,
+        *mut TmMetalBuffer,
+        u32,
+        u32,
+        u32,
+        u32,
+        u32,
+        *mut c_char,
+        usize,
+    ) -> c_int;
+    /// `tm_metal_qwen35_attention_{f16,f32}_chunk`.
+    pub type AttnChunkFn = unsafe extern "C" fn(
+        *mut TmMetalCtx,
+        *mut TmMetalBuffer,
+        *mut TmMetalBuffer,
+        *mut TmMetalBuffer,
+        *mut TmMetalBuffer,
+        *mut TmMetalBuffer,
+        u32,
+        u32,
+        u32,
+        u32,
+        u32,
+        f32,
+        u32,
+        *mut c_char,
+        usize,
+    ) -> c_int;
+
     pub const TM_METAL_ERR_NO_DEVICE: c_int = -1;
     pub const TM_METAL_ERR_SOURCE: c_int = -2;
     pub const TM_METAL_ERR_ALLOC: c_int = -3;
@@ -192,48 +226,6 @@ mod imp {
             err: *mut c_char,
             err_cap: usize,
         ) -> c_int;
-        pub fn tm_metal_rope_f32(
-            ctx: *mut TmMetalCtx,
-            q: *mut TmMetalBuffer,
-            k: *mut TmMetalBuffer,
-            inv_freq: *mut TmMetalBuffer,
-            pos: u32,
-            n_q_heads: u32,
-            n_kv_heads: u32,
-            head_dim: u32,
-            err: *mut c_char,
-            err_cap: usize,
-        ) -> c_int;
-        pub fn tm_metal_kv_store_f32(
-            ctx: *mut TmMetalCtx,
-            k_src: *mut TmMetalBuffer,
-            v_src: *mut TmMetalBuffer,
-            k_cache: *mut TmMetalBuffer,
-            v_cache: *mut TmMetalBuffer,
-            kv_heads: u32,
-            pos: u32,
-            cap: u32,
-            head_dim: u32,
-            round_f16: u32,
-            err: *mut c_char,
-            err_cap: usize,
-        ) -> c_int;
-        pub fn tm_metal_attention_f32(
-            ctx: *mut TmMetalCtx,
-            q: *mut TmMetalBuffer,
-            k_cache: *mut TmMetalBuffer,
-            v_cache: *mut TmMetalBuffer,
-            out: *mut TmMetalBuffer,
-            scratch: *mut TmMetalBuffer,
-            heads: u32,
-            pos: u32,
-            cap: u32,
-            head_dim: u32,
-            group: u32,
-            scale: f32,
-            err: *mut c_char,
-            err_cap: usize,
-        ) -> c_int;
         pub fn tm_metal_f16_row_f32(
             ctx: *mut TmMetalCtx,
             w: *mut TmMetalBuffer,
@@ -241,17 +233,6 @@ mod imp {
             row: u32,
             cols: u32,
             out_off: u32,
-            err: *mut c_char,
-            err_cap: usize,
-        ) -> c_int;
-        pub fn tm_metal_rmsnorm_f16w(
-            ctx: *mut TmMetalCtx,
-            x: *mut TmMetalBuffer,
-            weight: *mut TmMetalBuffer,
-            y: *mut TmMetalBuffer,
-            rows: u32,
-            cols: u32,
-            eps: f32,
             err: *mut c_char,
             err_cap: usize,
         ) -> c_int;
@@ -300,51 +281,6 @@ mod imp {
             batch: u32,
             x_off: u32,
             y_off: u32,
-            err: *mut c_char,
-            err_cap: usize,
-        ) -> c_int;
-        pub fn tm_metal_rope_batch_f32(
-            ctx: *mut TmMetalCtx,
-            q: *mut TmMetalBuffer,
-            k: *mut TmMetalBuffer,
-            inv_freq: *mut TmMetalBuffer,
-            start_pos: u32,
-            n_tokens: u32,
-            n_q_heads: u32,
-            n_kv_heads: u32,
-            head_dim: u32,
-            err: *mut c_char,
-            err_cap: usize,
-        ) -> c_int;
-        pub fn tm_metal_kv_store_batch_f32(
-            ctx: *mut TmMetalCtx,
-            k_src: *mut TmMetalBuffer,
-            v_src: *mut TmMetalBuffer,
-            k_cache: *mut TmMetalBuffer,
-            v_cache: *mut TmMetalBuffer,
-            n_tokens: u32,
-            start_pos: u32,
-            cap: u32,
-            head_dim: u32,
-            kv_heads: u32,
-            round_f16: u32,
-            err: *mut c_char,
-            err_cap: usize,
-        ) -> c_int;
-        pub fn tm_metal_attention_batch_f32(
-            ctx: *mut TmMetalCtx,
-            q: *mut TmMetalBuffer,
-            k_cache: *mut TmMetalBuffer,
-            v_cache: *mut TmMetalBuffer,
-            out: *mut TmMetalBuffer,
-            scratch: *mut TmMetalBuffer,
-            heads: u32,
-            n_tokens: u32,
-            start_pos: u32,
-            cap: u32,
-            head_dim: u32,
-            group: u32,
-            scale: f32,
             err: *mut c_char,
             err_cap: usize,
         ) -> c_int;
@@ -596,6 +532,37 @@ mod imp {
             cap: u32,
             head_dim: u32,
             kv_heads: u32,
+            n: u32,
+            err: *mut c_char,
+            err_cap: usize,
+        ) -> c_int;
+        pub fn tm_metal_qwen35_kv_store_f32_chunk(
+            ctx: *mut TmMetalCtx,
+            k_src: *mut TmMetalBuffer,
+            v_src: *mut TmMetalBuffer,
+            k_cache: *mut TmMetalBuffer,
+            v_cache: *mut TmMetalBuffer,
+            pos0: u32,
+            cap: u32,
+            head_dim: u32,
+            kv_heads: u32,
+            n: u32,
+            err: *mut c_char,
+            err_cap: usize,
+        ) -> c_int;
+        pub fn tm_metal_qwen35_attention_f32_chunk(
+            ctx: *mut TmMetalCtx,
+            q: *mut TmMetalBuffer,
+            k_cache: *mut TmMetalBuffer,
+            v_cache: *mut TmMetalBuffer,
+            out: *mut TmMetalBuffer,
+            scratch: *mut TmMetalBuffer,
+            heads: u32,
+            pos0: u32,
+            cap: u32,
+            head_dim: u32,
+            group: u32,
+            scale: f32,
             n: u32,
             err: *mut c_char,
             err_cap: usize,
@@ -1291,6 +1258,27 @@ impl MetalContext {
         kv_heads: u32,
         n: u32,
     ) -> Result<()> {
+        self.qwen35_kv_store_chunk(
+            k_src, v_src, k_cache, v_cache, pos0, cap, head_dim, kv_heads, n, false,
+        )
+    }
+
+    /// KV store of `n` chunk rows at positions `pos0+t` into a packed f16
+    /// cache, or an f32 cache (exact copies) when `f32_cache`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn qwen35_kv_store_chunk(
+        &self,
+        k_src: &MetalBuffer,
+        v_src: &MetalBuffer,
+        k_cache: &MetalBuffer,
+        v_cache: &MetalBuffer,
+        pos0: u32,
+        cap: u32,
+        head_dim: u32,
+        kv_heads: u32,
+        n: u32,
+        f32_cache: bool,
+    ) -> Result<()> {
         for (b, name) in [
             (k_src, "k_src"),
             (v_src, "v_src"),
@@ -1300,11 +1288,22 @@ impl MetalContext {
             self.check_owned(b, name)?;
         }
         let r = (k_src.raw, v_src.raw, k_cache.raw, v_cache.raw);
-        self.operate("qwen35_kv_store_f16_chunk", move |ctx| {
+        let (label, f) = if f32_cache {
+            (
+                "qwen35_kv_store_f32_chunk",
+                imp::tm_metal_qwen35_kv_store_f32_chunk as imp::KvChunkFn,
+            )
+        } else {
+            (
+                "qwen35_kv_store_f16_chunk",
+                imp::tm_metal_qwen35_kv_store_f16_chunk as imp::KvChunkFn,
+            )
+        };
+        self.operate(label, move |ctx| {
             let mut err = [0 as c_char; ERR_CAP];
             // SAFETY: raw handles were validated against this context.
             let code = unsafe {
-                imp::tm_metal_qwen35_kv_store_f16_chunk(
+                f(
                     ctx,
                     r.0,
                     r.1,
@@ -1342,6 +1341,30 @@ impl MetalContext {
         scale: f32,
         n: u32,
     ) -> Result<()> {
+        self.qwen35_attention_chunk(
+            q, k_cache, v_cache, out, scratch, heads, pos0, cap, head_dim, group, scale, n, false,
+        )
+    }
+
+    /// [`Self::qwen35_attention_f16_chunk`] over a packed f16 cache, or an
+    /// f32 cache when `f32_cache`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn qwen35_attention_chunk(
+        &self,
+        q: &MetalBuffer,
+        k_cache: &MetalBuffer,
+        v_cache: &MetalBuffer,
+        out: &MetalBuffer,
+        scratch: &MetalBuffer,
+        heads: u32,
+        pos0: u32,
+        cap: u32,
+        head_dim: u32,
+        group: u32,
+        scale: f32,
+        n: u32,
+        f32_cache: bool,
+    ) -> Result<()> {
         for (b, name) in [
             (q, "q"),
             (k_cache, "k_cache"),
@@ -1352,11 +1375,22 @@ impl MetalContext {
             self.check_owned(b, name)?;
         }
         let r = (q.raw, k_cache.raw, v_cache.raw, out.raw, scratch.raw);
-        self.operate("qwen35_attention_f16_chunk", move |ctx| {
+        let (label, f) = if f32_cache {
+            (
+                "qwen35_attention_f32_chunk",
+                imp::tm_metal_qwen35_attention_f32_chunk as imp::AttnChunkFn,
+            )
+        } else {
+            (
+                "qwen35_attention_f16_chunk",
+                imp::tm_metal_qwen35_attention_f16_chunk as imp::AttnChunkFn,
+            )
+        };
+        self.operate(label, move |ctx| {
             let mut err = [0 as c_char; ERR_CAP];
             // SAFETY: raw handles were validated against this context.
             let code = unsafe {
-                imp::tm_metal_qwen35_attention_f16_chunk(
+                f(
                     ctx,
                     r.0,
                     r.1,
@@ -2060,40 +2094,6 @@ impl MetalContext {
         })
     }
 
-    /// Row-wise RMSNorm with an F16-weight table.
-    pub fn rmsnorm_f16w(
-        &self,
-        x: &MetalBuffer,
-        weight: &MetalBuffer,
-        y: &MetalBuffer,
-        rows: u32,
-        cols: u32,
-        eps: f32,
-    ) -> Result<()> {
-        for (buffer, name) in [(x, "x"), (weight, "weight"), (y, "y")] {
-            self.check_owned(buffer, name)?;
-        }
-        let (xc, wc, yc) = (x.raw, weight.raw, y.raw);
-        self.operate("rmsnorm_f16w", move |ctx| {
-            let mut err = [0 as c_char; ERR_CAP];
-            // SAFETY: raw handles were validated against this context.
-            let code = unsafe {
-                imp::tm_metal_rmsnorm_f16w(
-                    ctx,
-                    xc,
-                    wc,
-                    yc,
-                    rows,
-                    cols,
-                    eps,
-                    err.as_mut_ptr(),
-                    ERR_CAP,
-                )
-            };
-            (code, err)
-        })
-    }
-
     /// Row-wise RMSNorm: y[row] = rmsnorm(x[row], weight, eps).
     pub fn rmsnorm(
         &self,
@@ -2120,140 +2120,6 @@ impl MetalContext {
                     rows,
                     cols,
                     eps,
-                    err.as_mut_ptr(),
-                    ERR_CAP,
-                )
-            };
-            (code, err)
-        })
-    }
-
-    /// NeoX RoPE in place over q (n_q_heads) and k (n_kv_heads) at `pos`.
-    #[allow(clippy::too_many_arguments)]
-    pub fn rope(
-        &self,
-        q: &MetalBuffer,
-        k: &MetalBuffer,
-        inv_freq: &MetalBuffer,
-        pos: u32,
-        n_q_heads: u32,
-        n_kv_heads: u32,
-        head_dim: u32,
-    ) -> Result<()> {
-        for (buffer, name) in [(q, "q"), (k, "k"), (inv_freq, "inv_freq")] {
-            self.check_owned(buffer, name)?;
-        }
-        let (qc, kc, fc) = (q.raw, k.raw, inv_freq.raw);
-        self.operate("rope", move |ctx| {
-            let mut err = [0 as c_char; ERR_CAP];
-            // SAFETY: raw handles were validated against this context.
-            let code = unsafe {
-                imp::tm_metal_rope_f32(
-                    ctx,
-                    qc,
-                    kc,
-                    fc,
-                    pos,
-                    n_q_heads,
-                    n_kv_heads,
-                    head_dim,
-                    err.as_mut_ptr(),
-                    ERR_CAP,
-                )
-            };
-            (code, err)
-        })
-    }
-
-    /// Append k/v rows into the KV caches at `pos`.
-    #[allow(clippy::too_many_arguments)]
-    pub fn kv_store(
-        &self,
-        k_src: &MetalBuffer,
-        v_src: &MetalBuffer,
-        k_cache: &MetalBuffer,
-        v_cache: &MetalBuffer,
-        kv_heads: u32,
-        pos: u32,
-        cap: u32,
-        head_dim: u32,
-        round_f16: bool,
-    ) -> Result<()> {
-        for (buffer, name) in [
-            (k_src, "k_src"),
-            (v_src, "v_src"),
-            (k_cache, "k_cache"),
-            (v_cache, "v_cache"),
-        ] {
-            self.check_owned(buffer, name)?;
-        }
-        let (ks, vs, kcat, vcat) = (k_src.raw, v_src.raw, k_cache.raw, v_cache.raw);
-        self.operate("kv_store", move |ctx| {
-            let mut err = [0 as c_char; ERR_CAP];
-            // SAFETY: raw handles were validated against this context.
-            let code = unsafe {
-                imp::tm_metal_kv_store_f32(
-                    ctx,
-                    ks,
-                    vs,
-                    kcat,
-                    vcat,
-                    kv_heads,
-                    pos,
-                    cap,
-                    head_dim,
-                    u32::from(round_f16),
-                    err.as_mut_ptr(),
-                    ERR_CAP,
-                )
-            };
-            (code, err)
-        })
-    }
-
-    /// Causal GQA attention for one position; `scratch` holds heads*cap f32.
-    #[allow(clippy::too_many_arguments)]
-    pub fn attention(
-        &self,
-        q: &MetalBuffer,
-        k_cache: &MetalBuffer,
-        v_cache: &MetalBuffer,
-        out: &MetalBuffer,
-        scratch: &MetalBuffer,
-        heads: u32,
-        pos: u32,
-        cap: u32,
-        head_dim: u32,
-        group: u32,
-        scale: f32,
-    ) -> Result<()> {
-        for (buffer, name) in [
-            (q, "q"),
-            (k_cache, "k_cache"),
-            (v_cache, "v_cache"),
-            (out, "out"),
-            (scratch, "scratch"),
-        ] {
-            self.check_owned(buffer, name)?;
-        }
-        let (qc, kc, vc, oc, sc) = (q.raw, k_cache.raw, v_cache.raw, out.raw, scratch.raw);
-        self.operate("attention", move |ctx| {
-            let mut err = [0 as c_char; ERR_CAP];
-            // SAFETY: raw handles were validated against this context.
-            let code = unsafe {
-                imp::tm_metal_attention_f32(
-                    ctx,
-                    qc,
-                    kc,
-                    vc,
-                    oc,
-                    sc,
-                    heads,
-                    pos,
-                    cap,
-                    head_dim,
-                    group,
-                    scale,
                     err.as_mut_ptr(),
                     ERR_CAP,
                 )
@@ -2398,146 +2264,6 @@ impl MetalContext {
                     batch,
                     x_off,
                     y_off,
-                    err.as_mut_ptr(),
-                    ERR_CAP,
-                )
-            };
-            (code, err)
-        })
-    }
-
-    /// Batched RoPE over a chunk of tokens.
-    #[allow(clippy::too_many_arguments)]
-    pub fn rope_batch(
-        &self,
-        q: &MetalBuffer,
-        k: &MetalBuffer,
-        inv_freq: &MetalBuffer,
-        start_pos: u32,
-        n_tokens: u32,
-        n_q_heads: u32,
-        n_kv_heads: u32,
-        head_dim: u32,
-    ) -> Result<()> {
-        for (buffer, name) in [(q, "q"), (k, "k"), (inv_freq, "inv_freq")] {
-            self.check_owned(buffer, name)?;
-        }
-        let (qc, kc, fc) = (q.raw, k.raw, inv_freq.raw);
-        self.operate("rope_batch", move |ctx| {
-            let mut err = [0 as c_char; ERR_CAP];
-            // SAFETY: raw handles were validated against this context.
-            let code = unsafe {
-                imp::tm_metal_rope_batch_f32(
-                    ctx,
-                    qc,
-                    kc,
-                    fc,
-                    start_pos,
-                    n_tokens,
-                    n_q_heads,
-                    n_kv_heads,
-                    head_dim,
-                    err.as_mut_ptr(),
-                    ERR_CAP,
-                )
-            };
-            (code, err)
-        })
-    }
-
-    /// Batched KV writes for a prefilled chunk.
-    #[allow(clippy::too_many_arguments)]
-    pub fn kv_store_batch(
-        &self,
-        k_src: &MetalBuffer,
-        v_src: &MetalBuffer,
-        k_cache: &MetalBuffer,
-        v_cache: &MetalBuffer,
-        n_tokens: u32,
-        start_pos: u32,
-        cap: u32,
-        head_dim: u32,
-        kv_heads: u32,
-        round_f16: bool,
-    ) -> Result<()> {
-        for (buffer, name) in [
-            (k_src, "k_src"),
-            (v_src, "v_src"),
-            (k_cache, "k_cache"),
-            (v_cache, "v_cache"),
-        ] {
-            self.check_owned(buffer, name)?;
-        }
-        let (ks, vs, kcat, vcat) = (k_src.raw, v_src.raw, k_cache.raw, v_cache.raw);
-        self.operate("kv_store_batch", move |ctx| {
-            let mut err = [0 as c_char; ERR_CAP];
-            // SAFETY: raw handles were validated against this context.
-            let code = unsafe {
-                imp::tm_metal_kv_store_batch_f32(
-                    ctx,
-                    ks,
-                    vs,
-                    kcat,
-                    vcat,
-                    n_tokens,
-                    start_pos,
-                    cap,
-                    head_dim,
-                    kv_heads,
-                    u32::from(round_f16),
-                    err.as_mut_ptr(),
-                    ERR_CAP,
-                )
-            };
-            (code, err)
-        })
-    }
-
-    /// Batched causal GQA attention for a prefilled chunk.
-    #[allow(clippy::too_many_arguments)]
-    pub fn attention_batch(
-        &self,
-        q: &MetalBuffer,
-        k_cache: &MetalBuffer,
-        v_cache: &MetalBuffer,
-        out: &MetalBuffer,
-        scratch: &MetalBuffer,
-        heads: u32,
-        n_tokens: u32,
-        start_pos: u32,
-        cap: u32,
-        head_dim: u32,
-        group: u32,
-        scale: f32,
-    ) -> Result<()> {
-        for (buffer, name) in [
-            (q, "q"),
-            (k_cache, "k_cache"),
-            (v_cache, "v_cache"),
-            (out, "out"),
-            (scratch, "scratch"),
-        ] {
-            self.check_owned(buffer, name)?;
-        }
-        let (qc, kc, vc, oc, sc) = (q.raw, k_cache.raw, v_cache.raw, out.raw, scratch.raw);
-        self.operate("attention_batch", move |ctx| {
-            let mut err = [0 as c_char; ERR_CAP];
-            // SAFETY: raw handles were validated against this context.
-            let code = unsafe {
-                imp::tm_metal_attention_batch_f32(
-                    ctx,
-                    qc,
-                    kc,
-                    vc,
-                    oc,
-                    sc,
-                    heads,
-                    n_tokens,
-                    start_pos,
-                    cap,
-                    head_dim,
-                    group,
-                    scale,
                     err.as_mut_ptr(),
                     ERR_CAP,
                 )

@@ -31,16 +31,18 @@ use crate::tensor;
 
 /// Row geometry of one artifact tensor, plus its absolute file offset.
 #[derive(Debug, Clone, Copy)]
-struct TensorMeta {
-    offset: u64,
-    type_id: u32,
-    in_dim: u64,
-    out_dim: u64,
-    row_bytes: u64,
-    byte_size: u64,
+pub(crate) struct TensorMeta {
+    pub(crate) offset: u64,
+    pub(crate) type_id: u32,
+    pub(crate) in_dim: u64,
+    pub(crate) out_dim: u64,
+    pub(crate) row_bytes: u64,
+    pub(crate) byte_size: u64,
 }
 
-fn build_tensor_meta(insp: &tuckmill_manifest::gguf::GgufInspection) -> Result<Vec<TensorMeta>> {
+pub(crate) fn build_tensor_meta(
+    insp: &tuckmill_manifest::gguf::GgufInspection,
+) -> Result<Vec<TensorMeta>> {
     let mut meta = Vec::with_capacity(insp.tensors.len());
     for t in &insp.tensors {
         meta.push(TensorMeta::from_tensor(t, insp.data_start, insp.file_len)?);
@@ -57,7 +59,7 @@ impl TensorMeta {
                 return Err(TuckmillError::new(
                     ErrorCode::InvalidArtifact,
                     format!(
-                        "tensor {:?} has {n} dims; the qwen35 reference reads 1-D and 2-D tensors only",
+                        "tensor {:?} has {n} dims; TuckCore reads 1-D and 2-D tensors only",
                         t.name
                     ),
                 ));
@@ -145,8 +147,7 @@ pub trait TensorSource {
 /// and the resolved contract only. Used by device clients so they never
 /// depend on a CPU inference session.
 pub struct ArtifactTensorSource {
-    file: File,
-    meta: Vec<TensorMeta>,
+    weights: crate::engine::GgufWeights,
     cfg: Qwen35Config,
     layout: Qwen35Layout,
 }
@@ -194,13 +195,7 @@ impl ArtifactTensorSource {
         let registry = AdapterRegistry::builtin()?;
         let (cfg, layout) = resolve(insp, &registry)?;
         Ok(Self {
-            file: file.try_clone().map_err(|e| {
-                TuckmillError::new(
-                    ErrorCode::StorageLost,
-                    format!("cannot clone the verified artifact handle: {e}"),
-                )
-            })?,
-            meta: build_tensor_meta(insp)?,
+            weights: crate::engine::GgufWeights::with_inspection(file, insp)?,
             cfg,
             layout,
         })
@@ -217,63 +212,23 @@ impl TensorSource for ArtifactTensorSource {
     }
 
     fn tensor_type_id(&self, tensor_index: usize) -> Result<u32> {
-        Ok(self.meta_of(tensor_index)?.type_id)
+        crate::engine::WeightSource::tensor_type_id(&self.weights, tensor_index)
     }
 
     fn tensor_dims(&self, tensor_index: usize) -> Result<(u64, u64)> {
-        let m = self.meta_of(tensor_index)?;
-        Ok((m.in_dim, m.out_dim))
+        crate::engine::WeightSource::tensor_dims(&self.weights, tensor_index)
     }
 
     fn tensor_bytes(&self, tensor_index: usize) -> Result<u64> {
-        Ok(self.meta_of(tensor_index)?.byte_size)
+        crate::engine::WeightSource::tensor_bytes(&self.weights, tensor_index)
     }
 
     fn read_tensor_into(&self, tensor_index: usize, offset: u64, dst: &mut [u8]) -> Result<()> {
-        let m = *self.meta_of(tensor_index)?;
-        if offset + dst.len() as u64 > m.byte_size {
-            return Err(TuckmillError::new(
-                ErrorCode::Internal,
-                format!("tensor {tensor_index} read past its {} bytes", m.byte_size),
-            ));
-        }
-        let mut done = 0usize;
-        while done < dst.len() {
-            let n = self
-                .file
-                .read_at(&mut dst[done..], m.offset + offset + done as u64)
-                .map_err(|e| {
-                    TuckmillError::new(ErrorCode::StorageLost, format!("artifact read failed: {e}"))
-                })?;
-            if n == 0 {
-                return Err(TuckmillError::new(
-                    ErrorCode::StorageLost,
-                    "artifact ended early while reading a tensor",
-                ));
-            }
-            done += n;
-        }
-        Ok(())
+        crate::engine::WeightSource::read_tensor_into(&self.weights, tensor_index, offset, dst)
     }
 
     fn read_vector(&self, tensor_index: usize) -> Result<Vec<f32>> {
-        let m = *self.meta_of(tensor_index)?;
-        let mut bytes = vec![0u8; m.byte_size as usize];
-        self.read_tensor_into(tensor_index, 0, &mut bytes)?;
-        let mut out = Vec::new();
-        tensor::dequant_into(m.type_id, &bytes, &mut out)?;
-        Ok(out)
-    }
-}
-
-impl ArtifactTensorSource {
-    fn meta_of(&self, tensor_index: usize) -> Result<&TensorMeta> {
-        self.meta.get(tensor_index).ok_or_else(|| {
-            TuckmillError::new(
-                ErrorCode::Internal,
-                format!("tensor index {tensor_index} is outside the inspected range"),
-            )
-        })
+        crate::engine::WeightSource::read_vector(&self.weights, tensor_index)
     }
 }
 

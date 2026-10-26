@@ -367,62 +367,8 @@ kernel void tm_rmsnorm_f32(device const float *x [[buffer(0)]],
  * precomputed on the host (matching the scalar executor's f32 table).
  * Layout per head: [.., dim] rotations pair (i, i + head_dim/2). One
  * threadgroup per head of head_dim/2 lanes.
- */
-kernel void tm_rope_f32(device float *q [[buffer(0)]],
-                        device float *k [[buffer(1)]],
-                        device const float *inv_freq [[buffer(2)]],
-                        constant uint &pos [[buffer(3)]],
-                        constant uint &n_q_heads [[buffer(4)]],
-                        constant uint &n_kv_heads [[buffer(5)]],
-                        constant uint &head_dim [[buffer(6)]],
-                        uint head [[threadgroup_position_in_grid]],
-                        uint lane [[thread_position_in_threadgroup]]) {
-    const uint half_dim = head_dim / 2u;
-    if (lane >= half_dim) {
-        return;
-    }
-    const bool is_q = head < n_q_heads;
-    const uint local_head = is_q ? head : head - n_q_heads;
-    device float *base = is_q ? q : k;
-    const device float *row = base + (size_t)local_head * (size_t)head_dim;
-    device float *mutable_row = base + (size_t)local_head * (size_t)head_dim;
-    const float angle = (float)pos * inv_freq[lane];
-    const float c = cos(angle);
-    const float s = sin(angle);
-    const float a = row[lane];
-    const float b = row[lane + half_dim];
-    mutable_row[lane] = a * c - b * s;
-    mutable_row[lane + half_dim] = a * s + b * c;
-}
-
 /* k_cache[h][pos][d] = k_src[h][d] (same for v). One threadgroup per kv
  * head over head_dim lanes. */
-kernel void tm_kv_store_f32(device const float *k_src [[buffer(0)]],
-                            device const float *v_src [[buffer(1)]],
-                            device float *k_cache [[buffer(2)]],
-                            device float *v_cache [[buffer(3)]],
-                            constant uint &pos [[buffer(4)]],
-                            constant uint &cap [[buffer(5)]],
-                            constant uint &head_dim [[buffer(6)]],
-                            constant uint &round_f16 [[buffer(7)]],
-                            uint head [[threadgroup_position_in_grid]],
-                            uint lane [[thread_position_in_threadgroup]]) {
-    if (lane >= head_dim) {
-        return;
-    }
-    const size_t src = (size_t)head * (size_t)head_dim + lane;
-    const size_t dst = ((size_t)head * (size_t)cap + (size_t)pos) * (size_t)head_dim + lane;
-    if (round_f16 != 0u) {
-        /* Declared f16 cache precision: entries stay f32 values that are
-         * exactly f16-representable, mirroring the CPU executor's contract. */
-        k_cache[dst] = (float)(half)k_src[src];
-        v_cache[dst] = (float)(half)v_src[src];
-    } else {
-        k_cache[dst] = k_src[src];
-        v_cache[dst] = v_src[src];
-    }
-}
-
 /*
  * Causal GQA attention for one query position. One threadgroup per query
  * head; 128 threads. Scores for keys 0..=pos land in scratch (per-head
@@ -430,87 +376,6 @@ kernel void tm_kv_store_f32(device const float *k_src [[buffer(0)]],
  * value accumulation parallel over head_dim lanes. `scale` is
  * 1/sqrt(head_dim). No mask beyond causality (Qwen3 dense here has no
  * sliding window).
- */
-kernel void tm_attention_f32(device const float *q [[buffer(0)]],
-                             device const float *k_cache [[buffer(1)]],
-                             device const float *v_cache [[buffer(2)]],
-                             device float *out [[buffer(3)]],
-                             device float *scratch [[buffer(4)]],
-                             constant uint &pos [[buffer(5)]],
-                             constant uint &cap [[buffer(6)]],
-                             constant uint &head_dim [[buffer(7)]],
-                             constant uint &group [[buffer(8)]],
-                             constant float &scale [[buffer(9)]],
-                             uint head [[threadgroup_position_in_grid]],
-                             uint tid [[thread_position_in_threadgroup]],
-                             uint lane [[thread_index_in_simdgroup]],
-                             uint simd_group [[simdgroup_index_in_threadgroup]]) {
-    threadgroup float reduce_scratch[4];
-    threadgroup float row_stats[2]; /* [0] = running max, [1] = denominator */
-    const uint kv_head = head / group;
-    const device float *qh = q + (size_t)head * (size_t)head_dim;
-    const device float *kc = k_cache + ((size_t)kv_head * (size_t)cap) * (size_t)head_dim;
-    const device float *vc = v_cache + ((size_t)kv_head * (size_t)cap) * (size_t)head_dim;
-    device float *head_scratch = scratch + (size_t)head * (size_t)cap;
-    const uint seq = pos + 1u;
-
-    /* scores */
-    for (uint j = 0; j < seq; ++j) {
-        float part = 0.0f;
-        for (uint d = tid; d < head_dim; d += 128u) {
-            part += qh[d] * kc[(size_t)j * (size_t)head_dim + d];
-        }
-        const float s = tm_reduce_sum_128(part, reduce_scratch, lane, simd_group) * scale;
-        if (tid == 0u) {
-            head_scratch[j] = s;
-        }
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    /* row max */
-    float local_max = -INFINITY;
-    for (uint j = tid; j < seq; j += 128u) {
-        local_max = max(local_max, head_scratch[j]);
-    }
-    local_max = simd_max(local_max);
-    if (lane == 0u) {
-        reduce_scratch[simd_group] = local_max;
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    if (tid == 0u) {
-        float m = reduce_scratch[0];
-        for (uint g = 1u; g < 4u; ++g) {
-            m = max(m, reduce_scratch[g]);
-        }
-        row_stats[0] = m;
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    const float row_max = row_stats[0];
-
-    /* denominator */
-    float local_sum = 0.0f;
-    for (uint j = tid; j < seq; j += 128u) {
-        local_sum += exp(head_scratch[j] - row_max);
-    }
-    const float denom = tm_reduce_sum_128(local_sum, reduce_scratch, lane, simd_group);
-    if (tid == 0u) {
-        row_stats[1] = denom;
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    device float *oh = out + (size_t)head * (size_t)head_dim;
-
-    /* weighted values; each lane owns head_dim/128 = 1 dim when head_dim
-     * is 128, but the loop is written for threadgroup 128 generally. */
-    for (uint d = tid; d < head_dim; d += 128u) {
-        float accv = 0.0f;
-        for (uint j = 0; j < seq; ++j) {
-            const float w = exp(head_scratch[j] - row_max) / denom;
-            accv += w * vc[(size_t)j * (size_t)head_dim + d];
-        }
-        oh[d] = accv;
-    }
-}
-
 /* out[i] = silu(gate[i]) * up[i], i < n. */
 kernel void tm_silu_mul_f32(device const float *gate [[buffer(0)]],
                             device const float *up [[buffer(1)]],
@@ -536,30 +401,6 @@ kernel void tm_f16_row_f32(device const half *w [[buffer(0)]],
         return;
     }
     out[out_off + gid] = (float)w[(size_t)row * (size_t)cols + gid];
-}
-
-/* RMSNorm with an F16-weight table (fixture/F16-twin artifacts). */
-kernel void tm_rmsnorm_f16w(device const float *x [[buffer(0)]],
-                            device const half *weight [[buffer(1)]],
-                            device float *y [[buffer(2)]],
-                            constant uint &cols [[buffer(3)]],
-                            constant float &eps [[buffer(4)]],
-                            uint row [[threadgroup_position_in_grid]],
-                            uint tid [[thread_position_in_threadgroup]],
-                            uint lane [[thread_index_in_simdgroup]],
-                            uint simd_group [[simdgroup_index_in_threadgroup]]) {
-    threadgroup float scratch[4];
-    const device float *xrow = x + (size_t)row * (size_t)cols;
-    device float *yrow = y + (size_t)row * (size_t)cols;
-    float acc = 0.0f;
-    for (uint i = tid; i < cols; i += 128u) {
-        acc += xrow[i] * xrow[i];
-    }
-    const float sumsq = tm_reduce_sum_128(acc, scratch, lane, simd_group);
-    const float rms = 1.0f / sqrt(sumsq / (float)cols + eps);
-    for (uint i = tid; i < cols; i += 128u) {
-        yrow[i] = xrow[i] * rms * (float)weight[i];
-    }
 }
 
 /* ---------------- C3: batched prefill kernels ---------------- */
@@ -816,164 +657,13 @@ kernel void tm_f16_gemm(device const half *w [[buffer(0)]],
  * n_tokens*n_q_heads rows rotate q, the rest rotate k. Token t is rotated
  * at position start_pos + t, so a prefilled chunk matches single-token
  * semantics exactly (same angles, same pair order).
- */
-kernel void tm_rope_batch_f32(device float *q [[buffer(0)]],
-                              device float *k [[buffer(1)]],
-                              device const float *inv_freq [[buffer(2)]],
-                              constant uint &start_pos [[buffer(3)]],
-                              constant uint &n_tokens [[buffer(4)]],
-                              constant uint &n_q_heads [[buffer(5)]],
-                              constant uint &n_kv_heads [[buffer(6)]],
-                              constant uint &head_dim [[buffer(7)]],
-                              uint row [[threadgroup_position_in_grid]],
-                              uint lane [[thread_position_in_threadgroup]]) {
-    const uint half_dim = head_dim / 2u;
-    if (lane >= half_dim) {
-        return;
-    }
-    const uint q_rows = n_tokens * n_q_heads;
-    const uint total_rows = q_rows + n_tokens * n_kv_heads;
-    if (row >= total_rows) {
-        return;
-    }
-    const bool is_q = row < q_rows;
-    const uint t = is_q ? row / n_q_heads : (row - q_rows) / n_kv_heads;
-    const uint head = is_q ? row % n_q_heads : (row - q_rows) % n_kv_heads;
-    const uint heads = is_q ? n_q_heads : n_kv_heads;
-    device float *base = is_q ? q : k;
-    device float *r = base + ((size_t)t * heads + head) * (size_t)head_dim;
-    const float angle = (float)(start_pos + t) * inv_freq[lane];
-    const float c = cos(angle);
-    const float s = sin(angle);
-    const float a = r[lane];
-    const float bb = r[lane + half_dim];
-    r[lane] = a * c - bb * s;
-    r[lane + half_dim] = a * s + bb * c;
-}
-
 /* Batched KV writes: rows = n_tokens * kv_heads; token t lands at
  * start_pos + t. Same f16 rounding contract as the single-token kernel. */
-kernel void tm_kv_store_batch_f32(device const float *k_src [[buffer(0)]],
-                                  device const float *v_src [[buffer(1)]],
-                                  device float *k_cache [[buffer(2)]],
-                                  device float *v_cache [[buffer(3)]],
-                                  constant uint &n_tokens [[buffer(4)]],
-                                  constant uint &start_pos [[buffer(5)]],
-                                  constant uint &cap [[buffer(6)]],
-                                  constant uint &head_dim [[buffer(7)]],
-                                  constant uint &kv_heads [[buffer(8)]],
-                                  constant uint &round_f16 [[buffer(9)]],
-                                  uint row [[threadgroup_position_in_grid]],
-                                  uint lane [[thread_position_in_threadgroup]]) {
-    if (lane >= head_dim) {
-        return;
-    }
-    const uint t = row / kv_heads;
-    const uint head = row % kv_heads;
-    if (t >= n_tokens) {
-        return;
-    }
-    const uint pos = start_pos + t;
-    const size_t src = ((size_t)t * kv_heads + head) * (size_t)head_dim + lane;
-    const size_t dst = ((size_t)head * (size_t)cap + (size_t)pos) * (size_t)head_dim + lane;
-    if (round_f16 != 0u) {
-        k_cache[dst] = (float)(half)k_src[src];
-        v_cache[dst] = (float)(half)v_src[src];
-    } else {
-        k_cache[dst] = k_src[src];
-        v_cache[dst] = v_src[src];
-    }
-}
-
 /*
  * Batched causal GQA attention: one threadgroup per (token, query head);
  * query token t attends keys 0..=(start_pos + t) — exactly the masking and
  * arithmetic of the single-token kernel per (t, head). Scratch region is
  * (t * heads + head) * cap floats.
- */
-kernel void tm_attention_batch_f32(device const float *q [[buffer(0)]],
-                                   device const float *k_cache [[buffer(1)]],
-                                   device const float *v_cache [[buffer(2)]],
-                                   device float *out [[buffer(3)]],
-                                   device float *scratch [[buffer(4)]],
-                                   constant uint &heads [[buffer(5)]],
-                                   constant uint &n_tokens [[buffer(6)]],
-                                   constant uint &start_pos [[buffer(7)]],
-                                   constant uint &cap [[buffer(8)]],
-                                   constant uint &head_dim [[buffer(9)]],
-                                   constant uint &group [[buffer(10)]],
-                                   constant float &scale [[buffer(11)]],
-                                   uint gid [[threadgroup_position_in_grid]],
-                                   uint tid [[thread_position_in_threadgroup]],
-                                   uint lane [[thread_index_in_simdgroup]],
-                                   uint simd_group [[simdgroup_index_in_threadgroup]]) {
-    threadgroup float reduce_scratch[4];
-    threadgroup float row_stats[2];
-    const uint t = gid / heads;
-    const uint head = gid % heads;
-    if (t >= n_tokens) {
-        return;
-    }
-    const uint pos = start_pos + t;
-    const uint seq = pos + 1u;
-    const uint kv_head = head / group;
-    const device float *qh = q + ((size_t)t * heads + head) * (size_t)head_dim;
-    const device float *kc = k_cache + ((size_t)kv_head * (size_t)cap) * (size_t)head_dim;
-    const device float *vc = v_cache + ((size_t)kv_head * (size_t)cap) * (size_t)head_dim;
-    device float *oh = out + ((size_t)t * heads + head) * (size_t)head_dim;
-    device float *head_scratch = scratch + ((size_t)t * heads + head) * (size_t)cap;
-
-    for (uint j = 0; j < seq; ++j) {
-        float part = 0.0f;
-        for (uint d = tid; d < head_dim; d += 128u) {
-            part += qh[d] * kc[(size_t)j * (size_t)head_dim + d];
-        }
-        const float s = tm_reduce_sum_128(part, reduce_scratch, lane, simd_group) * scale;
-        if (tid == 0u) {
-            head_scratch[j] = s;
-        }
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    float local_max = -INFINITY;
-    for (uint j = tid; j < seq; j += 128u) {
-        local_max = max(local_max, head_scratch[j]);
-    }
-    local_max = simd_max(local_max);
-    if (lane == 0u) {
-        reduce_scratch[simd_group] = local_max;
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    if (tid == 0u) {
-        float m = reduce_scratch[0];
-        for (uint g = 1u; g < 4u; ++g) {
-            m = max(m, reduce_scratch[g]);
-        }
-        row_stats[0] = m;
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    const float row_max = row_stats[0];
-
-    float local_sum = 0.0f;
-    for (uint j = tid; j < seq; j += 128u) {
-        local_sum += exp(head_scratch[j] - row_max);
-    }
-    const float denom = tm_reduce_sum_128(local_sum, reduce_scratch, lane, simd_group);
-    if (tid == 0u) {
-        row_stats[1] = denom;
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    for (uint d = tid; d < head_dim; d += 128u) {
-        float accv = 0.0f;
-        for (uint j = 0; j < seq; ++j) {
-            const float w = exp(head_scratch[j] - row_max) / denom;
-            accv += w * vc[(size_t)j * (size_t)head_dim + d];
-        }
-        oh[d] = accv;
-    }
-}
-
 /* ---------------- Q35-2A: Gated DeltaNet operators ---------------- */
 
 /*
@@ -1176,8 +866,8 @@ kernel void tm_qwen35_q_gate_split(device const float *qg [[buffer(0)]],
  * Partial split-half RoPE (IMRoPE reduced to text positions): rotate only
  * the first `n_rot` dims of each head row, pairs (i, i + n_rot/2), angle
  * pos * inv_freq[i] (inv_freq holds n_rot/2 entries); dims at or beyond
- * n_rot pass through untouched. One threadgroup per head over q then k
- * (like tm_rope_f32).
+ * n_rot pass through untouched; with n_rot == head_dim it is full NeoX
+ * RoPE (dense Qwen3). One threadgroup per head over q then k.
  */
 kernel void tm_qwen35_rope_partial_f32(device float *q [[buffer(0)]],
                                        device float *k [[buffer(1)]],
@@ -1234,14 +924,15 @@ kernel void tm_qwen35_kv_store_f16(device const float *k_src [[buffer(0)]],
  * them (Phase 1C: the per-position barrier and the per-dim recomputation
  * of exp() dominated prefill attention).
  */
-/* One head's causal attention over a packed f16 cache (shared by the
- * per-token and chunk kernels, so both run exactly this code). */
-inline void tm_q35_attend(const device float *qh, const device half *kc, const device half *vc,
+/* One head's causal attention over a packed f16 (or f32) cache, shared by
+ * the per-token and chunk kernels, so both run exactly this code. */
+template <typename C>
+inline void tm_q35_attend(const device float *qh, const device C *kc, const device C *vc,
                           device float *oh, device float *head_scratch, uint seq,
                           uint head_dim, float scale, uint tid, uint lane, uint simd_group,
                           threadgroup float *reduce_scratch, threadgroup float *row_stats) {
     for (uint j = simd_group; j < seq; j += 4u) {
-        const device half *kr = kc + (size_t)j * (size_t)head_dim;
+        const device C *kr = kc + (size_t)j * (size_t)head_dim;
         float part = 0.0f;
         for (uint d = lane; d < head_dim; d += 32u) {
             part += qh[d] * (float)kr[d];
@@ -1324,9 +1015,10 @@ kernel void tm_qwen35_attention_f16(device const float *q [[buffer(0)]],
  * a chunk starting at `pos0` over positions 0..pos0+t, with the same code as
  * the per-token kernel. Every chunk token's K/V must already be stored.
  * Scratch rows are [n, heads, cap]. */
-kernel void tm_qwen35_attention_f16_chunk(device const float *q [[buffer(0)]],
-                                          device const half *k_cache [[buffer(1)]],
-                                          device const half *v_cache [[buffer(2)]],
+template <typename C>
+kernel void tm_qwen35_attention_chunk(device const float *q [[buffer(0)]],
+                                      device const C *k_cache [[buffer(1)]],
+                                      device const C *v_cache [[buffer(2)]],
                                           device float *out [[buffer(3)]],
                                           device float *scratch [[buffer(4)]],
                                           constant uint &pos0 [[buffer(5)]],
@@ -1352,6 +1044,21 @@ kernel void tm_qwen35_attention_f16_chunk(device const float *q [[buffer(0)]],
                   head_dim, scale, tid, lane, simd_group, reduce_scratch, row_stats);
 }
 
+#define TM_ATTN_CHUNK_ARGS(C)                                                               \
+    device const float *q [[buffer(0)]], device const C *k_cache [[buffer(1)]],             \
+        device const C *v_cache [[buffer(2)]], device float *out [[buffer(3)]],             \
+        device float *scratch [[buffer(4)]], constant uint &pos0 [[buffer(5)]],             \
+        constant uint &cap [[buffer(6)]], constant uint &head_dim [[buffer(7)]],            \
+        constant uint &group [[buffer(8)]], constant float &scale [[buffer(9)]],            \
+        constant uint &heads [[buffer(10)]], uint2 tg [[threadgroup_position_in_grid]],     \
+        uint tid [[thread_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]],   \
+        uint simd_group [[simdgroup_index_in_threadgroup]]
+
+template [[host_name("tm_qwen35_attention_f16_chunk")]] kernel void
+tm_qwen35_attention_chunk<half>(TM_ATTN_CHUNK_ARGS(half));
+template [[host_name("tm_qwen35_attention_f32_chunk")]] kernel void
+tm_qwen35_attention_chunk<float>(TM_ATTN_CHUNK_ARGS(float));
+
 /* Grouped-query causal attention for one KV head and one query row: the G
  * query heads that share KV head `tg.x` attend query row `tg.y` of a chunk
  * starting at `pos0` (decode is the n = 1 case, so prefill and decode run
@@ -1367,10 +1074,10 @@ kernel void tm_qwen35_attention_f16_chunk(device const float *q [[buffer(0)]],
  * Scratch rows are [n, heads, cap], as for tm_qwen35_attention_f16_chunk.
  * Summation order differs from tm_q35_attend (tolerance-qualified).
  * Instantiated for the (head_dim, group) pairs in use. */
-template <uint HD, uint G>
+template <uint HD, uint G, typename C>
 kernel void tm_qwen35_attention_gqa(device const float *q [[buffer(0)]],
-                                    device const half *k_cache [[buffer(1)]],
-                                    device const half *v_cache [[buffer(2)]],
+                                    device const C *k_cache [[buffer(1)]],
+                                    device const C *v_cache [[buffer(2)]],
                                     device float *out [[buffer(3)]],
                                     device float *scratch [[buffer(4)]],
                                     constant uint &pos0 [[buffer(5)]],
@@ -1394,8 +1101,8 @@ kernel void tm_qwen35_attention_gqa(device const float *q [[buffer(0)]],
     const uint d0 = lane * EPL;
     const bool active = d0 < HD;
     const size_t row0 = (size_t)t * heads + (size_t)kv_head * G;
-    const device half *kc = k_cache + (size_t)kv_head * (size_t)cap * HD;
-    const device half *vc = v_cache + (size_t)kv_head * (size_t)cap * HD;
+    const device C *kc = k_cache + (size_t)kv_head * (size_t)cap * HD;
+    const device C *vc = v_cache + (size_t)kv_head * (size_t)cap * HD;
 
     float qv[G][EPL];
     for (uint h = 0; h < G; ++h) {
@@ -1472,9 +1179,9 @@ kernel void tm_qwen35_attention_gqa(device const float *q [[buffer(0)]],
     }
 }
 
-#define TM_ATTN_GQA_ARGS                                                                  \
-    device const float *q [[buffer(0)]], device const half *k_cache [[buffer(1)]],          \
-        device const half *v_cache [[buffer(2)]], device float *out [[buffer(3)]],           \
+#define TM_ATTN_GQA_ARGS(C)                                                               \
+    device const float *q [[buffer(0)]], device const C *k_cache [[buffer(1)]],             \
+        device const C *v_cache [[buffer(2)]], device float *out [[buffer(3)]],             \
         device float *scratch [[buffer(4)]], constant uint &pos0 [[buffer(5)]],              \
         constant uint &cap [[buffer(6)]], constant uint &head_dim [[buffer(7)]],             \
         constant uint &group [[buffer(8)]], constant float &scale [[buffer(9)]],             \
@@ -1483,9 +1190,19 @@ kernel void tm_qwen35_attention_gqa(device const float *q [[buffer(0)]],
         uint sg [[simdgroup_index_in_threadgroup]]
 
 template [[host_name("tm_qwen35_attention_gqa_256x4")]] kernel void
-tm_qwen35_attention_gqa<256u, 4u>(TM_ATTN_GQA_ARGS);
+tm_qwen35_attention_gqa<256u, 4u, half>(TM_ATTN_GQA_ARGS(half));
 template [[host_name("tm_qwen35_attention_gqa_16x2")]] kernel void
-tm_qwen35_attention_gqa<16u, 2u>(TM_ATTN_GQA_ARGS);
+tm_qwen35_attention_gqa<16u, 2u, half>(TM_ATTN_GQA_ARGS(half));
+template [[host_name("tm_qwen35_attention_gqa_128x2")]] kernel void
+tm_qwen35_attention_gqa<128u, 2u, half>(TM_ATTN_GQA_ARGS(half));
+template [[host_name("tm_qwen35_attention_gqa_128x4")]] kernel void
+tm_qwen35_attention_gqa<128u, 4u, half>(TM_ATTN_GQA_ARGS(half));
+template [[host_name("tm_qwen35_attention_gqa_f32_16x2")]] kernel void
+tm_qwen35_attention_gqa<16u, 2u, float>(TM_ATTN_GQA_ARGS(float));
+template [[host_name("tm_qwen35_attention_gqa_f32_128x2")]] kernel void
+tm_qwen35_attention_gqa<128u, 2u, float>(TM_ATTN_GQA_ARGS(float));
+template [[host_name("tm_qwen35_attention_gqa_f32_128x4")]] kernel void
+tm_qwen35_attention_gqa<128u, 4u, float>(TM_ATTN_GQA_ARGS(float));
 
 /* attn[i] *= sigmoid(gate[i]) — the joint Q-projection output gate. */
 kernel void tm_qwen35_attn_gate(device float *attn [[buffer(0)]],
@@ -1705,12 +1422,14 @@ kernel void tm_qwen35_rope_partial_chunk(device float *q [[buffer(0)]],
     row[lane + half_rot] = a * s + b * c;
 }
 
-/* Packed f16 KV store of a chunk's rows [n, kv_heads, head_dim] at
- * positions pos0+t (same rounding as tm_qwen35_kv_store_f16). */
-kernel void tm_qwen35_kv_store_f16_chunk(device const float *k_src [[buffer(0)]],
-                                         device const float *v_src [[buffer(1)]],
-                                         device half *k_cache [[buffer(2)]],
-                                         device half *v_cache [[buffer(3)]],
+/* KV store of a chunk's rows [n, kv_heads, head_dim] at positions
+ * pos0+t: packed f16 (same rounding as tm_qwen35_kv_store_f16) or f32
+ * (an exact copy). */
+template <typename C>
+kernel void tm_qwen35_kv_store_chunk(device const float *k_src [[buffer(0)]],
+                                     device const float *v_src [[buffer(1)]],
+                                     device C *k_cache [[buffer(2)]],
+                                     device C *v_cache [[buffer(3)]],
                                          constant uint &pos0 [[buffer(4)]],
                                          constant uint &cap [[buffer(5)]],
                                          constant uint &head_dim [[buffer(6)]],
@@ -1726,9 +1445,21 @@ kernel void tm_qwen35_kv_store_f16_chunk(device const float *k_src [[buffer(0)]]
     const size_t head = rem / head_dim;
     const size_t lane = rem % head_dim;
     const size_t dst = (head * (size_t)cap + (size_t)pos0 + t) * (size_t)head_dim + lane;
-    k_cache[dst] = (half)k_src[gid];
-    v_cache[dst] = (half)v_src[gid];
+    k_cache[dst] = (C)k_src[gid];
+    v_cache[dst] = (C)v_src[gid];
 }
+
+#define TM_KV_CHUNK_ARGS(C)                                                                  \
+    device const float *k_src [[buffer(0)]], device const float *v_src [[buffer(1)]],        \
+        device C *k_cache [[buffer(2)]], device C *v_cache [[buffer(3)]],                     \
+        constant uint &pos0 [[buffer(4)]], constant uint &cap [[buffer(5)]],                  \
+        constant uint &head_dim [[buffer(6)]], constant uint &kv_heads [[buffer(7)]],         \
+        constant uint &n [[buffer(8)]], uint gid [[thread_position_in_grid]]
+
+template [[host_name("tm_qwen35_kv_store_f16_chunk")]] kernel void
+tm_qwen35_kv_store_chunk<half>(TM_KV_CHUNK_ARGS(half));
+template [[host_name("tm_qwen35_kv_store_f32_chunk")]] kernel void
+tm_qwen35_kv_store_chunk<float>(TM_KV_CHUNK_ARGS(float));
 
 /* tm_qwen35_gdn_chunk with the state column held in registers for the
  * whole chunk (read once, written once) instead of re-read from device

@@ -4,7 +4,10 @@
 use super::graph::{
     AttentionSpec, FfnSpec, GatedDeltaNetSpec, LayerSpec, MixerSpec, ModelGraph, Tensor,
 };
+use crate::model::{Qwen3Config, TensorNames};
 use crate::qwen35::{Qwen35AttentionTensors, Qwen35Config, Qwen35Layout};
+use tuckmill_manifest::error::{ErrorCode, Result, TuckmillError};
+use tuckmill_manifest::gguf::GgufInspection;
 
 fn t(r: &crate::qwen35::TensorRef) -> Tensor {
     Tensor { index: r.index }
@@ -95,4 +98,75 @@ pub fn qwen35(cfg: &Qwen35Config, layout: &Qwen35Layout) -> ModelGraph {
             .unwrap_or(t(&layout.token_embd)),
         eos_token_id: cfg.eos_token_id,
     }
+}
+
+/// Dense Qwen3 (`qwen3`): grouped-query attention with per-head Q/K RMS
+/// norms and full NeoX RoPE, no output gate, SwiGLU FFNs; tied head unless
+/// the artifact carries `output`. `names` must already be resolved against
+/// `insp` (every tensor present).
+pub fn qwen3(cfg: &Qwen3Config, names: &TensorNames, insp: &GgufInspection) -> Result<ModelGraph> {
+    if cfg.key_length != cfg.value_length {
+        return Err(TuckmillError::new(
+            ErrorCode::UnsupportedArchitecture,
+            format!(
+                "dense Qwen3 with key length {} != value length {} has no engine block; attention heads are square",
+                cfg.key_length, cfg.value_length
+            ),
+        )
+        .with_action("Use an artifact with equal key and value head sizes; shapes are never approximated."));
+    }
+    let index = |name: &str| -> Result<Tensor> {
+        insp.tensors
+            .iter()
+            .position(|t| t.name == name)
+            .map(|index| Tensor { index })
+            .ok_or_else(|| {
+                TuckmillError::new(
+                    ErrorCode::UnsupportedArchitecture,
+                    format!("artifact is missing required tensor {name:?} for dense Qwen3"),
+                )
+            })
+    };
+    let mut layers = Vec::with_capacity(cfg.layers as usize);
+    for l in 0..cfg.layers as usize {
+        layers.push(LayerSpec {
+            pre_norm: index(&names.attn_norm[l])?,
+            mixer: MixerSpec::Attention(AttentionSpec {
+                q: index(&names.attn_q[l])?,
+                k: index(&names.attn_k[l])?,
+                v: index(&names.attn_v[l])?,
+                o: index(&names.attn_output[l])?,
+                q_norm: Some(index(&names.attn_q_norm[l])?),
+                k_norm: Some(index(&names.attn_k_norm[l])?),
+                heads: cfg.heads as usize,
+                kv_heads: cfg.kv_heads as usize,
+                head_dim: cfg.key_length as usize,
+                rope_dims: cfg.key_length as usize,
+                rope_base: cfg.rope_base,
+                output_gate: false,
+            }),
+            post_norm: index(&names.ffn_norm[l])?,
+            ffn: FfnSpec::SwiGlu {
+                gate: index(&names.ffn_gate[l])?,
+                up: index(&names.ffn_up[l])?,
+                down: index(&names.ffn_down[l])?,
+                width: cfg.ffn as usize,
+            },
+        });
+    }
+    let embedding = index(&names.token_embd)?;
+    Ok(ModelGraph {
+        architecture: "qwen3".to_string(),
+        hidden: cfg.hidden as usize,
+        vocab: cfg.vocab as usize,
+        eps: cfg.rms_eps,
+        embedding,
+        layers,
+        final_norm: index(&names.output_norm)?,
+        head: match &names.output {
+            Some(output) => index(output)?,
+            None => embedding,
+        },
+        eos_token_id: cfg.eos_token_id,
+    })
 }

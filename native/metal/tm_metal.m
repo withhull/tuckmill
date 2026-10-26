@@ -57,6 +57,13 @@ struct tm_metal_ctx {
     id<MTLComputePipelineState> pso_q35_attention_chunk;
     id<MTLComputePipelineState> pso_q35_attention_gqa_256x4;
     id<MTLComputePipelineState> pso_q35_attention_gqa_16x2;
+    id<MTLComputePipelineState> pso_q35_attention_gqa_128x2;
+    id<MTLComputePipelineState> pso_q35_attention_gqa_128x4;
+    id<MTLComputePipelineState> pso_q35_attention_gqa_f32_16x2;
+    id<MTLComputePipelineState> pso_q35_attention_gqa_f32_128x2;
+    id<MTLComputePipelineState> pso_q35_attention_gqa_f32_128x4;
+    id<MTLComputePipelineState> pso_q35_attention_chunk_f32;
+    id<MTLComputePipelineState> pso_q35_kv_store_chunk_f32;
     id<MTLComputePipelineState> pso_f16row_indirect;
     id<MTLComputePipelineState> pso_f16f32;
     id<MTLComputePipelineState> pso_f32f16;
@@ -64,18 +71,11 @@ struct tm_metal_ctx {
     id<MTLComputePipelineState> pso_f16gemv;
     id<MTLComputePipelineState> pso_q8row;
     id<MTLComputePipelineState> pso_rmsnorm;
-    id<MTLComputePipelineState> pso_rope;
-    id<MTLComputePipelineState> pso_kvstore;
-    id<MTLComputePipelineState> pso_attention;
     id<MTLComputePipelineState> pso_silu;
     id<MTLComputePipelineState> pso_f16row;
-    id<MTLComputePipelineState> pso_rmsnorm_f16w;
     id<MTLComputePipelineState> pso_q8gemm;
     id<MTLComputePipelineState> pso_q8gemm_mma;
     id<MTLComputePipelineState> pso_f16gemm;
-    id<MTLComputePipelineState> pso_rope_batch;
-    id<MTLComputePipelineState> pso_kvstore_batch;
-    id<MTLComputePipelineState> pso_attention_batch;
     id<MTLComputePipelineState> pso_q35_conv;
     id<MTLComputePipelineState> pso_q35_conv_shift;
     id<MTLComputePipelineState> pso_q35_l2norm;
@@ -349,6 +349,20 @@ tm_metal_ctx *tm_metal_create(const char *msl_source, char *err, size_t err_cap)
             tm_pipeline(ctx, @"tm_qwen35_attention_gqa_256x4", &error);
         ctx->pso_q35_attention_gqa_16x2 =
             tm_pipeline(ctx, @"tm_qwen35_attention_gqa_16x2", &error);
+        ctx->pso_q35_attention_gqa_128x2 =
+            tm_pipeline(ctx, @"tm_qwen35_attention_gqa_128x2", &error);
+        ctx->pso_q35_attention_gqa_128x4 =
+            tm_pipeline(ctx, @"tm_qwen35_attention_gqa_128x4", &error);
+        ctx->pso_q35_attention_gqa_f32_16x2 =
+            tm_pipeline(ctx, @"tm_qwen35_attention_gqa_f32_16x2", &error);
+        ctx->pso_q35_attention_gqa_f32_128x2 =
+            tm_pipeline(ctx, @"tm_qwen35_attention_gqa_f32_128x2", &error);
+        ctx->pso_q35_attention_gqa_f32_128x4 =
+            tm_pipeline(ctx, @"tm_qwen35_attention_gqa_f32_128x4", &error);
+        ctx->pso_q35_attention_chunk_f32 =
+            tm_pipeline(ctx, @"tm_qwen35_attention_f32_chunk", &error);
+        ctx->pso_q35_kv_store_chunk_f32 =
+            tm_pipeline(ctx, @"tm_qwen35_kv_store_f32_chunk", &error);
         ctx->pso_f16row_indirect = tm_pipeline(ctx, @"tm_f16_row_indirect_f32", &error);
         ctx->pso_f16f32 = tm_pipeline(ctx, @"tm_cast_f16_f32", &error);
         ctx->pso_f32f16 = tm_pipeline(ctx, @"tm_cast_f32_f16", &error);
@@ -356,18 +370,11 @@ tm_metal_ctx *tm_metal_create(const char *msl_source, char *err, size_t err_cap)
         ctx->pso_f16gemv = tm_pipeline(ctx, @"tm_f16_gemv", &error);
         ctx->pso_q8row = tm_pipeline(ctx, @"tm_q8_0_row_f32", &error);
         ctx->pso_rmsnorm = tm_pipeline(ctx, @"tm_rmsnorm_f32", &error);
-        ctx->pso_rope = tm_pipeline(ctx, @"tm_rope_f32", &error);
-        ctx->pso_kvstore = tm_pipeline(ctx, @"tm_kv_store_f32", &error);
-        ctx->pso_attention = tm_pipeline(ctx, @"tm_attention_f32", &error);
         ctx->pso_silu = tm_pipeline(ctx, @"tm_silu_mul_f32", &error);
         ctx->pso_f16row = tm_pipeline(ctx, @"tm_f16_row_f32", &error);
-        ctx->pso_rmsnorm_f16w = tm_pipeline(ctx, @"tm_rmsnorm_f16w", &error);
         ctx->pso_q8gemm = tm_pipeline(ctx, @"tm_q8_0_gemm", &error);
         ctx->pso_q8gemm_mma = tm_pipeline(ctx, @"tm_q8_0_gemm_mma", &error);
         ctx->pso_f16gemm = tm_pipeline(ctx, @"tm_f16_gemm", &error);
-        ctx->pso_rope_batch = tm_pipeline(ctx, @"tm_rope_batch_f32", &error);
-        ctx->pso_kvstore_batch = tm_pipeline(ctx, @"tm_kv_store_batch_f32", &error);
-        ctx->pso_attention_batch = tm_pipeline(ctx, @"tm_attention_batch_f32", &error);
         ctx->pso_q35_conv = tm_pipeline(ctx, @"tm_qwen35_conv_step", &error);
         ctx->pso_q35_conv_shift = tm_pipeline(ctx, @"tm_qwen35_conv_shift", &error);
         ctx->pso_q35_l2norm = tm_pipeline(ctx, @"tm_qwen35_l2norm_heads", &error);
@@ -390,14 +397,15 @@ tm_metal_ctx *tm_metal_create(const char *msl_source, char *err, size_t err_cap)
             ctx->pso_q35_rope_chunk == nil ||
             ctx->pso_q35_kv_store_chunk == nil || ctx->pso_q35_attention_chunk == nil ||
             ctx->pso_q35_attention_gqa_256x4 == nil || ctx->pso_q35_attention_gqa_16x2 == nil ||
+            ctx->pso_q35_attention_gqa_128x2 == nil || ctx->pso_q35_attention_gqa_128x4 == nil ||
+            ctx->pso_q35_attention_gqa_f32_16x2 == nil ||
+            ctx->pso_q35_attention_gqa_f32_128x2 == nil ||
+            ctx->pso_q35_attention_gqa_f32_128x4 == nil ||
+            ctx->pso_q35_attention_chunk_f32 == nil || ctx->pso_q35_kv_store_chunk_f32 == nil ||
             ctx->pso_f16f32 == nil ||
             ctx->pso_f32f16 == nil || ctx->pso_q8gemv == nil || ctx->pso_f16gemv == nil ||
-            ctx->pso_q8row == nil || ctx->pso_rmsnorm == nil || ctx->pso_rope == nil ||
-            ctx->pso_kvstore == nil || ctx->pso_attention == nil || ctx->pso_silu == nil ||
-            ctx->pso_f16row == nil || ctx->pso_rmsnorm_f16w == nil ||
-            ctx->pso_q8gemm == nil || ctx->pso_q8gemm_mma == nil || ctx->pso_f16gemm == nil ||
-            ctx->pso_rope_batch == nil || ctx->pso_kvstore_batch == nil ||
-            ctx->pso_attention_batch == nil ||
+            ctx->pso_q8row == nil || ctx->pso_rmsnorm == nil || ctx->pso_silu == nil ||
+            ctx->pso_f16row == nil || ctx->pso_q8gemm == nil || ctx->pso_q8gemm_mma == nil || ctx->pso_f16gemm == nil ||
             ctx->pso_q35_conv == nil || ctx->pso_q35_conv_shift == nil ||
             ctx->pso_q35_l2norm == nil || ctx->pso_q35_beta_decay == nil ||
             ctx->pso_q35_gdn_step == nil || ctx->pso_q35_gated_norm == nil ||
@@ -450,18 +458,11 @@ void tm_metal_destroy(tm_metal_ctx *ctx) {
             fprintf(stderr, "tm_metal: %llu bytes still allocated at destroy; buffer lifetime bug\n",
                     (unsigned long long)still_allocated);
         }
-        [ctx->pso_attention_batch release];
-        [ctx->pso_kvstore_batch release];
-        [ctx->pso_rope_batch release];
         [ctx->pso_f16gemm release];
         [ctx->pso_q8gemm release];
         [ctx->pso_q8gemm_mma release];
-        [ctx->pso_rmsnorm_f16w release];
         [ctx->pso_f16row release];
         [ctx->pso_silu release];
-        [ctx->pso_attention release];
-        [ctx->pso_kvstore release];
-        [ctx->pso_rope release];
         [ctx->pso_rmsnorm release];
         [ctx->pso_q8row release];
         [ctx->pso_f16gemv release];
@@ -484,6 +485,13 @@ void tm_metal_destroy(tm_metal_ctx *ctx) {
         [ctx->pso_q35_attention_chunk release];
         [ctx->pso_q35_attention_gqa_256x4 release];
         [ctx->pso_q35_attention_gqa_16x2 release];
+        [ctx->pso_q35_attention_gqa_128x2 release];
+        [ctx->pso_q35_attention_gqa_128x4 release];
+        [ctx->pso_q35_attention_gqa_f32_16x2 release];
+        [ctx->pso_q35_attention_gqa_f32_128x2 release];
+        [ctx->pso_q35_attention_gqa_f32_128x4 release];
+        [ctx->pso_q35_attention_chunk_f32 release];
+        [ctx->pso_q35_kv_store_chunk_f32 release];
         [ctx->pso_f16row_indirect release];
         [ctx->pso_scale release];
         [ctx->library release];
@@ -1130,144 +1138,6 @@ int tm_metal_rmsnorm_f32(tm_metal_ctx *ctx, tm_metal_buffer *x, tm_metal_buffer 
                                err, err_cap, "rmsnorm");
 }
 
-int tm_metal_rope_f32(tm_metal_ctx *ctx, tm_metal_buffer *q, tm_metal_buffer *k,
-                      tm_metal_buffer *inv_freq, uint32_t pos, uint32_t n_q_heads,
-                      uint32_t n_kv_heads, uint32_t head_dim, char *err, size_t err_cap) {
-    if (tm_check_ctx(ctx, err, err_cap, "rope") != TM_METAL_OK) {
-        return TM_METAL_ERR_UNSUPPORTED;
-    }
-    if (head_dim == 0 || (head_dim % 2u) != 0u || n_q_heads == 0) {
-        return tm_fail(err, err_cap, TM_METAL_ERR_UNSUPPORTED, @"rope: shape");
-    }
-    size_t q_need = (size_t)n_q_heads * (size_t)head_dim * 4u;
-    size_t k_need = (size_t)n_kv_heads * (size_t)head_dim * 4u;
-    if (tm_check_buffer(ctx, q, q_need, err, err_cap, "rope.q") != TM_METAL_OK ||
-        tm_check_buffer(ctx, k, k_need, err, err_cap, "rope.k") != TM_METAL_OK ||
-        tm_check_buffer(ctx, inv_freq, (size_t)(head_dim / 2u) * 4u, err, err_cap, "rope.inv_freq") != TM_METAL_OK) {
-        return TM_METAL_ERR_BOUNDS;
-    }
-    @autoreleasepool {
-        tm_frame f;
-        id<MTLComputeCommandEncoder> enc = tm_frame_open(ctx, &f);
-        if (enc == nil) {
-            return tm_fail(err, err_cap, TM_METAL_ERR_INTERNAL, @"rope: no encoder");
-        }
-        [enc setComputePipelineState:ctx->pso_rope];
-        [enc setBuffer:q->buffer offset:0 atIndex:0];
-        [enc setBuffer:k->buffer offset:0 atIndex:1];
-        [enc setBuffer:inv_freq->buffer offset:0 atIndex:2];
-        [f.keep addObject:q->buffer];
-        [f.keep addObject:k->buffer];
-        [f.keep addObject:inv_freq->buffer];
-        [enc setBytes:&pos length:sizeof(pos) atIndex:3];
-        [enc setBytes:&n_q_heads length:sizeof(n_q_heads) atIndex:4];
-        [enc setBytes:&n_kv_heads length:sizeof(n_kv_heads) atIndex:5];
-        [enc setBytes:&head_dim length:sizeof(head_dim) atIndex:6];
-        [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)(n_q_heads + n_kv_heads), 1, 1)
-            threadsPerThreadgroup:MTLSizeMake(head_dim / 2u, 1, 1)];
-        return tm_frame_commit(ctx, &f, err, err_cap, "rope");
-    }
-}
-
-int tm_metal_kv_store_f32(tm_metal_ctx *ctx, tm_metal_buffer *k_src, tm_metal_buffer *v_src,
-                          tm_metal_buffer *k_cache, tm_metal_buffer *v_cache,
-                          uint32_t kv_heads, uint32_t pos, uint32_t cap, uint32_t head_dim,
-                          uint32_t round_f16, char *err, size_t err_cap) {
-    if (tm_check_ctx(ctx, err, err_cap, "kv_store") != TM_METAL_OK) {
-        return TM_METAL_ERR_UNSUPPORTED;
-    }
-    if (pos >= cap || head_dim == 0) {
-        return tm_fail(err, err_cap, TM_METAL_ERR_BOUNDS,
-                       [NSString stringWithFormat:@"kv_store: pos %u, cap %u", pos, cap]);
-    }
-    size_t src_need = (size_t)kv_heads * (size_t)head_dim * 4u;
-    size_t cache_need = (size_t)kv_heads * (size_t)cap * (size_t)head_dim * 4u;
-    if (tm_check_buffer(ctx, k_src, src_need, err, err_cap, "kv_store.k_src") != TM_METAL_OK ||
-        tm_check_buffer(ctx, v_src, src_need, err, err_cap, "kv_store.v_src") != TM_METAL_OK ||
-        tm_check_buffer(ctx, k_cache, cache_need, err, err_cap, "kv_store.k_cache") != TM_METAL_OK ||
-        tm_check_buffer(ctx, v_cache, cache_need, err, err_cap, "kv_store.v_cache") != TM_METAL_OK) {
-        return TM_METAL_ERR_BOUNDS;
-    }
-    @autoreleasepool {
-        tm_frame f;
-        id<MTLComputeCommandEncoder> enc = tm_frame_open(ctx, &f);
-        if (enc == nil) {
-            return tm_fail(err, err_cap, TM_METAL_ERR_INTERNAL, @"kv_store: no encoder");
-        }
-        [enc setComputePipelineState:ctx->pso_kvstore];
-        [enc setBuffer:k_src->buffer offset:0 atIndex:0];
-        [enc setBuffer:v_src->buffer offset:0 atIndex:1];
-        [enc setBuffer:k_cache->buffer offset:0 atIndex:2];
-        [enc setBuffer:v_cache->buffer offset:0 atIndex:3];
-        [f.keep addObject:k_src->buffer];
-        [f.keep addObject:v_src->buffer];
-        [f.keep addObject:k_cache->buffer];
-        [f.keep addObject:v_cache->buffer];
-        [enc setBytes:&pos length:sizeof(pos) atIndex:4];
-        [enc setBytes:&cap length:sizeof(cap) atIndex:5];
-        [enc setBytes:&head_dim length:sizeof(head_dim) atIndex:6];
-        [enc setBytes:&round_f16 length:sizeof(round_f16) atIndex:7];
-        [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)kv_heads, 1, 1)
-            threadsPerThreadgroup:MTLSizeMake((NSUInteger)head_dim, 1, 1)];
-        return tm_frame_commit(ctx, &f, err, err_cap, "kv_store");
-    }
-}
-
-int tm_metal_attention_f32(tm_metal_ctx *ctx, tm_metal_buffer *q, tm_metal_buffer *k_cache,
-                           tm_metal_buffer *v_cache, tm_metal_buffer *out,
-                           tm_metal_buffer *scratch, uint32_t heads, uint32_t pos,
-                           uint32_t cap, uint32_t head_dim, uint32_t group, float scale,
-                           char *err, size_t err_cap) {
-    if (tm_check_ctx(ctx, err, err_cap, "attention") != TM_METAL_OK) {
-        return TM_METAL_ERR_UNSUPPORTED;
-    }
-    if (heads == 0 || group == 0 || pos >= cap || head_dim == 0) {
-        return tm_fail(err, err_cap, TM_METAL_ERR_BOUNDS,
-                       [NSString stringWithFormat:@"attention: heads %u, group %u, pos %u, cap %u",
-                                                  heads, group, pos, cap]);
-    }
-    uint32_t kv_heads = heads / group;
-    if (kv_heads * group != heads) {
-        return tm_fail(err, err_cap, TM_METAL_ERR_UNSUPPORTED, @"attention: heads not divisible by group");
-    }
-    size_t q_need = (size_t)heads * (size_t)head_dim * 4u;
-    size_t cache_need = (size_t)kv_heads * (size_t)cap * (size_t)head_dim * 4u;
-    size_t scratch_need = (size_t)heads * (size_t)cap * 4u;
-    if (tm_check_buffer(ctx, q, q_need, err, err_cap, "attention.q") != TM_METAL_OK ||
-        tm_check_buffer(ctx, k_cache, cache_need, err, err_cap, "attention.k_cache") != TM_METAL_OK ||
-        tm_check_buffer(ctx, v_cache, cache_need, err, err_cap, "attention.v_cache") != TM_METAL_OK ||
-        tm_check_buffer(ctx, out, q_need, err, err_cap, "attention.out") != TM_METAL_OK ||
-        tm_check_buffer(ctx, scratch, scratch_need, err, err_cap, "attention.scratch") != TM_METAL_OK) {
-        return TM_METAL_ERR_BOUNDS;
-    }
-    @autoreleasepool {
-        tm_frame f;
-        id<MTLComputeCommandEncoder> enc = tm_frame_open(ctx, &f);
-        if (enc == nil) {
-            return tm_fail(err, err_cap, TM_METAL_ERR_INTERNAL, @"attention: no encoder");
-        }
-        [enc setComputePipelineState:ctx->pso_attention];
-        [enc setBuffer:q->buffer offset:0 atIndex:0];
-        [enc setBuffer:k_cache->buffer offset:0 atIndex:1];
-        [enc setBuffer:v_cache->buffer offset:0 atIndex:2];
-        [enc setBuffer:out->buffer offset:0 atIndex:3];
-        [enc setBuffer:scratch->buffer offset:0 atIndex:4];
-        [f.keep addObject:q->buffer];
-        [f.keep addObject:k_cache->buffer];
-        [f.keep addObject:v_cache->buffer];
-        [f.keep addObject:out->buffer];
-        [f.keep addObject:scratch->buffer];
-        [enc setBytes:&pos length:sizeof(pos) atIndex:5];
-        [enc setBytes:&cap length:sizeof(cap) atIndex:6];
-        [enc setBytes:&head_dim length:sizeof(head_dim) atIndex:7];
-        [enc setBytes:&group length:sizeof(group) atIndex:8];
-        [enc setBytes:&scale length:sizeof(scale) atIndex:9];
-        [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)heads, 1, 1)
-            threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
-        return tm_frame_commit(ctx, &f, err, err_cap, "attention");
-    }
-}
-
 int tm_metal_silu_mul_f32(tm_metal_ctx *ctx, tm_metal_buffer *gate, tm_metal_buffer *up,
                           tm_metal_buffer *out, uint32_t n, char *err, size_t err_cap) {
     if (tm_check_ctx(ctx, err, err_cap, "silu_mul") != TM_METAL_OK) {
@@ -1302,13 +1172,6 @@ int tm_metal_silu_mul_f32(tm_metal_ctx *ctx, tm_metal_buffer *gate, tm_metal_buf
             threadsPerThreadgroup:MTLSizeMake(tg, 1, 1)];
         return tm_frame_commit(ctx, &f, err, err_cap, "silu_mul");
     }
-}
-
-int tm_metal_rmsnorm_f16w(tm_metal_ctx *ctx, tm_metal_buffer *x, tm_metal_buffer *weight,
-                          tm_metal_buffer *y, uint32_t rows, uint32_t cols, float eps,
-                          char *err, size_t err_cap) {
-    return tm_rmsnorm_dispatch(ctx, ctx->pso_rmsnorm_f16w, x, weight, y, rows, cols, eps, 2,
-                               err, err_cap, "rmsnorm_f16w");
 }
 
 int tm_metal_f16_row_f32(tm_metal_ctx *ctx, tm_metal_buffer *w, tm_metal_buffer *out,
@@ -1448,149 +1311,6 @@ int tm_metal_f16_gemm(tm_metal_ctx *ctx, tm_metal_buffer *w, tm_metal_buffer *x,
     size_t w_need = (size_t)rows * (size_t)cols * 2u;
     return tm_gemm_dispatch(ctx, ctx->pso_f16gemm, w, w_need, x, y, rows, cols, batch, x_off,
                             y_off, err, err_cap, "f16_gemm");
-}
-
-int tm_metal_rope_batch_f32(tm_metal_ctx *ctx, tm_metal_buffer *q, tm_metal_buffer *k,
-                            tm_metal_buffer *inv_freq, uint32_t start_pos, uint32_t n_tokens,
-                            uint32_t n_q_heads, uint32_t n_kv_heads, uint32_t head_dim,
-                            char *err, size_t err_cap) {
-    if (tm_check_ctx(ctx, err, err_cap, "rope_batch") != TM_METAL_OK) {
-        return TM_METAL_ERR_UNSUPPORTED;
-    }
-    if (head_dim == 0 || (head_dim % 2u) != 0u || n_tokens == 0 || n_q_heads == 0) {
-        return tm_fail(err, err_cap, TM_METAL_ERR_UNSUPPORTED, @"rope_batch: shape");
-    }
-    size_t q_need = (size_t)n_tokens * n_q_heads * head_dim * 4u;
-    size_t k_need = (size_t)n_tokens * n_kv_heads * head_dim * 4u;
-    if (tm_check_buffer(ctx, q, q_need, err, err_cap, "rope_batch.q") != TM_METAL_OK ||
-        tm_check_buffer(ctx, k, k_need, err, err_cap, "rope_batch.k") != TM_METAL_OK ||
-        tm_check_buffer(ctx, inv_freq, (size_t)(head_dim / 2u) * 4u, err, err_cap, "rope_batch.inv_freq") != TM_METAL_OK) {
-        return TM_METAL_ERR_BOUNDS;
-    }
-    @autoreleasepool {
-        tm_frame f;
-        id<MTLComputeCommandEncoder> enc = tm_frame_open(ctx, &f);
-        if (enc == nil) {
-            return tm_fail(err, err_cap, TM_METAL_ERR_INTERNAL, @"rope_batch: no encoder");
-        }
-        [enc setComputePipelineState:ctx->pso_rope_batch];
-        [enc setBuffer:q->buffer offset:0 atIndex:0];
-        [enc setBuffer:k->buffer offset:0 atIndex:1];
-        [enc setBuffer:inv_freq->buffer offset:0 atIndex:2];
-        [f.keep addObject:q->buffer];
-        [f.keep addObject:k->buffer];
-        [f.keep addObject:inv_freq->buffer];
-        [enc setBytes:&start_pos length:sizeof(start_pos) atIndex:3];
-        [enc setBytes:&n_tokens length:sizeof(n_tokens) atIndex:4];
-        [enc setBytes:&n_q_heads length:sizeof(n_q_heads) atIndex:5];
-        [enc setBytes:&n_kv_heads length:sizeof(n_kv_heads) atIndex:6];
-        [enc setBytes:&head_dim length:sizeof(head_dim) atIndex:7];
-        [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)n_tokens * (n_q_heads + n_kv_heads), 1, 1)
-            threadsPerThreadgroup:MTLSizeMake(head_dim / 2u, 1, 1)];
-        return tm_frame_commit(ctx, &f, err, err_cap, "rope_batch");
-    }
-}
-
-int tm_metal_kv_store_batch_f32(tm_metal_ctx *ctx, tm_metal_buffer *k_src, tm_metal_buffer *v_src,
-                                tm_metal_buffer *k_cache, tm_metal_buffer *v_cache,
-                                uint32_t n_tokens, uint32_t start_pos, uint32_t cap,
-                                uint32_t head_dim, uint32_t kv_heads, uint32_t round_f16,
-                                char *err, size_t err_cap) {
-    if (tm_check_ctx(ctx, err, err_cap, "kv_store_batch") != TM_METAL_OK) {
-        return TM_METAL_ERR_UNSUPPORTED;
-    }
-    if (n_tokens == 0 || start_pos + n_tokens > cap || head_dim == 0) {
-        return tm_fail(err, err_cap, TM_METAL_ERR_BOUNDS, @"kv_store_batch: range");
-    }
-    size_t src_need = (size_t)n_tokens * kv_heads * head_dim * 4u;
-    size_t cache_need = (size_t)kv_heads * cap * head_dim * 4u;
-    if (tm_check_buffer(ctx, k_src, src_need, err, err_cap, "kv_store_batch.k_src") != TM_METAL_OK ||
-        tm_check_buffer(ctx, v_src, src_need, err, err_cap, "kv_store_batch.v_src") != TM_METAL_OK ||
-        tm_check_buffer(ctx, k_cache, cache_need, err, err_cap, "kv_store_batch.k_cache") != TM_METAL_OK ||
-        tm_check_buffer(ctx, v_cache, cache_need, err, err_cap, "kv_store_batch.v_cache") != TM_METAL_OK) {
-        return TM_METAL_ERR_BOUNDS;
-    }
-    @autoreleasepool {
-        tm_frame f;
-        id<MTLComputeCommandEncoder> enc = tm_frame_open(ctx, &f);
-        if (enc == nil) {
-            return tm_fail(err, err_cap, TM_METAL_ERR_INTERNAL, @"kv_store_batch: no encoder");
-        }
-        [enc setComputePipelineState:ctx->pso_kvstore_batch];
-        [enc setBuffer:k_src->buffer offset:0 atIndex:0];
-        [enc setBuffer:v_src->buffer offset:0 atIndex:1];
-        [enc setBuffer:k_cache->buffer offset:0 atIndex:2];
-        [enc setBuffer:v_cache->buffer offset:0 atIndex:3];
-        [f.keep addObject:k_src->buffer];
-        [f.keep addObject:v_src->buffer];
-        [f.keep addObject:k_cache->buffer];
-        [f.keep addObject:v_cache->buffer];
-        [enc setBytes:&n_tokens length:sizeof(n_tokens) atIndex:4];
-        [enc setBytes:&start_pos length:sizeof(start_pos) atIndex:5];
-        [enc setBytes:&cap length:sizeof(cap) atIndex:6];
-        [enc setBytes:&head_dim length:sizeof(head_dim) atIndex:7];
-        [enc setBytes:&kv_heads length:sizeof(kv_heads) atIndex:8];
-        [enc setBytes:&round_f16 length:sizeof(round_f16) atIndex:9];
-        [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)n_tokens * kv_heads, 1, 1)
-            threadsPerThreadgroup:MTLSizeMake((NSUInteger)head_dim, 1, 1)];
-        return tm_frame_commit(ctx, &f, err, err_cap, "kv_store_batch");
-    }
-}
-
-int tm_metal_attention_batch_f32(tm_metal_ctx *ctx, tm_metal_buffer *q, tm_metal_buffer *k_cache,
-                                 tm_metal_buffer *v_cache, tm_metal_buffer *out,
-                                 tm_metal_buffer *scratch, uint32_t heads, uint32_t n_tokens,
-                                 uint32_t start_pos, uint32_t cap, uint32_t head_dim,
-                                 uint32_t group, float scale, char *err, size_t err_cap) {
-    if (tm_check_ctx(ctx, err, err_cap, "attention_batch") != TM_METAL_OK) {
-        return TM_METAL_ERR_UNSUPPORTED;
-    }
-    if (heads == 0 || group == 0 || n_tokens == 0 || head_dim == 0 ||
-        start_pos + n_tokens > cap) {
-        return tm_fail(err, err_cap, TM_METAL_ERR_BOUNDS, @"attention_batch: shape");
-    }
-    uint32_t kv_heads = heads / group;
-    if (kv_heads * group != heads) {
-        return tm_fail(err, err_cap, TM_METAL_ERR_UNSUPPORTED, @"attention_batch: heads/group");
-    }
-    size_t q_need = (size_t)n_tokens * heads * head_dim * 4u;
-    size_t cache_need = (size_t)kv_heads * cap * head_dim * 4u;
-    size_t scratch_need = (size_t)n_tokens * heads * cap * 4u;
-    if (tm_check_buffer(ctx, q, q_need, err, err_cap, "attention_batch.q") != TM_METAL_OK ||
-        tm_check_buffer(ctx, k_cache, cache_need, err, err_cap, "attention_batch.k_cache") != TM_METAL_OK ||
-        tm_check_buffer(ctx, v_cache, cache_need, err, err_cap, "attention_batch.v_cache") != TM_METAL_OK ||
-        tm_check_buffer(ctx, out, q_need, err, err_cap, "attention_batch.out") != TM_METAL_OK ||
-        tm_check_buffer(ctx, scratch, scratch_need, err, err_cap, "attention_batch.scratch") != TM_METAL_OK) {
-        return TM_METAL_ERR_BOUNDS;
-    }
-    @autoreleasepool {
-        tm_frame f;
-        id<MTLComputeCommandEncoder> enc = tm_frame_open(ctx, &f);
-        if (enc == nil) {
-            return tm_fail(err, err_cap, TM_METAL_ERR_INTERNAL, @"attention_batch: no encoder");
-        }
-        [enc setComputePipelineState:ctx->pso_attention_batch];
-        [enc setBuffer:q->buffer offset:0 atIndex:0];
-        [enc setBuffer:k_cache->buffer offset:0 atIndex:1];
-        [enc setBuffer:v_cache->buffer offset:0 atIndex:2];
-        [enc setBuffer:out->buffer offset:0 atIndex:3];
-        [enc setBuffer:scratch->buffer offset:0 atIndex:4];
-        [f.keep addObject:q->buffer];
-        [f.keep addObject:k_cache->buffer];
-        [f.keep addObject:v_cache->buffer];
-        [f.keep addObject:out->buffer];
-        [f.keep addObject:scratch->buffer];
-        [enc setBytes:&heads length:sizeof(heads) atIndex:5];
-        [enc setBytes:&n_tokens length:sizeof(n_tokens) atIndex:6];
-        [enc setBytes:&start_pos length:sizeof(start_pos) atIndex:7];
-        [enc setBytes:&cap length:sizeof(cap) atIndex:8];
-        [enc setBytes:&head_dim length:sizeof(head_dim) atIndex:9];
-        [enc setBytes:&group length:sizeof(group) atIndex:10];
-        [enc setBytes:&scale length:sizeof(scale) atIndex:11];
-        [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)n_tokens * heads, 1, 1)
-            threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
-        return tm_frame_commit(ctx, &f, err, err_cap, "attention_batch");
-    }
 }
 
 int tm_metal_fence(tm_metal_ctx *ctx, char *err, size_t err_cap) {
@@ -2050,7 +1770,7 @@ int tm_metal_qwen35_kv_store_f16(tm_metal_ctx *ctx, tm_metal_buffer *k_src, tm_m
 }
 
 static id<MTLComputePipelineState> tm_attention_gqa_pso(tm_metal_ctx *ctx, uint32_t head_dim,
-                                                        uint32_t group);
+                                                        uint32_t group, int f32_cache);
 
 int tm_metal_qwen35_attention_f16(tm_metal_ctx *ctx, tm_metal_buffer *q, tm_metal_buffer *k_cache,
                                   tm_metal_buffer *v_cache, tm_metal_buffer *out,
@@ -2065,7 +1785,7 @@ int tm_metal_qwen35_attention_f16(tm_metal_ctx *ctx, tm_metal_buffer *q, tm_meta
     }
     /* One query row through the grouped chunk kernel, so decode and
      * chunked prefill share one compiled kernel (bit-identical). */
-    if (tm_attention_gqa_pso(ctx, head_dim, group) != nil) {
+    if (tm_attention_gqa_pso(ctx, head_dim, group, 0) != nil) {
         return tm_metal_qwen35_attention_f16_chunk(ctx, q, k_cache, v_cache, out, scratch, heads,
                                                    pos, cap, head_dim, group, scale, 1u, err,
                                                    err_cap);
@@ -2429,53 +2149,94 @@ int tm_metal_qwen35_rope_partial_chunk(tm_metal_ctx *ctx, tm_metal_buffer *q, tm
                             MTLSizeMake(128, 1, 1), err, err_cap, "qwen35_rope_partial_chunk");
 }
 
-int tm_metal_qwen35_kv_store_f16_chunk(tm_metal_ctx *ctx, tm_metal_buffer *k_src,
-                                       tm_metal_buffer *v_src, tm_metal_buffer *k_cache,
-                                       tm_metal_buffer *v_cache, uint32_t pos0, uint32_t cap,
-                                       uint32_t head_dim, uint32_t kv_heads, uint32_t n, char *err,
-                                       size_t err_cap) {
+/* KV store of a chunk into a packed f16 (f32_cache 0) or f32 (1) cache. */
+static int tm_kv_store_chunk(tm_metal_ctx *ctx, tm_metal_buffer *k_src, tm_metal_buffer *v_src,
+                             tm_metal_buffer *k_cache, tm_metal_buffer *v_cache, uint32_t pos0,
+                             uint32_t cap, uint32_t head_dim, uint32_t kv_heads, uint32_t n,
+                             int f32_cache, char *err, size_t err_cap, const char *what) {
     if (n == 0 || head_dim == 0 || kv_heads == 0 || (uint64_t)pos0 + n > cap) {
         return tm_fail(err, err_cap, TM_METAL_ERR_BOUNDS,
-                       @"qwen35_kv_store_f16_chunk: positions beyond the cache capacity");
+                       [NSString stringWithFormat:@"%s: positions beyond the cache capacity", what]);
     }
     size_t rows = (size_t)n * kv_heads * head_dim * 4u;
-    size_t plane = (size_t)kv_heads * cap * head_dim * 2u;
+    size_t plane = (size_t)kv_heads * cap * head_dim * (f32_cache ? 4u : 2u);
     tm_arg_buffer bufs[4] = {
         {k_src, rows, "kv_chunk.k"}, {v_src, rows, "kv_chunk.v"},
         {k_cache, plane, "kv_chunk.k_cache"}, {v_cache, plane, "kv_chunk.v_cache"},
     };
     uint32_t consts[5] = {pos0, cap, head_dim, kv_heads, n};
-    return tm_dispatch_args(ctx, ctx->pso_q35_kv_store_chunk, bufs, 4, consts, 5,
+    return tm_dispatch_args(ctx,
+                            f32_cache ? ctx->pso_q35_kv_store_chunk_f32
+                                      : ctx->pso_q35_kv_store_chunk,
+                            bufs, 4, consts, 5,
                             MTLSizeMake((NSUInteger)n * kv_heads * head_dim, 1, 1),
-                            MTLSizeMake(128, 1, 1), err, err_cap, "qwen35_kv_store_f16_chunk");
+                            MTLSizeMake(128, 1, 1), err, err_cap, what);
 }
 
-/* The grouped attention instance for this geometry, or nil. */
+int tm_metal_qwen35_kv_store_f16_chunk(tm_metal_ctx *ctx, tm_metal_buffer *k_src,
+                                       tm_metal_buffer *v_src, tm_metal_buffer *k_cache,
+                                       tm_metal_buffer *v_cache, uint32_t pos0, uint32_t cap,
+                                       uint32_t head_dim, uint32_t kv_heads, uint32_t n, char *err,
+                                       size_t err_cap) {
+    return tm_kv_store_chunk(ctx, k_src, v_src, k_cache, v_cache, pos0, cap, head_dim, kv_heads,
+                             n, 0, err, err_cap, "qwen35_kv_store_f16_chunk");
+}
+
+int tm_metal_qwen35_kv_store_f32_chunk(tm_metal_ctx *ctx, tm_metal_buffer *k_src,
+                                       tm_metal_buffer *v_src, tm_metal_buffer *k_cache,
+                                       tm_metal_buffer *v_cache, uint32_t pos0, uint32_t cap,
+                                       uint32_t head_dim, uint32_t kv_heads, uint32_t n, char *err,
+                                       size_t err_cap) {
+    return tm_kv_store_chunk(ctx, k_src, v_src, k_cache, v_cache, pos0, cap, head_dim, kv_heads,
+                             n, 1, err, err_cap, "qwen35_kv_store_f32_chunk");
+}
+
+/* The grouped attention instance for this geometry and cache type, or
+ * nil (the generic chunk kernel then runs). */
 static id<MTLComputePipelineState> tm_attention_gqa_pso(tm_metal_ctx *ctx, uint32_t head_dim,
-                                                        uint32_t group) {
+                                                        uint32_t group, int f32_cache) {
+    if (f32_cache) {
+        if (head_dim == 16u && group == 2u) {
+            return ctx->pso_q35_attention_gqa_f32_16x2;
+        }
+        if (head_dim == 128u && group == 2u) {
+            return ctx->pso_q35_attention_gqa_f32_128x2;
+        }
+        if (head_dim == 128u && group == 4u) {
+            return ctx->pso_q35_attention_gqa_f32_128x4;
+        }
+        return nil;
+    }
     if (head_dim == 256u && group == 4u) {
         return ctx->pso_q35_attention_gqa_256x4;
     }
     if (head_dim == 16u && group == 2u) {
         return ctx->pso_q35_attention_gqa_16x2;
     }
+    if (head_dim == 128u && group == 2u) {
+        return ctx->pso_q35_attention_gqa_128x2;
+    }
+    if (head_dim == 128u && group == 4u) {
+        return ctx->pso_q35_attention_gqa_128x4;
+    }
     return nil;
 }
 
-int tm_metal_qwen35_attention_f16_chunk(tm_metal_ctx *ctx, tm_metal_buffer *q,
-                                        tm_metal_buffer *k_cache, tm_metal_buffer *v_cache,
-                                        tm_metal_buffer *out, tm_metal_buffer *scratch,
-                                        uint32_t heads, uint32_t pos0, uint32_t cap,
-                                        uint32_t head_dim, uint32_t group, float scale, uint32_t n,
-                                        char *err, size_t err_cap) {
+/* Chunk attention over a packed f16 (f32_cache 0) or f32 (1) cache. */
+static int tm_attention_chunk(tm_metal_ctx *ctx, tm_metal_buffer *q, tm_metal_buffer *k_cache,
+                              tm_metal_buffer *v_cache, tm_metal_buffer *out,
+                              tm_metal_buffer *scratch, uint32_t heads, uint32_t pos0,
+                              uint32_t cap, uint32_t head_dim, uint32_t group, float scale,
+                              uint32_t n, int f32_cache, char *err, size_t err_cap,
+                              const char *what) {
     if (n == 0 || heads == 0 || head_dim == 0 || group == 0 || (heads % group) != 0u ||
         (uint64_t)pos0 + n > cap) {
         return tm_fail(err, err_cap, TM_METAL_ERR_UNSUPPORTED,
-                       @"qwen35_attention_f16_chunk: invalid geometry or positions");
+                       [NSString stringWithFormat:@"%s: invalid geometry or positions", what]);
     }
     uint32_t kv_heads = heads / group;
     size_t rows = (size_t)n * heads * head_dim * 4u;
-    size_t plane = (size_t)kv_heads * cap * head_dim * 2u;
+    size_t plane = (size_t)kv_heads * cap * head_dim * (f32_cache ? 4u : 2u);
     tm_arg_buffer bufs[5] = {
         {q, rows, "attn_chunk.q"}, {k_cache, plane, "attn_chunk.k_cache"},
         {v_cache, plane, "attn_chunk.v_cache"}, {out, rows, "attn_chunk.out"},
@@ -2486,16 +2247,39 @@ int tm_metal_qwen35_attention_f16_chunk(tm_metal_ctx *ctx, tm_metal_buffer *q,
     uint32_t consts[6] = {pos0, cap, head_dim, group, scale_bits, heads};
     /* Grouped kernel (one threadgroup per KV head and row) when the
      * geometry has an instantiation; decode routes here too (n = 1). */
-    id<MTLComputePipelineState> gqa = tm_attention_gqa_pso(ctx, head_dim, group);
+    id<MTLComputePipelineState> gqa = tm_attention_gqa_pso(ctx, head_dim, group, f32_cache);
     if (gqa != nil) {
         return tm_dispatch_args(ctx, gqa, bufs, 5, consts, 6,
                                 MTLSizeMake((NSUInteger)kv_heads * 128u, n, 1),
-                                MTLSizeMake(128, 1, 1), err, err_cap,
-                                "qwen35_attention_f16_chunk");
+                                MTLSizeMake(128, 1, 1), err, err_cap, what);
     }
-    return tm_dispatch_args(ctx, ctx->pso_q35_attention_chunk, bufs, 5, consts, 6,
-                            MTLSizeMake((NSUInteger)heads * 128u, n, 1), MTLSizeMake(128, 1, 1),
-                            err, err_cap, "qwen35_attention_f16_chunk");
+    return tm_dispatch_args(ctx,
+                            f32_cache ? ctx->pso_q35_attention_chunk_f32
+                                      : ctx->pso_q35_attention_chunk,
+                            bufs, 5, consts, 6, MTLSizeMake((NSUInteger)heads * 128u, n, 1),
+                            MTLSizeMake(128, 1, 1), err, err_cap, what);
+}
+
+int tm_metal_qwen35_attention_f16_chunk(tm_metal_ctx *ctx, tm_metal_buffer *q,
+                                        tm_metal_buffer *k_cache, tm_metal_buffer *v_cache,
+                                        tm_metal_buffer *out, tm_metal_buffer *scratch,
+                                        uint32_t heads, uint32_t pos0, uint32_t cap,
+                                        uint32_t head_dim, uint32_t group, float scale, uint32_t n,
+                                        char *err, size_t err_cap) {
+    return tm_attention_chunk(ctx, q, k_cache, v_cache, out, scratch, heads, pos0, cap,
+                              head_dim, group, scale, n, 0, err, err_cap,
+                              "qwen35_attention_f16_chunk");
+}
+
+int tm_metal_qwen35_attention_f32_chunk(tm_metal_ctx *ctx, tm_metal_buffer *q,
+                                        tm_metal_buffer *k_cache, tm_metal_buffer *v_cache,
+                                        tm_metal_buffer *out, tm_metal_buffer *scratch,
+                                        uint32_t heads, uint32_t pos0, uint32_t cap,
+                                        uint32_t head_dim, uint32_t group, float scale, uint32_t n,
+                                        char *err, size_t err_cap) {
+    return tm_attention_chunk(ctx, q, k_cache, v_cache, out, scratch, heads, pos0, cap,
+                              head_dim, group, scale, n, 1, err, err_cap,
+                              "qwen35_attention_f32_chunk");
 }
 
 int tm_metal_set_gdn_chunk_generic(tm_metal_ctx *ctx, int generic) {

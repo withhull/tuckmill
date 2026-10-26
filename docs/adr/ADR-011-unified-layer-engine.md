@@ -422,3 +422,93 @@ three passes each; full prefill ~330 ms):
   alternated, six passes each): 512-token prefill 319-321 -> 286-292 ms.
   Accuracy is unchanged (512-token batched vs sequential 3.36e-4, top-1
   equal; GEMM tolerance tests at every shape).
+
+## Step 2 plan (2026-10-27): dense Qwen3 on the engine
+
+- **Scope.** Dense Qwen3 on Metal (`--kernels metal`) moves to the engine,
+  and `gpu.rs` (its Metal model code) is retired after the gate.
+  `forward.rs` stays for now. It is the served CPU executor (scalar and
+  NEON, mapped/owned storage, bounded CPU block streaming for the 8 GB
+  tier) and the arithmetic oracle, and the graph-driven CPU engine that
+  would replace it does not exist yet. It retires in a later step, with
+  its own gate.
+- **Blocks needed.**
+  - `AttentionSpec` with `output_gate: false` (plain Q projection) and
+    `rope_dims == head_dim` (full NeoX rotation).
+  - KV cache precision is an engine load option, not a graph property.
+    Packed f16 serves declared `f16`: the same values the old path stored
+    as f16-rounded f32. A new f32 plane serves declared `f32`, the dense
+    Qwen3 default. Neither is ever substituted for the other.
+- **Adapter and weights.** `adapters::qwen3` maps the resolved Qwen3
+  contract to a graph. A family-independent GGUF weight source reads
+  through the verified handle.
+- **Serving.** Qwen3 with `--kernels metal` loads through the same engine
+  load and serve path as Qwen3.5 (plan checks per class, ledger == plan,
+  pipelined greedy decoding). `prefill_batch` is refused, as for Qwen3.5,
+  because the engine prefills in fixed chunks.
+- **Superseded claim.** The old path's "teacher-forced logits bit-identical
+  across prefill batch sizes" relied on per-row GEMMs. The engine uses
+  the matrix-unit GEMM for batches, so chunked prefill is
+  tolerance-qualified against sequential decode on real weights. The
+  fixture stays bit-identical where the GEMM is per-row. `docs/claims.md`
+  is updated accordingly.
+- **Gate before `gpu.rs` is deleted:**
+  - fixture: engine vs the CPU oracle (f32 and f16 KV) within the
+    registered GPU tolerances, and greedy output equal to the oracle;
+  - the pinned real Qwen3-0.6B Q8_0 (sha256 `9465e63a…bb031`,
+    re-downloaded and verified): engine vs CPU oracle teacher-forced
+    logits within the registered envelope, `verify --reference` against
+    pinned llama.cpp within its registered envelopes, and the CLI
+    completion matching the recorded real-model check.
+
+## Step 2 record (2026-10-27): dense Qwen3 served through the engine
+
+- **Engine.**
+  - `AttentionBlock` supports attention without an output gate; full NeoX
+    RoPE is the partial-RoPE kernel with `rope_dims == head_dim`.
+  - KV cache precision is a load option (`KvCache::{F16, F32}`):
+    `alloc_plan_with` / `EngineModel::load_with`.
+  - f32 KV uses new chunk kernels (`tm_qwen35_kv_store_f32_chunk`,
+    `tm_qwen35_attention_f32_chunk`, GQA instances for float caches).
+    Decode runs them with n = 1, so prefill and decode stay
+    bit-identical.
+  - GQA instances added for head_dim 128 with group 2 and 4 (Qwen3
+    geometries), for both cache types.
+- **Adapter and weights.** `adapters::qwen3` maps the resolved dense
+  contract. `GgufWeights` is the family-independent weight source, and
+  `ArtifactTensorSource` delegates to it.
+- **Serving.**
+  - `--kernels metal` loads dense Qwen3 through the shared `load_engine`
+    (the qwen35 path uses it too). Dense Qwen3 has kernel identity
+    `ADR011:qwen3-q8_0+f16:metal`.
+  - `verify` no longer sends CPU cache geometry to a Metal side and
+    records the cache actually applied.
+  - The supervisor's warm-reuse workspace test now pins the engine's
+    behavior: reuse is kept while the plan covers the retained scratch,
+    and a reload under a reservation one byte short is refused.
+- **Gate passed before anything was deleted.**
+  - Fixture: engine vs CPU oracle (f32 and f16 KV) within the registered
+    policy with equal greedy text; chunked prefill bit-identical to
+    decode for both precisions.
+  - Pinned Qwen3-0.6B Q8_0 (re-downloaded; sha256 `9465e63a…bb031`
+    verified): teacher-forced logits vs the CPU oracle 4.196e-5 (retired
+    path 4.274e-5), top-1 equal.
+  - `verify --reference` vs pinned llama.cpp (oracle-f32): PASS for f32
+    and f16 KV (max 0.352 / 0.350 under tolerance 0.5, top-1 100%,
+    generated texts equal).
+  - The CLI completion is unchanged.
+  - Qwen3.5 numbers are unchanged.
+- **Retired:**
+  - `crates/tuckcore/src/gpu.rs`;
+  - the operators only it used: f32 per-token and batched `rope`,
+    `kv_store` and `attention`, and `rmsnorm_f16w` (kernels, C ABI,
+    pipelines, Rust wrappers and their operator tests);
+  - the `--prefill-batch` option (CLI and execution options; a requested
+    batch is now an unknown option). The engine reports its effective
+    chunk in `prefill_batch` stats and bench records.
+- **Superseded claim.** "Teacher-forced logits bit-identical across
+  prefill batch sizes 1-8" (`docs/claims.md`) is replaced by the evidence
+  above.
+- **Remaining.** `forward.rs` stays as the CPU executor and oracle until
+  the graph-driven CPU engine exists (a later step with its own gate).
+  Dense Qwen3 performance vs llama.cpp is not measured yet.

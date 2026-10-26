@@ -150,32 +150,11 @@ int tm_metal_rmsnorm_f32(tm_metal_ctx *ctx, tm_metal_buffer *x, tm_metal_buffer 
 
 /* NeoX RoPE in place over n_q_heads of q and n_kv_heads of k at `pos`,
  * using host-precomputed inv_freq[head_dim/2]. */
-int tm_metal_rope_f32(tm_metal_ctx *ctx, tm_metal_buffer *q, tm_metal_buffer *k,
-                      tm_metal_buffer *inv_freq, uint32_t pos, uint32_t n_q_heads,
-                      uint32_t n_kv_heads, uint32_t head_dim, char *err, size_t err_cap);
-
 /* k_cache[h][pos][:] = k_src[h][:], same for v; `round_f16` stores
  * f16-representable f32 values (the declared f16 cache contract). */
-int tm_metal_kv_store_f32(tm_metal_ctx *ctx, tm_metal_buffer *k_src, tm_metal_buffer *v_src,
-                          tm_metal_buffer *k_cache, tm_metal_buffer *v_cache,
-                          uint32_t kv_heads, uint32_t pos, uint32_t cap, uint32_t head_dim,
-                          uint32_t round_f16, char *err, size_t err_cap);
-
-/* Causal GQA attention at `pos`; `scratch` holds heads*cap f32. */
-int tm_metal_attention_f32(tm_metal_ctx *ctx, tm_metal_buffer *q, tm_metal_buffer *k_cache,
-                           tm_metal_buffer *v_cache, tm_metal_buffer *out,
-                           tm_metal_buffer *scratch, uint32_t heads, uint32_t pos,
-                           uint32_t cap, uint32_t head_dim, uint32_t group, float scale,
-                           char *err, size_t err_cap);
-
 /* Dequantize row `row` of an F16 matrix to `cols` f32 values. */
 int tm_metal_f16_row_f32(tm_metal_ctx *ctx, tm_metal_buffer *w, tm_metal_buffer *out,
                          uint32_t row, uint32_t cols, uint32_t out_off, char *err, size_t err_cap);
-
-/* RMSNorm with an F16-weight table. */
-int tm_metal_rmsnorm_f16w(tm_metal_ctx *ctx, tm_metal_buffer *x, tm_metal_buffer *weight,
-                          tm_metal_buffer *y, uint32_t rows, uint32_t cols, float eps,
-                          char *err, size_t err_cap);
 
 /* ---------------- C3: batched prefill operations ---------------- */
 
@@ -203,27 +182,9 @@ int tm_metal_f16_gemm(tm_metal_ctx *ctx, tm_metal_buffer *w, tm_metal_buffer *x,
 
 /* Batched RoPE: token t rotates at start_pos + t (q [n_tokens, n_q_heads,
  * dim], k [n_tokens, n_kv_heads, dim]). */
-int tm_metal_rope_batch_f32(tm_metal_ctx *ctx, tm_metal_buffer *q, tm_metal_buffer *k,
-                            tm_metal_buffer *inv_freq, uint32_t start_pos, uint32_t n_tokens,
-                            uint32_t n_q_heads, uint32_t n_kv_heads, uint32_t head_dim,
-                            char *err, size_t err_cap);
-
-/* Batched KV writes: row (t, head) lands at position start_pos + t. */
-int tm_metal_kv_store_batch_f32(tm_metal_ctx *ctx, tm_metal_buffer *k_src, tm_metal_buffer *v_src,
-                                tm_metal_buffer *k_cache, tm_metal_buffer *v_cache,
-                                uint32_t n_tokens, uint32_t start_pos, uint32_t cap,
-                                uint32_t head_dim, uint32_t kv_heads, uint32_t round_f16,
-                                char *err, size_t err_cap);
-
 /* Batched causal attention: one threadgroup per (token, query head); query
  * token t attends keys 0..=(start_pos + t). Scratch is
  * n_tokens * heads * cap f32. */
-int tm_metal_attention_batch_f32(tm_metal_ctx *ctx, tm_metal_buffer *q, tm_metal_buffer *k_cache,
-                                 tm_metal_buffer *v_cache, tm_metal_buffer *out,
-                                 tm_metal_buffer *scratch, uint32_t heads, uint32_t n_tokens,
-                                 uint32_t start_pos, uint32_t cap, uint32_t head_dim,
-                                 uint32_t group, float scale, char *err, size_t err_cap);
-
 /* out[i] = silu(gate[i]) * up[i]. */
 int tm_metal_silu_mul_f32(tm_metal_ctx *ctx, tm_metal_buffer *gate, tm_metal_buffer *up,
                           tm_metal_buffer *out, uint32_t n, char *err, size_t err_cap);
@@ -396,6 +357,21 @@ int tm_metal_qwen35_kv_store_f16_chunk(tm_metal_ctx *ctx, tm_metal_buffer *k_src
                                        uint32_t head_dim, uint32_t kv_heads, uint32_t n, char *err,
                                        size_t err_cap);
 int tm_metal_qwen35_attention_f16_chunk(tm_metal_ctx *ctx, tm_metal_buffer *q,
+                                        tm_metal_buffer *k_cache, tm_metal_buffer *v_cache,
+                                        tm_metal_buffer *out, tm_metal_buffer *scratch,
+                                        uint32_t heads, uint32_t pos0, uint32_t cap,
+                                        uint32_t head_dim, uint32_t group, float scale, uint32_t n,
+                                        char *err, size_t err_cap);
+
+/* The same KV store and chunk attention over an f32 cache (declared f32
+ * KV: entries are exact copies, never rounded). Plane layout and geometry
+ * are those of the f16 functions, at 4 bytes per entry. */
+int tm_metal_qwen35_kv_store_f32_chunk(tm_metal_ctx *ctx, tm_metal_buffer *k_src,
+                                       tm_metal_buffer *v_src, tm_metal_buffer *k_cache,
+                                       tm_metal_buffer *v_cache, uint32_t pos0, uint32_t cap,
+                                       uint32_t head_dim, uint32_t kv_heads, uint32_t n, char *err,
+                                       size_t err_cap);
+int tm_metal_qwen35_attention_f32_chunk(tm_metal_ctx *ctx, tm_metal_buffer *q,
                                         tm_metal_buffer *k_cache, tm_metal_buffer *v_cache,
                                         tm_metal_buffer *out, tm_metal_buffer *scratch,
                                         uint32_t heads, uint32_t pos0, uint32_t cap,

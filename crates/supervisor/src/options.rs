@@ -38,11 +38,6 @@ pub struct ExecutionOptions {
     /// governor commands mid-run). Refused for real engines.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub per_token_delay_ms: Option<u64>,
-    /// Metal prefill micro-batch for tuckcore (default 8, bounded 1..=32;
-    /// the effective size is the largest candidate whose exact workspace
-    /// geometry fits the plan). Refused for engines without batched prefill.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub prefill_batch: Option<u32>,
 }
 
 impl ExecutionOptions {
@@ -63,26 +58,6 @@ impl ExecutionOptions {
                         "per-token delay is a reference-test-engine test aid; real engines never simulate slowness",
                     ));
                 }
-                if let Some(b) = self.prefill_batch {
-                    // Batched prefill is a Metal capability: the CPU kernel
-                    // paths execute single-token steps and never silently
-                    // ignore a requested batching.
-                    if !matches!(self.kernels, Some(KernelSelection::Metal)) {
-                        return Err(TuckmillError::new(
-                            ErrorCode::InvalidRequest,
-                            "--prefill-batch requires --kernels metal; CPU kernel selections execute single-token steps and do not implement batching",
-                        )
-                        .with_action(
-                            "Select --kernels metal, or drop --prefill-batch.",
-                        ));
-                    }
-                    if !(1..=32).contains(&b) {
-                        return Err(TuckmillError::new(
-                            ErrorCode::InvalidRequest,
-                            format!("--prefill-batch {b} is outside the supported 1..=32 range"),
-                        ));
-                    }
-                }
                 Ok(())
             }
             EngineKind::LlamaCpp => {
@@ -90,12 +65,6 @@ impl ExecutionOptions {
                     return Err(TuckmillError::new(
                         ErrorCode::InvalidRequest,
                         "--kernels/--storage apply to the tuckcore engine; llama.cpp selects its own kernels",
-                    ));
-                }
-                if self.prefill_batch.is_some() {
-                    return Err(TuckmillError::new(
-                        ErrorCode::InvalidRequest,
-                        "batched prefill is a tuckcore Metal option; llama.cpp manages its own prefill",
                     ));
                 }
                 if self.numerical_profile.is_some() {
@@ -123,7 +92,6 @@ impl ExecutionOptions {
             EngineKind::ReferenceTest => {
                 let mut without_test_aid = self.clone();
                 without_test_aid.per_token_delay_ms = None;
-                without_test_aid.prefill_batch = None;
                 if without_test_aid != Self::default() {
                     return Err(TuckmillError::new(
                         ErrorCode::InvalidRequest,
@@ -142,9 +110,6 @@ impl ExecutionOptions {
         let mut obj = Map::new();
         match kind {
             EngineKind::TuckCore => {
-                if let Some(v) = self.prefill_batch {
-                    obj.insert("prefill_batch".into(), Value::from(v));
-                }
                 if let Some(v) = self.weight_cache_bytes {
                     obj.insert("weight_cache_bytes".into(), Value::from(v));
                 }
@@ -165,9 +130,6 @@ impl ExecutionOptions {
                 }
                 if let Some(v) = self.profile {
                     obj.insert("profile".into(), Value::from(v));
-                }
-                if let Some(v) = self.prefill_batch {
-                    obj.insert("prefill_batch".into(), Value::from(v));
                 }
             }
             EngineKind::LlamaCpp => {
@@ -233,7 +195,10 @@ impl ExecutionOptions {
     /// the block size follows the cache size as before.
     pub fn side_load_json(&self, kind: EngineKind, cache_override: Option<u64>) -> Option<Value> {
         let mut opts = self.clone();
-        if let Some(cache) = cache_override {
+        // Cache geometry shapes CPU weight streaming only; the Metal path
+        // keeps weights resident and refuses streaming options.
+        let streams = !matches!(opts.kernels, Some(KernelSelection::Metal));
+        if let (Some(cache), true) = (cache_override, streams) {
             opts.weight_cache_bytes = Some(cache);
             opts.block_bytes = Some(cache.clamp(64 * 1024, 4 * 1024 * 1024));
         }
@@ -346,31 +311,13 @@ pub struct AcknowledgedExecution {
 mod tests {
     use super::*;
 
+    /// The engine prefills in fixed chunks (ADR-011); a requested prefill
+    /// batch is an unknown option, refused rather than ignored.
     #[test]
-    fn prefill_batch_requires_metal_kernels() {
-        let mut o = ExecutionOptions {
-            prefill_batch: Some(4),
-            ..Default::default()
-        };
-        assert!(
-            o.validate(EngineKind::TuckCore).is_err(),
-            "batching without a kernel selection must be refused, never ignored"
-        );
-        o.kernels = Some(KernelSelection::Neon);
-        assert!(
-            o.validate(EngineKind::TuckCore).is_err(),
-            "NEON executes single-token steps; batching must not be accepted"
-        );
-        o.kernels = Some(KernelSelection::Metal);
-        assert!(o.validate(EngineKind::TuckCore).is_ok());
-        o.prefill_batch = Some(64);
-        assert!(o.validate(EngineKind::TuckCore).is_err(), "range is 1..=32");
-
-        let llama = ExecutionOptions {
-            prefill_batch: Some(4),
-            ..Default::default()
-        };
-        assert!(llama.validate(EngineKind::LlamaCpp).is_err());
+    fn a_requested_prefill_batch_is_refused_as_unknown() {
+        let parsed: std::result::Result<ExecutionOptions, _> =
+            serde_json::from_value(serde_json::json!({"kernels": "metal", "prefill_batch": 4}));
+        assert!(parsed.is_err());
     }
 }
 

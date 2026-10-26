@@ -24,8 +24,9 @@ statements in [docs/claims.md](docs/claims.md).
     graph, and one Metal engine runs it from shared blocks. Qwen3.5 0.8B
     and 2B (Q8_0) are served this way, with batched prefill and pipelined
     greedy decoding on the GPU.
-  - **Dense Qwen3:** runs on its older CPU and Metal paths until it
-    migrates to the engine.
+  - **Dense Qwen3:** served by the same engine on Metal (f32 or f16 KV);
+    the CPU path (scalar and NEON, with bounded weight streaming) stays
+    as the CPU executor and arithmetic oracle.
 - **Reference backend**: pinned llama.cpp b11695 (`--engine llama`). It is
   loaded at runtime, never vendored, and is both the comparison oracle and
   the speed baseline.
@@ -109,7 +110,8 @@ constrained machines, not the architecture.
 | `bench`: standard-v1 records with cache-state labels and caveats | ✅ |
 | Governor: Normal / Constrained / Paused / Draining / Failed, driven by real memory-pressure and thermal signals | ✅ |
 | Qwen3.5 hybrid on Metal (unified engine): Gated DeltaNet and gated attention, packed f16 KV, batched prefill, device greedy sampling | ✅ experimental; raw completion only, chat ⛔ (template not recognized) |
-| Dense Qwen3: scalar f32 oracle and NEON Q8_0/F16 kernel on CPU, resident Metal path | ✅ experimental; engine migration pending (ADR-011 step 2) |
+| Dense Qwen3 on Metal (unified engine): f32 or packed f16 KV, batched prefill, device greedy sampling | ✅ experimental; qualified on the pinned Qwen3-0.6B (CPU oracle and llama.cpp envelopes) |
+| Dense Qwen3 on CPU: scalar f32 oracle and NEON Q8_0/F16 kernel, bounded weight streaming | ✅ experimental |
 | Formats executed | CPU: F32, F16, BF16, Q8_0, Q4_0, Q4_1. Metal: Q8_0, F16. K-quants and IQ formats are refused |
 | GPU partial residency and streaming, MoE execution, compressed (Bonsai) execution | ⛔ Phases 2–3 |
 
@@ -161,7 +163,7 @@ scripts/            build, test, demo, fetch-llama, bench-baseline
 
 ## Verification
 
-`scripts/test.sh` is the gate (492 tests at this revision). It runs
+`scripts/test.sh` is the gate (490 tests at this revision). It runs
 formatting, `clippy -D warnings` and the full suite:
 - adversarial GGUF and Safetensors fixtures;
 - planner math, governor semantics and import fault injection;

@@ -778,8 +778,34 @@ impl GdnBlock {
 /// Grouped-query attention with Q/K norms, partial split-half RoPE,
 /// packed f16 KV and a sigmoid output gate. Other variants are refused at
 /// load until their block lands (never approximated).
+/// Declared KV cache precision of attention layers (part of the numerical
+/// profile; never substituted). `F16` stores packed f16 entries (the values
+/// an f16-rounding f32 cache would hold); `F32` stores exact f32 entries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KvCache {
+    F16,
+    F32,
+}
+
+impl KvCache {
+    fn entry_bytes(self) -> usize {
+        match self {
+            Self::F16 => 2,
+            Self::F32 => 4,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::F16 => "f16",
+            Self::F32 => "f32",
+        }
+    }
+}
+
 struct AttentionBlock {
     spec: AttentionSpec,
+    kv: KvCache,
     eps: f32,
     q_w: Matrix,
     k_w: Matrix,
@@ -790,9 +816,11 @@ struct AttentionBlock {
     inv_freq: MetalBuffer,
     k_cache: MetalBuffer,
     v_cache: MetalBuffer,
-    qg: MetalBuffer,
+    /// Joint Q + gate projection output (gated attention only).
+    qg: Option<MetalBuffer>,
     q: MetalBuffer,
-    gate: MetalBuffer,
+    /// Sigmoid output gate (gated attention only).
+    gate: Option<MetalBuffer>,
     k: MetalBuffer,
     v: MetalBuffer,
     attn: MetalBuffer,
@@ -802,12 +830,12 @@ struct AttentionBlock {
 
 impl AttentionBlock {
     fn check_supported(s: &AttentionSpec) -> Result<(Tensor, Tensor)> {
-        match (s.output_gate, s.q_norm, s.k_norm) {
-            (true, Some(q_norm), Some(k_norm)) => Ok((q_norm, k_norm)),
+        match (s.q_norm, s.k_norm) {
+            (Some(q_norm), Some(k_norm)) => Ok((q_norm, k_norm)),
             _ => Err(TuckmillError::new(
                 ErrorCode::UnsupportedArchitecture,
                 format!(
-                    "attention variant (output gate {}, q_norm {}, k_norm {}) has no engine block yet; only gated attention with Q/K norms is implemented",
+                    "attention variant (output gate {}, q_norm {}, k_norm {}) has no engine block yet; only attention with Q/K norms is implemented",
                     s.output_gate,
                     s.q_norm.is_some(),
                     s.k_norm.is_some()
@@ -817,21 +845,24 @@ impl AttentionBlock {
         }
     }
 
-    fn kv_plane_bytes(s: &AttentionSpec, capacity: usize) -> u64 {
-        // Packed f16 entries.
-        (s.kv_heads * capacity * s.head_dim * 2) as u64
+    fn kv_plane_bytes(s: &AttentionSpec, capacity: usize, kv: KvCache) -> u64 {
+        (s.kv_heads * capacity * s.head_dim * kv.entry_bytes()) as u64
     }
 
+    /// `[qg, q, gate, k, v, attn, kv_scratch]` in f32 elements; `qg` and
+    /// `gate` are 0 (not allocated) without an output gate.
     fn scratch_elems(s: &AttentionSpec, capacity: usize) -> [usize; 7] {
         let hd = s.heads * s.head_dim;
         let kv = s.kv_heads * s.head_dim;
-        [hd * 2, hd, hd, kv, kv, hd, s.heads * capacity]
+        let gated = if s.output_gate { hd } else { 0 };
+        [gated * 2, hd, gated, kv, kv, hd, s.heads * capacity]
     }
 
     fn plan(
         s: &AttentionSpec,
         src: &dyn WeightSource,
         capacity: usize,
+        kv: KvCache,
         p: &mut Plan,
     ) -> Result<()> {
         let (q_norm, k_norm) = Self::check_supported(s)?;
@@ -844,9 +875,11 @@ impl AttentionBlock {
         // weight bytes, so it is priced as scratch (the planner's weights
         // reservation is exactly the artifact's tensors).
         p.scratch_f32(s.rope_dims / 2);
-        p.state += 2 * Self::kv_plane_bytes(s, capacity);
+        p.state += 2 * Self::kv_plane_bytes(s, capacity, kv);
         for elems in Self::scratch_elems(s, capacity) {
-            p.scratch_f32(elems);
+            if elems > 0 {
+                p.scratch_f32(elems);
+            }
         }
         Ok(())
     }
@@ -857,10 +890,18 @@ impl AttentionBlock {
         s: &AttentionSpec,
         eps: f32,
         capacity: usize,
+        kv: KvCache,
     ) -> Result<Self> {
         let (q_norm, k_norm) = Self::check_supported(s)?;
         let [qg, q, gate, k, v, attn, kv_scratch] = Self::scratch_elems(s, capacity);
-        let plane = Self::kv_plane_bytes(s, capacity) as usize;
+        let plane = Self::kv_plane_bytes(s, capacity, kv) as usize;
+        let optional = |elems: usize| -> Result<Option<MetalBuffer>> {
+            if elems == 0 {
+                Ok(None)
+            } else {
+                zeros(gpu, elems).map(Some)
+            }
+        };
         Ok(Self {
             q_w: Matrix::load(gpu, src, s.q)?,
             k_w: Matrix::load(gpu, src, s.k)?,
@@ -874,15 +915,16 @@ impl AttentionBlock {
             )?,
             k_cache: gpu.buffer(plane)?,
             v_cache: gpu.buffer(plane)?,
-            qg: zeros(gpu, qg)?,
+            qg: optional(qg)?,
             q: zeros(gpu, q)?,
-            gate: zeros(gpu, gate)?,
+            gate: optional(gate)?,
             k: zeros(gpu, k)?,
             v: zeros(gpu, v)?,
             attn: zeros(gpu, attn)?,
             kv_scratch: zeros(gpu, kv_scratch)?,
             cache_cap: capacity,
             spec: s.clone(),
+            kv,
             eps,
         })
     }
@@ -893,7 +935,7 @@ impl AttentionBlock {
     }
 
     fn decode(&self, gpu: &Qwen35Gpu, h: &MetalBuffer, proj: &MetalBuffer, pos: u32) -> Result<()> {
-        self.q_w.gemv(gpu, h, &self.qg)?;
+        self.q_w.gemv(gpu, h, self.qg.as_ref().unwrap_or(&self.q))?;
         self.k_w.gemv(gpu, h, &self.k)?;
         self.v_w.gemv(gpu, h, &self.v)?;
         self.core(gpu, pos)?;
@@ -918,11 +960,12 @@ impl AttentionBlock {
             self.core_chunk(gpu, s, n, pos0)?;
             return self.o_w.gemm(gpu, &s.e, &s.proj, nn);
         }
-        let qgw = spec.heads * spec.head_dim * 2;
-        let kvw = spec.kv_heads * spec.head_dim;
         let aw = spec.heads * spec.head_dim;
+        let qgw = if spec.output_gate { aw * 2 } else { aw };
+        let kvw = spec.kv_heads * spec.head_dim;
+        let q_dst = self.qg.as_ref().unwrap_or(&self.q);
         for i in 0..n {
-            ctx.copy_f32(&s.a, (i * qgw) as u32, &self.qg, 0, qgw as u32)?;
+            ctx.copy_f32(&s.a, (i * qgw) as u32, q_dst, 0, qgw as u32)?;
             ctx.copy_f32(&s.b, (i * kvw) as u32, &self.k, 0, kvw as u32)?;
             ctx.copy_f32(&s.c, (i * kvw) as u32, &self.v, 0, kvw as u32)?;
             self.core(gpu, pos0 + i as u32)?;
@@ -944,11 +987,18 @@ impl AttentionBlock {
             spec.kv_heads as u32,
             spec.head_dim as u32,
         );
-        gpu.q_gate_split_dev(&s.a, &s.aq, &s.ag, nn * heads, hd)?;
-        ctx.rmsnorm(&s.aq, &self.q_norm, &s.aq, nn * heads, hd, self.eps)?;
+        // Query rows: split from the joint projection when gated, else the
+        // projection output itself.
+        let q = if spec.output_gate {
+            gpu.q_gate_split_dev(&s.a, &s.aq, &s.ag, nn * heads, hd)?;
+            &s.aq
+        } else {
+            &s.a
+        };
+        ctx.rmsnorm(q, &self.q_norm, q, nn * heads, hd, self.eps)?;
         ctx.rmsnorm(&s.b, &self.k_norm, &s.b, nn * kv, hd, self.eps)?;
         ctx.qwen35_rope_partial_chunk(
-            &s.aq,
+            q,
             &s.b,
             &self.inv_freq,
             pos0,
@@ -958,7 +1008,8 @@ impl AttentionBlock {
             spec.rope_dims as u32,
             nn,
         )?;
-        ctx.qwen35_kv_store_f16_chunk(
+        let f32_cache = self.kv == KvCache::F32;
+        ctx.qwen35_kv_store_chunk(
             &s.b,
             &s.c,
             &self.k_cache,
@@ -968,9 +1019,10 @@ impl AttentionBlock {
             hd,
             kv,
             nn,
+            f32_cache,
         )?;
-        ctx.qwen35_attention_f16_chunk(
-            &s.aq,
+        ctx.qwen35_attention_chunk(
+            q,
             &self.k_cache,
             &self.v_cache,
             &s.e,
@@ -982,21 +1034,21 @@ impl AttentionBlock {
             heads / kv,
             1.0 / (spec.head_dim as f32).sqrt(),
             nn,
+            f32_cache,
         )?;
-        gpu.attn_gate_dev(&s.e, &s.ag, nn * heads * hd)
+        if spec.output_gate {
+            gpu.attn_gate_dev(&s.e, &s.ag, nn * heads * hd)?;
+        }
+        Ok(())
     }
 
     /// The sequential per-token core, from `qg`/`k`/`v` to `attn`.
     fn core(&self, gpu: &Qwen35Gpu, pos: u32) -> Result<()> {
         let ctx = gpu.context();
         let s = &self.spec;
-        gpu.q_gate_split_dev(
-            &self.qg,
-            &self.q,
-            &self.gate,
-            s.heads as u32,
-            s.head_dim as u32,
-        )?;
+        if let (Some(qg), Some(gate)) = (&self.qg, &self.gate) {
+            gpu.q_gate_split_dev(qg, &self.q, gate, s.heads as u32, s.head_dim as u32)?;
+        }
         ctx.rmsnorm(
             &self.q,
             &self.q_norm,
@@ -1023,30 +1075,68 @@ impl AttentionBlock {
             s.head_dim as u32,
             s.rope_dims as u32,
         )?;
-        gpu.kv_store_f16_dev(
-            &self.k,
-            &self.v,
-            &self.k_cache,
-            &self.v_cache,
-            pos,
-            self.cache_cap as u32,
-            s.head_dim as u32,
-            s.kv_heads as u32,
-        )?;
-        gpu.attention_f16_dev(
-            &self.q,
-            &self.k_cache,
-            &self.v_cache,
-            &self.attn,
-            &self.kv_scratch,
-            s.heads as u32,
-            pos,
-            self.cache_cap as u32,
-            s.head_dim as u32,
-            (s.heads / s.kv_heads) as u32,
-            1.0 / (s.head_dim as f32).sqrt(),
-        )?;
-        gpu.attn_gate_dev(&self.attn, &self.gate, (s.heads * s.head_dim) as u32)
+        match self.kv {
+            KvCache::F16 => {
+                gpu.kv_store_f16_dev(
+                    &self.k,
+                    &self.v,
+                    &self.k_cache,
+                    &self.v_cache,
+                    pos,
+                    self.cache_cap as u32,
+                    s.head_dim as u32,
+                    s.kv_heads as u32,
+                )?;
+                gpu.attention_f16_dev(
+                    &self.q,
+                    &self.k_cache,
+                    &self.v_cache,
+                    &self.attn,
+                    &self.kv_scratch,
+                    s.heads as u32,
+                    pos,
+                    self.cache_cap as u32,
+                    s.head_dim as u32,
+                    (s.heads / s.kv_heads) as u32,
+                    1.0 / (s.head_dim as f32).sqrt(),
+                )?;
+            }
+            // f32 KV runs the chunk kernels with n = 1, so decode and
+            // chunked prefill share one compiled kernel (bit-identical).
+            KvCache::F32 => {
+                ctx.qwen35_kv_store_chunk(
+                    &self.k,
+                    &self.v,
+                    &self.k_cache,
+                    &self.v_cache,
+                    pos,
+                    self.cache_cap as u32,
+                    s.head_dim as u32,
+                    s.kv_heads as u32,
+                    1,
+                    true,
+                )?;
+                ctx.qwen35_attention_chunk(
+                    &self.q,
+                    &self.k_cache,
+                    &self.v_cache,
+                    &self.attn,
+                    &self.kv_scratch,
+                    s.heads as u32,
+                    pos,
+                    self.cache_cap as u32,
+                    s.head_dim as u32,
+                    (s.heads / s.kv_heads) as u32,
+                    1.0 / (s.head_dim as f32).sqrt(),
+                    1,
+                    true,
+                )?;
+            }
+        }
+        if let Some(gate) = &self.gate {
+            gpu.attn_gate_dev(&self.attn, gate, (s.heads * s.head_dim) as u32)?;
+        }
+        Ok(())
     }
 }
 
@@ -1079,6 +1169,7 @@ impl Layer {
         graph: &ModelGraph,
         src: &dyn WeightSource,
         capacity: usize,
+        kv: KvCache,
         p: &mut Plan,
     ) -> Result<()> {
         p.weights_f32(vector_len(src, spec.pre_norm)?);
@@ -1088,7 +1179,7 @@ impl Layer {
         p.scratch_f32(graph.hidden); // proj
         match &spec.mixer {
             MixerSpec::GatedDeltaNet(g) => GdnBlock::plan(g, src, p)?,
-            MixerSpec::Attention(a) => AttentionBlock::plan(a, src, capacity, p)?,
+            MixerSpec::Attention(a) => AttentionBlock::plan(a, src, capacity, kv, p)?,
         }
         SwiGluBlock::plan(&spec.ffn, graph.hidden, src, p)
     }
@@ -1099,6 +1190,7 @@ impl Layer {
         spec: &super::graph::LayerSpec,
         graph: &ModelGraph,
         capacity: usize,
+        kv: KvCache,
     ) -> Result<Self> {
         Ok(Self {
             pre_norm: vector(gpu, src, spec.pre_norm)?,
@@ -1111,7 +1203,7 @@ impl Layer {
                     Mixer::Gdn(Box::new(GdnBlock::load(gpu, src, g, graph.eps)?))
                 }
                 MixerSpec::Attention(a) => Mixer::Attention(Box::new(AttentionBlock::load(
-                    gpu, src, a, graph.eps, capacity,
+                    gpu, src, a, graph.eps, capacity, kv,
                 )?)),
             },
             ffn: SwiGluBlock::load(gpu, src, &spec.ffn, graph.hidden)?,
@@ -1178,9 +1270,19 @@ pub fn alloc_plan(
     src: &dyn WeightSource,
     capacity: usize,
 ) -> Result<GpuAllocPlan> {
+    alloc_plan_with(graph, src, capacity, KvCache::F16)
+}
+
+/// [`alloc_plan`] for a declared KV cache precision.
+pub fn alloc_plan_with(
+    graph: &ModelGraph,
+    src: &dyn WeightSource,
+    capacity: usize,
+    kv: KvCache,
+) -> Result<GpuAllocPlan> {
     let mut p = Plan::default();
     for layer in &graph.layers {
-        Layer::plan(layer, graph, src, capacity, &mut p)?;
+        Layer::plan(layer, graph, src, capacity, kv, &mut p)?;
     }
     p.weights += Matrix::plan(src, graph.embedding)?;
     if graph.head != graph.embedding {
@@ -1239,7 +1341,19 @@ impl EngineModel {
         capacity: usize,
         admitted_gpu_bytes: u64,
     ) -> Result<Self> {
-        let plan = alloc_plan(&graph, src, capacity)?;
+        Self::load_with(gpu, graph, src, capacity, admitted_gpu_bytes, KvCache::F16)
+    }
+
+    /// [`Self::load`] with a declared KV cache precision.
+    pub fn load_with(
+        gpu: Qwen35Gpu,
+        graph: ModelGraph,
+        src: &dyn WeightSource,
+        capacity: usize,
+        admitted_gpu_bytes: u64,
+        kv: KvCache,
+    ) -> Result<Self> {
+        let plan = alloc_plan_with(&graph, src, capacity, kv)?;
         let total = plan.total();
         if total > admitted_gpu_bytes {
             return Err(TuckmillError::new(
@@ -1256,7 +1370,7 @@ impl EngineModel {
         let layers = graph
             .layers
             .iter()
-            .map(|spec| Layer::load(&gpu, src, spec, &graph, capacity))
+            .map(|spec| Layer::load(&gpu, src, spec, &graph, capacity, kv))
             .collect::<Result<Vec<_>>>()?;
         let embedding = Matrix::load(&gpu, src, graph.embedding)?;
         let head = if graph.head != graph.embedding {
@@ -2675,5 +2789,108 @@ mod chunk_core_tests {
             &ArtifactTensorSource::open(&path).unwrap(),
             &[1, 5, 16, 37, 512],
         );
+    }
+}
+
+#[cfg(test)]
+mod qwen3_tests {
+    use super::*;
+    use tuckmill_manifest::testing::{write_synthetic, SyntheticConfig};
+
+    fn gpu_or_skip() -> bool {
+        if tuckmill_metal::probe().available {
+            return true;
+        }
+        assert!(
+            std::env::var("TUCKMILL_REQUIRE_METAL").is_err(),
+            "TUCKMILL_REQUIRE_METAL is set but no Metal device is available"
+        );
+        eprintln!("skipping: no Metal device");
+        false
+    }
+
+    /// Dense Qwen3 on the engine (ADR-011 step 2), for both declared KV
+    /// precisions: ledger == plan with KV planes at the declared entry size,
+    /// and batched prefill bit-identical to token-by-token decode (single,
+    /// partial, full and multi-chunk prompts).
+    #[test]
+    fn qwen3_graph_prefill_is_bit_identical_to_decode_for_both_kv_precisions() {
+        if !gpu_or_skip() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("qwen3.gguf");
+        write_synthetic(&path, &SyntheticConfig::tiny_qwen3()).unwrap();
+        let file = std::fs::File::open(&path).unwrap();
+        let insp =
+            tuckmill_manifest::gguf::inspect(&path, &tuckmill_manifest::gguf::Limits::default())
+                .unwrap();
+        let registry = tuckmill_manifest::adapter::AdapterRegistry::builtin().unwrap();
+        let (cfg, _) = crate::model::resolve(&insp, &registry).unwrap();
+        let mut names = crate::model::TensorNames::for_layers(cfg.layers);
+        names.resolve(&insp).unwrap();
+        let graph = super::super::adapters::qwen3(&cfg, &names, &insp).unwrap();
+        assert!(graph.layers.iter().all(|l| matches!(
+            &l.mixer,
+            MixerSpec::Attention(a) if !a.output_gate && a.rope_dims == a.head_dim
+        )));
+        let source = super::super::GgufWeights::with_inspection(&file, &insp).unwrap();
+        let capacity = PREFILL_BATCH + 8;
+        let bits = |v: &[f32]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+
+        for kv in [KvCache::F32, KvCache::F16] {
+            let plan = alloc_plan_with(&graph, &source, capacity, kv).unwrap();
+            let expected_state = cfg.layers as usize
+                * 2
+                * cfg.kv_heads as usize
+                * capacity
+                * cfg.key_length as usize
+                * kv.entry_bytes();
+            assert_eq!(plan.state as usize, expected_state, "{kv:?}: KV planes");
+            let model = EngineModel::load_with(
+                Qwen35Gpu::open().unwrap(),
+                graph.clone(),
+                &source,
+                capacity,
+                plan.total(),
+                kv,
+            )
+            .unwrap();
+            assert_eq!(
+                model.allocated_bytes(),
+                plan.total(),
+                "{kv:?}: ledger == plan"
+            );
+
+            for len in [1usize, 3, PREFILL_BATCH, PREFILL_BATCH + 4] {
+                let prompt: Vec<u32> = (0..len as u32)
+                    .map(|i| (i * 37 + 5) % cfg.vocab as u32)
+                    .collect();
+                model.reset().unwrap();
+                let mut seq = Vec::new();
+                for t in &prompt {
+                    model.forward_token(*t, &mut seq).unwrap();
+                }
+                let mut seq_next = Vec::new();
+                model.forward_token(7, &mut seq_next).unwrap();
+
+                model.reset().unwrap();
+                let mut batched = Vec::new();
+                let chunks: Vec<&[u32]> = prompt.chunks(PREFILL_BATCH).collect();
+                for (c, chunk) in chunks.iter().enumerate() {
+                    model
+                        .prefill_chunk(chunk, c + 1 == chunks.len(), &mut batched)
+                        .unwrap();
+                }
+                let mut batched_next = Vec::new();
+                model.forward_token(7, &mut batched_next).unwrap();
+                assert_eq!(bits(&batched), bits(&seq), "{kv:?} prompt {len}: logits");
+                assert_eq!(
+                    bits(&batched_next),
+                    bits(&seq_next),
+                    "{kv:?} prompt {len}: next decode step"
+                );
+            }
+        }
     }
 }

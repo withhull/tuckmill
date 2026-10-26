@@ -23,11 +23,10 @@ use tuckmill_manifest::units::Bytes;
 use tuckmill_manifest::{BACKEND_ABI_VERSION, WORKER_PROTOCOL_VERSION};
 
 use crate::completion::CompletionTracker;
-use crate::engine::metal::{self as engine_metal, EngineModel, GreedyInput, PendingToken};
+use crate::engine::metal::{self as engine_metal, EngineModel, GreedyInput, KvCache, PendingToken};
 use crate::forward::{
     self, Forward, KvPrecision, KvState, ModelWeights, NumericalProfile, ProfileCounters,
 };
-use crate::gpu;
 use crate::kernels::{KernelSelection, ResolvedKernels};
 use crate::loader::{BlockLoader, BlockPolicy, StorageSelection};
 use crate::model;
@@ -94,22 +93,21 @@ struct Loaded {
     /// transient overhead. This is exactly the quantity the load-time
     /// arena check validated against the plan, reported so the supervisor
     /// can re-check it against every later plan before reusing the worker.
-    /// On the Metal path this is the resident GPU weight footprint instead
-    /// (the CPU cache is not built).
     retained_weight_bytes: u64,
-    /// Resident Metal forward path (C2): present only when `--kernels
-    /// metal` was resolved; there is no silent fallback to the CPU.
-    metal: Option<Arc<gpu::MetalForward>>,
 }
 
-/// A loaded Qwen3.5 hybrid (`qwen35`) artifact on the resident Metal path
-/// (Q35-1E.2). Weights, packed f16 KV and f32 recurrent/convolution state
-/// live on one GPU owner for the prepared capacity; every request starts
-/// from a reset session, so recurrent state is never shared across
-/// requests.
-struct HybridLoaded {
-    /// The qwen35 graph executed by the unified engine (ADR-011).
+/// A loaded artifact served by the unified engine on the resident Metal
+/// path (ADR-011): `qwen35`, and dense `qwen3` with `--kernels metal`.
+/// Weights, KV planes and any recurrent/convolution state live on one GPU
+/// owner for the prepared capacity; every request starts from a reset
+/// session, so state is never shared across requests.
+struct EngineLoaded {
+    /// The graph executed by the unified engine.
     model: EngineModel,
+    /// Declared KV cache precision of the attention layers.
+    kv: KvCache,
+    /// Kernel identity reported in records.
+    kernel_id: String,
     tokenizer: DecodeVocab,
     eos_token_id: Option<u32>,
     context_total: u64,
@@ -125,7 +123,9 @@ struct HybridLoaded {
 /// The experimental custom native executor.
 pub struct TuckCore {
     loaded: Option<Loaded>,
-    hybrid: Option<HybridLoaded>,
+    /// A model served by the unified engine on Metal (qwen35, and dense
+    /// qwen3 with `--kernels metal`).
+    engine: Option<EngineLoaded>,
     /// Optional artificial per-token pacing (tests only; real forward work is
     /// its own pacing).
     pub per_token_delay: Duration,
@@ -145,7 +145,7 @@ impl TuckCore {
     pub fn new() -> Self {
         Self {
             loaded: None,
-            hybrid: None,
+            engine: None,
             per_token_delay: Duration::ZERO,
             trim_epoch: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             applied_trim_epoch: Arc::new(std::sync::atomic::AtomicU64::new(0)),
@@ -153,7 +153,7 @@ impl TuckCore {
     }
 
     pub fn is_loaded(&self) -> bool {
-        self.loaded.is_some() || self.hybrid.is_some()
+        self.loaded.is_some() || self.engine.is_some()
     }
 
     /// Applies a pending cache trim if the governor asked for one; returns
@@ -189,8 +189,8 @@ impl TuckCore {
             certified: false,
             backend_abi_version: BACKEND_ABI_VERSION,
             worker_protocol_version: WORKER_PROTOCOL_VERSION,
-            kernels: if self.hybrid.is_some() {
-                vec![HYBRID_KERNEL_ID.to_string()]
+            kernels: if let Some(engine) = &self.engine {
+                vec![engine.kernel_id.clone()]
             } else {
                 kernel_ids(self.loaded.as_ref().map(|l| l.kernels))
             },
@@ -214,7 +214,7 @@ impl InferenceBackend for TuckCore {
             notes: vec![
                 "Stage 0: dense Qwen3 GGUF, scalar f32 reference kernels, bounded weight streaming (ADR-005)"
                     .to_string(),
-                "Qwen3.5 hybrid (qwen35): resident Metal path only (--kernels metal), packed f16 KV, batched prefill (ADR-008)"
+                "Metal (--kernels metal): the unified engine (ADR-011) serves dense qwen3 (f32 or f16 KV) and qwen35 (packed f16 KV), resident, batched prefill"
                     .to_string(),
                 "MoE and ternary profiles remain separately gated; routing is never substituted"
                     .to_string(),
@@ -422,7 +422,7 @@ impl InferenceBackend for TuckCore {
                 kernels,
                 &insp,
                 &artifact_file,
-                HybridLoadContext {
+                EngineLoadContext {
                     payload,
                     content_verified,
                     counters,
@@ -433,6 +433,23 @@ impl InferenceBackend for TuckCore {
         }
         let registry = AdapterRegistry::builtin()?;
         let (cfg, _adapter) = model::resolve(&insp, &registry)?;
+        if metal_mode {
+            return self.load_qwen3_engine(
+                plan,
+                artifact,
+                &opts,
+                &cfg,
+                kv_precision,
+                &insp,
+                &artifact_file,
+                EngineLoadContext {
+                    payload,
+                    content_verified,
+                    counters,
+                    load_start,
+                },
+            );
+        }
         let kv_bound = KvState::bytes_for(&cfg, plan.context.total_context);
         if kv_bound > KvState::MAX_KV_BYTES {
             return Err(TuckmillError::new(
@@ -473,7 +490,7 @@ impl InferenceBackend for TuckCore {
         // charging it so the check prices the allocation that can happen.
         let effective_cache = policy.cache_bytes.min(payload);
         let cache_wanted = effective_cache.saturating_add(policy.block_bytes);
-        if !metal_mode && cache_wanted > weight_allowance {
+        if cache_wanted > weight_allowance {
             return Err(TuckmillError::new(
                 ErrorCode::InvalidPlan,
                 format!(
@@ -495,111 +512,9 @@ impl InferenceBackend for TuckCore {
         // compact decode table, not the encoder.
         let tokenizer = DecodeVocab::from_gguf(&insp)?;
 
-        // ---- Metal resident path (C2): build after identity verification,
-        // with the plan's arena classes checked against the exact GPU
-        // allocations before anything is accepted. ----
-        let mut note_batch: Option<u32> = None;
-        let metal = if metal_mode {
-            if opts.storage.is_some() {
-                return Err(TuckmillError::new(
-                    ErrorCode::InvalidRequest,
-                    "storage selection applies to CPU weight streaming; the Metal path keeps weights resident on the GPU",
-                ));
-            }
-            let weights_reserved = plan.budget.reservation_breakdown.weights.bytes();
-            let ws_reserved = plan.budget.reservation_breakdown.workspaces.bytes();
-            // Preflight (C3.0): choose the largest micro-batch whose exact
-            // resident geometry fits the admitted reservations, from pure
-            // inspected-geometry arithmetic — before any GPU allocation.
-            let requested = opts.prefill_batch.unwrap_or(8).clamp(1, 32);
-            let mut candidates: Vec<u32> = [requested, 16, 8, 4, 2, 1]
-                .into_iter()
-                .filter(|c| *c <= requested)
-                .collect();
-            candidates.dedup();
-            let mut chosen = None;
-            let mut last_miss = (0u64, 0u64);
-            for candidate in candidates {
-                let (w_req, ws_req) = gpu::MetalForward::required_bytes(
-                    &insp,
-                    &cfg,
-                    plan.context.total_context,
-                    candidate,
-                )?;
-                last_miss = (w_req, ws_req);
-                if w_req <= weights_reserved && ws_req <= ws_reserved {
-                    chosen = Some(candidate);
-                    break;
-                }
-            }
-            let batch = chosen.ok_or_else(|| {
-                TuckmillError::new(
-                    ErrorCode::InvalidPlan,
-                    format!(
-                        "even a batch-1 Metal prefill needs {} of weights and {} of workspaces, beyond the plan's {} / {} reservations; refusing to allocate before admission",
-                        Bytes(last_miss.0),
-                        Bytes(last_miss.1),
-                        Bytes(weights_reserved),
-                        Bytes(ws_reserved)
-                    ),
-                )
-                .with_action("Raise --memory-budget or lower --context; the plan must cover the GPU arenas.")
-            })?;
-            // The verified file handle is passed through: Metal weights are
-            // read from the exact opened, digest-verified file — never a
-            // pathname reopen (a rename after verification must not matter).
-            let forward = gpu::MetalForward::open(
-                &artifact_file,
-                &insp,
-                &names,
-                &cfg,
-                kv_precision,
-                plan.context.total_context,
-                batch,
-            )?;
-            // Second verification: the measured allocations must also fit.
-            if forward.weights_bytes() > weights_reserved {
-                return Err(TuckmillError::new(
-                    ErrorCode::InvalidPlan,
-                    format!(
-                        "the plan reserves {} for weights but the Metal path holds {} resident on the GPU",
-                        Bytes(weights_reserved),
-                        Bytes(forward.weights_bytes())
-                    ),
-                ));
-            }
-            if forward.workspace_bytes() > ws_reserved {
-                return Err(TuckmillError::new(
-                    ErrorCode::InvalidPlan,
-                    format!(
-                        "the plan reserves {} for workspaces but the Metal path holds {}",
-                        Bytes(ws_reserved),
-                        Bytes(forward.workspace_bytes())
-                    ),
-                ));
-            }
-            note_batch = Some(batch);
-            Some(Arc::new(forward))
-        } else {
-            None
-        };
-
         let entries = forward::tensor_entries(&insp, policy.block_bytes);
-        // The Metal path reads through the same verified handle; the CPU
-        // loader (kept for stats/trim bookkeeping) gets a clone of the same
-        // file description — never a pathname reopen.
-        let loader_file = if metal_mode {
-            artifact_file.try_clone().map_err(|e| {
-                TuckmillError::new(
-                    ErrorCode::Io,
-                    format!("cannot clone the verified artifact handle: {e}"),
-                )
-            })?
-        } else {
-            artifact_file
-        };
         let loader = Arc::new(BlockLoader::open_file(
-            loader_file,
+            artifact_file,
             insp.data_start,
             entries,
             policy,
@@ -635,21 +550,7 @@ impl InferenceBackend for TuckCore {
             note.push_str(&extra);
         }
         ProfileCounters::record(&counters.load_nanos, load_start);
-        // On the Metal path the retained allocation is the resident GPU
-        // weight footprint; the CPU weight cache is never exercised.
-        let retained_weight_bytes = match &metal {
-            Some(m) => m.weights_bytes(),
-            None => cache_wanted,
-        };
-        if let Some(m) = &metal {
-            note.push_str(&format!(
-                "; Metal resident path: {} weights + {} workspaces on the GPU (kernels: metal, prefill batch {})",
-                Bytes(m.weights_bytes()),
-                Bytes(m.workspace_bytes()),
-                note_batch.unwrap_or(1)
-            ));
-        }
-        self.hybrid = None;
+        self.engine = None;
         self.loaded = Some(Loaded {
             loader,
             tracker,
@@ -661,15 +562,14 @@ impl InferenceBackend for TuckCore {
             counters,
             kernels,
             session_kv_bytes: Arc::new(AtomicU64::new(0)),
-            retained_weight_bytes,
-            metal,
+            retained_weight_bytes: cache_wanted,
         });
         crate::release_freed_heap();
         Ok(note)
     }
 
     fn generate(&mut self, req: &GenerateRequest, ctl: &mut GenControl<'_>) -> Result<GenOutcome> {
-        let context_total = match (&self.loaded, &self.hybrid) {
+        let context_total = match (&self.loaded, &self.engine) {
             (Some(l), _) => l.context_total,
             (None, Some(h)) => h.context_total,
             (None, None) => {
@@ -702,14 +602,14 @@ impl InferenceBackend for TuckCore {
             ));
         }
 
-        if let Some(hybrid) = &self.hybrid {
+        if let Some(hybrid) = &self.engine {
             // Every request starts from a zeroed session: recurrent and KV
             // state are never carried from one request into another.
             hybrid.model.reset()?;
             hybrid
                 .session_kv_bytes
                 .store(hybrid.alloc.state, Ordering::Relaxed);
-            let mut engine = StepEngine::Hybrid {
+            let mut engine = StepEngine::Engine {
                 model: &hybrid.model,
             };
             let spec = SessionSpec {
@@ -745,43 +645,29 @@ impl InferenceBackend for TuckCore {
         loaded
             .session_kv_bytes
             .store(session_kv_bytes, Ordering::Relaxed);
-        let mut engine = match &loaded.metal {
-            Some(metal) => {
-                // GPU session: fresh per-request KV (f32 entries, matching
-                // KvState::bytes_for exactly), no shared state across runs.
-                let kv = metal.new_kv(session_context)?;
-                debug_assert_eq!(kv.allocated_bytes(), session_kv_bytes);
-                StepEngine::Gpu { forward: metal, kv }
-            }
-            None => {
-                let kv = KvState::new(&loaded.weights.cfg, session_context, loaded.kv_precision)?;
-                StepEngine::Cpu {
-                    fwd: Box::new(Forward {
-                        loader: &loaded.loader,
-                        tracker: &loaded.tracker,
-                        weights: &loaded.weights,
-                        profile: loaded.profile,
-                        kernels: loaded.kernels,
-                        kv_precision: loaded.kv_precision,
-                        control: &control,
-                        counters: if loaded.counters.enabled {
-                            Some(&loaded.counters)
-                        } else {
-                            None
-                        },
-                    }),
-                    kv,
-                }
-            }
+        let kv = KvState::new(&loaded.weights.cfg, session_context, loaded.kv_precision)?;
+        let mut engine = StepEngine::Cpu {
+            fwd: Box::new(Forward {
+                loader: &loaded.loader,
+                tracker: &loaded.tracker,
+                weights: &loaded.weights,
+                profile: loaded.profile,
+                kernels: loaded.kernels,
+                kv_precision: loaded.kv_precision,
+                control: &control,
+                counters: if loaded.counters.enabled {
+                    Some(&loaded.counters)
+                } else {
+                    None
+                },
+            }),
+            kv,
         };
 
         let spec = SessionSpec {
             tokenizer: &loaded.tokenizer,
             eos_token_id: loaded.weights.cfg.eos_token_id,
-            prefill_batch: match &loaded.metal {
-                Some(m) => m.prefill_batch() as usize,
-                None => 1,
-            },
+            prefill_batch: 1,
             per_token_delay: self.per_token_delay,
         };
         run_session(&mut engine, &spec, req, ctl)
@@ -794,8 +680,8 @@ impl InferenceBackend for TuckCore {
         cancelled: &dyn Fn() -> bool,
         sink: &mut dyn FnMut(u64, &[f32]) -> bool,
     ) -> Result<u64> {
-        if let Some(hybrid) = &self.hybrid {
-            return Self::score_hybrid(hybrid, tokens, positions, cancelled, sink);
+        if let Some(hybrid) = &self.engine {
+            return Self::score_engine(hybrid, tokens, positions, cancelled, sink);
         }
         let loaded = self.loaded.as_ref().ok_or_else(|| {
             TuckmillError::new(ErrorCode::WorkerFailed, "tuckcore has no loaded artifact")
@@ -826,10 +712,7 @@ impl InferenceBackend for TuckCore {
                 ));
             }
             let pos = *position as usize;
-            let logits = match &loaded.metal {
-                Some(metal) => metal.logits_at(tokens, pos, cancelled)?,
-                None => fwd.logits_at(tokens, pos, cancelled)?,
-            };
+            let logits = fwd.logits_at(tokens, pos, cancelled)?;
             scored += 1;
             if !sink(*position, &logits) {
                 break;
@@ -843,30 +726,23 @@ impl InferenceBackend for TuckCore {
     }
 
     fn stats(&self) -> BackendStats {
-        if let Some(hybrid) = &self.hybrid {
-            return Self::hybrid_stats(hybrid);
+        if let Some(hybrid) = &self.engine {
+            return Self::engine_stats(hybrid);
         }
         match &self.loaded {
             Some(loaded) => {
                 let s = loaded.loader.stats();
                 let residency = loaded.loader.residency();
-                let storage = if loaded.metal.is_some() {
-                    None
-                } else {
-                    Some(StorageStats {
-                        mode: s.storage_mode.clone(),
-                        owned_cache_bytes: s.owned_cache_bytes,
-                        owned_in_flight_bytes: loaded.tracker.in_flight_owned_bytes(),
-                        mapped_vm_bytes: s.mapped_vm_bytes,
-                        mapped_resident_bytes: residency.as_ref().map(|r| r.resident_bytes),
-                        mapped_resident_sampled: residency
-                            .as_ref()
-                            .map(|r| r.sampled)
-                            .unwrap_or(false),
-                        page_size_bytes: residency.as_ref().map(|r| r.page_size_bytes).unwrap_or(0),
-                        page_advice_bytes: s.page_advice_bytes,
-                    })
-                };
+                let storage = Some(StorageStats {
+                    mode: s.storage_mode.clone(),
+                    owned_cache_bytes: s.owned_cache_bytes,
+                    owned_in_flight_bytes: loaded.tracker.in_flight_owned_bytes(),
+                    mapped_vm_bytes: s.mapped_vm_bytes,
+                    mapped_resident_bytes: residency.as_ref().map(|r| r.resident_bytes),
+                    mapped_resident_sampled: residency.as_ref().map(|r| r.sampled).unwrap_or(false),
+                    page_size_bytes: residency.as_ref().map(|r| r.page_size_bytes).unwrap_or(0),
+                    page_advice_bytes: s.page_advice_bytes,
+                });
                 BackendStats {
                     logical_read_bytes: s.logical_read_bytes,
                     blocks_loaded: s.blocks_loaded,
@@ -891,9 +767,9 @@ impl InferenceBackend for TuckCore {
                     // Dense KV is allocated per request; nothing is held.
                     retained_state_bytes: None,
                     trims_applied: Some(loaded.counters.trims_applied.load(Ordering::Relaxed)),
-                    gpu_allocated_bytes: loaded.metal.as_ref().map(|m| m.allocated_bytes()),
-                    retained_workspace_bytes: loaded.metal.as_ref().map(|m| m.workspace_bytes()),
-                    prefill_batch: loaded.metal.as_ref().map(|m| m.prefill_batch()),
+                    gpu_allocated_bytes: None,
+                    retained_workspace_bytes: None,
+                    prefill_batch: None,
                     threads: Some(1), // scalar executor is single-threaded
                     kernel_impl: Some(loaded.kernels.as_str().to_string()),
                     numerical_profile: Some(loaded.profile.as_str().to_string()),
@@ -928,7 +804,7 @@ impl InferenceBackend for TuckCore {
     }
 
     fn shutdown(&mut self) {
-        self.hybrid = None;
+        self.engine = None;
         if let Some(loaded) = self.loaded.take() {
             loaded.loader.evict_all();
             // Leases must have drained; anything left would be a bug.
@@ -1185,21 +1061,18 @@ fn run_session(
     Ok(outcome.with_timing(timing))
 }
 
-/// One request's execution session: the CPU scalar forward with its f32
-/// KV, or the Metal resident forward with its GPU KV. Selection happened at
-/// load (`--kernels`); there is no per-step fallback.
+/// One request's execution session: the CPU forward with its KV, or the
+/// unified engine on Metal. Selection happened at load (`--kernels`); there
+/// is no per-step fallback.
 enum StepEngine<'a> {
     Cpu {
         fwd: Box<Forward<'a>>,
         kv: KvState,
     },
-    Gpu {
-        forward: &'a gpu::MetalForward,
-        kv: gpu::MetalKv,
-    },
-    /// Qwen3.5 hybrid on the GPU: the model owns its (reset) session state
-    /// and its position counter; tokens are processed strictly in order.
-    Hybrid {
+    /// The unified engine on the GPU: the model owns its (reset) session
+    /// state and its position counter; tokens are processed strictly in
+    /// order.
+    Engine {
         model: &'a EngineModel,
     },
 }
@@ -1218,10 +1091,7 @@ impl<'a> StepEngine<'a> {
             StepEngine::Cpu { fwd, kv } => {
                 *logits = fwd.forward_token(kv, token, pos, cancelled)?;
             }
-            StepEngine::Gpu { forward, kv } => {
-                *logits = forward.forward_token(kv, token, pos, cancelled)?;
-            }
-            StepEngine::Hybrid { model } => hybrid_step(model, token, pos, cancelled, logits)?,
+            StepEngine::Engine { model } => engine_step(model, token, pos, cancelled, logits)?,
         }
         Ok(())
     }
@@ -1229,7 +1099,7 @@ impl<'a> StepEngine<'a> {
     /// Whether greedy choices can be made on the device (only the 4-byte
     /// token crosses to the host); identical to the CPU greedy rule.
     fn device_greedy(&self) -> bool {
-        matches!(self, StepEngine::Hybrid { .. })
+        matches!(self, StepEngine::Engine { .. })
     }
 
     /// Device-greedy prefill chunk: `Some(choice)` for the final chunk
@@ -1241,10 +1111,10 @@ impl<'a> StepEngine<'a> {
         last: bool,
         cancelled: &dyn Fn() -> bool,
     ) -> Result<Option<Option<u32>>> {
-        let StepEngine::Hybrid { model } = self else {
+        let StepEngine::Engine { model } = self else {
             return Err(device_greedy_unsupported());
         };
-        hybrid_chunk_preamble(model, start, cancelled)?;
+        engine_chunk_preamble(model, start, cancelled)?;
         if last {
             Ok(Some(model.prefill_chunk_greedy(tokens)?))
         } else {
@@ -1257,14 +1127,14 @@ impl<'a> StepEngine<'a> {
     /// (pipelined greedy decoding talks to it directly).
     fn engine_model(&self) -> Option<&'a EngineModel> {
         match self {
-            StepEngine::Hybrid { model } => Some(*model),
+            StepEngine::Engine { model } => Some(*model),
             _ => None,
         }
     }
 
     /// Process a prefix chunk; logits are produced only when requested
     /// (the last chunk of a prefill). The CPU arm keeps its single-token
-    /// semantics; the Metal arm batches the whole chunk.
+    /// semantics; the engine arm batches the whole chunk.
     fn prefill_chunk(
         &mut self,
         tokens: &[u32],
@@ -1280,14 +1150,11 @@ impl<'a> StepEngine<'a> {
                 }
                 Ok(if want_logits { last } else { None })
             }
-            StepEngine::Gpu { forward, kv } => {
-                forward.prefill_chunk(kv, tokens, start, want_logits, cancelled)
-            }
             // Batched prefill (Q35-2D): one command buffer per chunk of at
             // most PREFILL_BATCH tokens; cancellation is honored between
             // chunks.
-            StepEngine::Hybrid { model } => {
-                hybrid_chunk_preamble(model, start, cancelled)?;
+            StepEngine::Engine { model } => {
+                engine_chunk_preamble(model, start, cancelled)?;
                 let mut logits = Vec::new();
                 model.prefill_chunk(tokens, want_logits, &mut logits)?;
                 Ok(if want_logits { Some(logits) } else { None })
@@ -1307,7 +1174,7 @@ fn device_greedy_unsupported() -> TuckmillError {
 }
 
 /// Chunk-boundary checks shared by the hybrid prefill paths.
-fn hybrid_chunk_preamble(
+fn engine_chunk_preamble(
     model: &EngineModel,
     start: usize,
     cancelled: &dyn Fn() -> bool,
@@ -1331,7 +1198,7 @@ fn hybrid_chunk_preamble(
 }
 
 /// Token-boundary checks shared by the hybrid decode paths.
-fn hybrid_preamble(model: &EngineModel, pos: usize, cancelled: &dyn Fn() -> bool) -> Result<()> {
+fn engine_preamble(model: &EngineModel, pos: usize, cancelled: &dyn Fn() -> bool) -> Result<()> {
     if cancelled() {
         return Err(TuckmillError::new(
             ErrorCode::Cancelled,
@@ -1350,14 +1217,14 @@ fn hybrid_preamble(model: &EngineModel, pos: usize, cancelled: &dyn Fn() -> bool
     Ok(())
 }
 
-fn hybrid_step(
+fn engine_step(
     model: &EngineModel,
     token: u32,
     pos: usize,
     cancelled: &dyn Fn() -> bool,
     logits: &mut Vec<f32>,
 ) -> Result<()> {
-    hybrid_preamble(model, pos, cancelled)?;
+    engine_preamble(model, pos, cancelled)?;
     model.forward_token(token, logits)
 }
 
@@ -1365,9 +1232,13 @@ fn hybrid_step(
 /// Q8_0/F16 weights, resolved implementation "metal".
 const HYBRID_KERNEL_ID: &str = "Q35-2C:qwen35-q8_0+f16:metal";
 
+/// Identity of dense Qwen3 on the unified engine (ADR-011 step 2), over raw
+/// Q8_0/F16 weights, resolved implementation "metal".
+const QWEN3_ENGINE_KERNEL_ID: &str = "ADR011:qwen3-q8_0+f16:metal";
+
 /// Load-time facts the shared verification prologue hands to the hybrid
 /// loader.
-struct HybridLoadContext {
+struct EngineLoadContext {
     payload: u64,
     content_verified: bool,
     counters: ProfileCounters,
@@ -1388,7 +1259,7 @@ impl TuckCore {
         kernels: ResolvedKernels,
         insp: &tuckmill_manifest::gguf::GgufInspection,
         artifact_file: &std::fs::File,
-        ctx: HybridLoadContext,
+        ctx: EngineLoadContext,
     ) -> Result<String> {
         if kernels != ResolvedKernels::Metal {
             return Err(TuckmillError::new(
@@ -1443,14 +1314,103 @@ impl TuckCore {
         // Reuses the identity-checked inspection (hashes vs the record, full
         // content digest of this handle) instead of parsing it again.
         let source = ArtifactTensorSource::with_inspection(artifact_file, insp)?;
+        let graph = crate::engine::adapters::qwen35(source.config(), source.layout());
+        self.load_engine(
+            plan,
+            artifact,
+            insp,
+            graph,
+            &source,
+            KvCache::F16,
+            HYBRID_KERNEL_ID,
+            ctx,
+        )
+    }
+
+    /// ADR-011 step 2: load a verified dense `qwen3` artifact onto the
+    /// unified engine (`--kernels metal`). Options that do not apply are
+    /// refused; the declared KV precision (f32 by default, as on the CPU
+    /// path) is honored exactly.
+    #[allow(clippy::too_many_arguments)]
+    fn load_qwen3_engine(
+        &mut self,
+        plan: &ExecutionPlan,
+        artifact: &ArtifactRef,
+        opts: &TuckCoreOptions,
+        cfg: &model::Qwen3Config,
+        kv_precision: KvPrecision,
+        insp: &tuckmill_manifest::gguf::GgufInspection,
+        artifact_file: &std::fs::File,
+        ctx: EngineLoadContext,
+    ) -> Result<String> {
+        if plan.mode != ExecutionMode::Resident {
+            return Err(TuckmillError::new(
+                ErrorCode::InvalidPlan,
+                format!(
+                    "the Metal path is resident-only, but the plan mode is {}; GPU streaming is not implemented (the CPU kernels stream)",
+                    plan.mode.as_str()
+                ),
+            )
+            .with_action("Raise --memory-budget so the plan is resident, lower --context, or use the CPU kernels."));
+        }
+        if opts.prefill_batch.is_some() {
+            return Err(TuckmillError::new(
+                ErrorCode::InvalidRequest,
+                format!(
+                    "the unified engine prefills in fixed chunks of {} tokens; prefill_batch must not be set",
+                    engine_metal::PREFILL_BATCH
+                ),
+            ));
+        }
+        if opts.weight_cache_bytes.is_some() || opts.block_bytes.is_some() {
+            return Err(TuckmillError::new(
+                ErrorCode::InvalidRequest,
+                "weight-cache and block options apply to CPU weight streaming; the Metal path keeps weights resident",
+            ));
+        }
+        let mut names = model::TensorNames::for_layers(cfg.layers);
+        names.resolve(insp)?;
+        let graph = crate::engine::adapters::qwen3(cfg, &names, insp)?;
+        let source = crate::engine::GgufWeights::with_inspection(artifact_file, insp)?;
+        let kv = match kv_precision {
+            KvPrecision::F32 => KvCache::F32,
+            KvPrecision::F16 => KvCache::F16,
+        };
+        self.load_engine(
+            plan,
+            artifact,
+            insp,
+            graph,
+            &source,
+            kv,
+            QWEN3_ENGINE_KERNEL_ID,
+            ctx,
+        )
+    }
+
+    /// The load shared by every engine-served family: per-class plan
+    /// checks before any GPU allocation, the exact preflighted upload, and
+    /// the ledger == plan check after it.
+    #[allow(clippy::too_many_arguments)]
+    fn load_engine(
+        &mut self,
+        plan: &ExecutionPlan,
+        artifact: &ArtifactRef,
+        insp: &tuckmill_manifest::gguf::GgufInspection,
+        graph: crate::engine::ModelGraph,
+        source: &dyn crate::engine::WeightSource,
+        kv: KvCache,
+        kernel_id: &str,
+        ctx: EngineLoadContext,
+    ) -> Result<String> {
         let capacity = usize::try_from(plan.context.total_context).map_err(|_| {
             TuckmillError::new(
                 ErrorCode::ContextExceedsBudget,
                 "admitted context does not fit this platform's address space",
             )
         })?;
-        let graph = crate::engine::adapters::qwen35(source.config(), source.layout());
-        let alloc = engine_metal::alloc_plan(&graph, &source, capacity)?;
+        let arch = graph.architecture.clone();
+        let alloc = engine_metal::alloc_plan_with(&graph, source, capacity, kv)?;
         let reserved = &plan.budget.reservation_breakdown;
         for (class, need, have) in [
             ("weights", alloc.weights, reserved.weights.bytes()),
@@ -1461,7 +1421,7 @@ impl TuckCore {
                 return Err(TuckmillError::new(
                     ErrorCode::InvalidPlan,
                     format!(
-                        "the plan reserves {} for {class} but the qwen35 GPU model needs {} at context {}; refusing before any GPU allocation",
+                        "the plan reserves {} for {class} but the {arch} GPU model needs {} at context {}; refusing before any GPU allocation",
                         Bytes(have),
                         Bytes(need),
                         plan.context.total_context
@@ -1470,20 +1430,31 @@ impl TuckCore {
                 .with_action("Rebuild the plan for this executor; understated reservations are never loaded."));
             }
         }
-        let model = EngineModel::load(Qwen35Gpu::open()?, graph, &source, capacity, alloc.total())?;
+        let model = EngineModel::load_with(
+            Qwen35Gpu::open()?,
+            graph,
+            source,
+            capacity,
+            alloc.total(),
+            kv,
+        )?;
         if model.allocated_bytes() != alloc.total() {
             return Err(TuckmillError::new(
                 ErrorCode::Internal,
                 format!(
-                    "qwen35 GPU ledger holds {} but the preflight priced {}; refusing an unaccounted allocation",
+                    "{arch} GPU ledger holds {} but the preflight priced {}; refusing an unaccounted allocation",
                     model.allocated_bytes(),
                     alloc.total()
                 ),
             ));
         }
         let tokenizer = DecodeVocab::from_gguf(insp)?;
+        let kv_note = match kv {
+            KvCache::F16 => "kv f16 packed",
+            KvCache::F32 => "kv f32",
+        };
         let mut note = format!(
-            "tuckcore (experimental, uncertified): unified engine (ADR-011), graph {} with {} layers, vocab {}, kernels metal [oracle-f32], kv f16 packed, batched prefill x{}; real weights from {} ({} payload), GPU ledger {} = weights {} + state {} + scratch {}",
+            "tuckcore (experimental, uncertified): unified engine (ADR-011), graph {} with {} layers, vocab {}, kernels metal [oracle-f32], {kv_note}, batched prefill x{}; real weights from {} ({} payload), GPU ledger {} = weights {} + state {} + scratch {}",
             model.graph().architecture,
             model.graph().layers.len(),
             model.graph().vocab,
@@ -1509,9 +1480,11 @@ impl TuckCore {
         }
         ProfileCounters::record(&ctx.counters.load_nanos, ctx.load_start);
         self.loaded = None;
-        self.hybrid = Some(HybridLoaded {
+        self.engine = Some(EngineLoaded {
             eos_token_id: model.graph().eos_token_id,
             model,
+            kv,
+            kernel_id: kernel_id.to_string(),
             tokenizer,
             context_total: plan.context.total_context,
             alloc,
@@ -1525,8 +1498,8 @@ impl TuckCore {
     /// Teacher-forced scoring on the hybrid path: the session is replayed
     /// in order from a reset state, so logits at a position always come
     /// from exactly the tokens before and at it.
-    fn score_hybrid(
-        hybrid: &HybridLoaded,
+    fn score_engine(
+        hybrid: &EngineLoaded,
         tokens: &[u32],
         positions: &[u64],
         cancelled: &dyn Fn() -> bool,
@@ -1564,9 +1537,9 @@ impl TuckCore {
         Ok(scored)
     }
 
-    fn hybrid_stats(hybrid: &HybridLoaded) -> BackendStats {
+    fn engine_stats(hybrid: &EngineLoaded) -> BackendStats {
         BackendStats {
-            kv_precision: Some("f16".to_string()),
+            kv_precision: Some(hybrid.kv.as_str().to_string()),
             kv_state_bytes: Some(hybrid.alloc.state),
             session_kv_bytes: match hybrid.session_kv_bytes.load(Ordering::Relaxed) {
                 0 => None,
@@ -2049,7 +2022,12 @@ mod tests {
                 Some(&serde_json::json!({"kernels": "metal"})),
             )
             .unwrap();
-        assert!(note.contains("Metal resident path"), "{note}");
+        assert!(
+            note.contains("unified engine")
+                && note.contains("graph qwen3 ")
+                && note.contains("kv f32"),
+            "{note}"
+        );
 
         // Teacher-forced logits on a fixed sequence (held positions).
         let tokens: Vec<u32> = vec![1, 9, 4, 17, 5, 23];
@@ -2117,6 +2095,86 @@ mod tests {
             "GPU resident path has no CPU storage mode"
         );
         assert!(st.retained_weight_bytes.unwrap_or(0) > 0);
+    }
+
+    /// ADR-011 step 2: dense Qwen3 on the engine with declared f16 KV
+    /// matches the CPU oracle with the same declared precision (packed f16
+    /// holds exactly the values the CPU stores as f16-rounded f32).
+    #[test]
+    fn metal_engine_f16_kv_matches_the_cpu_oracle_on_fixture() {
+        if !metal_or_skip() {
+            return;
+        }
+        let (_dir, artifact, plan) = fixture();
+        let mut cpu = TuckCore::new();
+        cpu.load(
+            &plan,
+            &artifact,
+            Some(&serde_json::json!({"kernels": "scalar", "kv_precision": "f16"})),
+        )
+        .unwrap();
+        let mut gpu = TuckCore::new();
+        let note = gpu
+            .load(
+                &plan,
+                &artifact,
+                Some(&serde_json::json!({"kernels": "metal", "kv_precision": "f16"})),
+            )
+            .unwrap();
+        assert!(note.contains("kv f16 packed"), "{note}");
+        assert_eq!(gpu.stats().kv_precision.as_deref(), Some("f16"));
+        let tokens: Vec<u32> = vec![1, 9, 4, 17, 5, 23];
+        let positions = [1u64, 3, 5];
+        let collect = |engine: &mut TuckCore| -> Vec<Vec<f32>> {
+            let mut out = Vec::new();
+            {
+                let mut sink = |_: u64, logits: &[f32]| {
+                    out.push(logits.to_vec());
+                    true
+                };
+                engine
+                    .score(&tokens, &positions, &|| false, &mut sink)
+                    .unwrap();
+            }
+            out
+        };
+        for (a, b) in collect(&mut cpu).iter().zip(collect(&mut gpu).iter()) {
+            let scale = a.iter().fold(0f32, |m, v| m.max(v.abs())).max(1.0);
+            let max_diff = a
+                .iter()
+                .zip(b.iter())
+                .fold(0f32, |m, (x, y)| m.max((x - y).abs()));
+            assert!(
+                max_diff <= 1e-2 * scale,
+                "max |diff| {max_diff} over {scale}"
+            );
+            assert_eq!(sampling::argmax(a), sampling::argmax(b), "top-1");
+        }
+        let (_, cpu_text) = run_generate_with(
+            &mut cpu,
+            tokens.clone(),
+            6,
+            vec![],
+            0,
+            SamplingPolicy::default(),
+        );
+        let (_, gpu_text) =
+            run_generate_with(&mut gpu, tokens, 6, vec![], 0, SamplingPolicy::default());
+        assert_eq!(cpu_text, gpu_text, "greedy text with f16 KV");
+    }
+
+    #[test]
+    fn metal_engine_refuses_options_it_cannot_honor_for_qwen3() {
+        let (_dir, artifact, plan) = fixture();
+        for opts in [
+            serde_json::json!({"kernels": "metal", "prefill_batch": 4}),
+            serde_json::json!({"kernels": "metal", "weight_cache_bytes": 65536}),
+        ] {
+            let mut engine = TuckCore::new();
+            let err = engine.load(&plan, &artifact, Some(&opts)).unwrap_err();
+            assert_eq!(err.code(), ErrorCode::InvalidRequest, "{opts}: {err}");
+            assert!(!engine.is_loaded(), "{opts}: nothing is loaded on refusal");
+        }
     }
 
     /// Gate C2 milestone (release-gated, real weights): the Metal resident

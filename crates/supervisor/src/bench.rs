@@ -427,7 +427,9 @@ pub fn run_standard_bench(
         summary: summary.clone(),
         performance_class,
         confidence: Confidence::Estimated,
-        prefill_batch_requested: runtime.execution_options().prefill_batch,
+        // Prefill chunking is fixed by the engine (ADR-011); nothing is
+        // requested, the effective chunk is recorded.
+        prefill_batch_requested: None,
         prefill_batch_effective: resolved_batch,
         slow_mode_accepted: false,
         caveats,
