@@ -36,18 +36,22 @@ statements in [docs/claims.md](docs/claims.md).
 ### Measured against llama.cpp (Qwen3.5-0.8B Q8_0, M3 8 GB)
 
 Identity-matched harness (`scripts/bench-baseline.sh`): same artifact, same
-prompt tokens, 512 tokens in and 256 out, ABBA rounds. Two idle runs at
-`171e53c`, locally-calibrated:
+prompt tokens, 512 tokens in and 256 out, ABBA rounds. Idle run at
+`d95ecc1`, locally-calibrated:
 
 | | TuckCore | llama.cpp Metal | Ratio |
 | --- | --- | --- | --- |
-| Time to first token | 0.311 s | 0.275-0.283 s | 88-91% of llama.cpp |
-| Decode | 83.8-84.3 tok/s | 66.9-68.2 tok/s | 0.99-1.28× (paired) |
+| Time to first token | 0.272 s | 0.270 s (0.269-0.287) | 99% of llama.cpp |
+| Decode | 84.3 tok/s | 75.9 tok/s (67.9-84.7) | 1.11× (0.99-1.24 paired) |
 
+- **Phase 1 bar** (≥ 90% of llama.cpp for decode and prefill): met in this
+  run on this model. It is one run, so a repeat comes before
+  certification.
 - **Decode** is at parity or ahead. llama.cpp's own decode in this harness
-  varies between runs (66-68 or about 84 tok/s), so this is not stated as
-  a lead.
-- **Prefill** is just short of the Phase 1 bar (≥ 90%, not yet confirmed).
+  varies between runs (about 66-85 tok/s), so this is not stated as a
+  lead.
+- **Remaining prefill difference:** f16 vs f32 operand precision. TuckCore
+  keeps f32 (ADR-011).
 - **Not measured:** other models, contexts and memory tiers. Records are in
   [benchmarks/results/](benchmarks/results/).
 
