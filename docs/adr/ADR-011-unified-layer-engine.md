@@ -512,3 +512,42 @@ three passes each; full prefill ~330 ms):
 - **Remaining.** `forward.rs` stays as the CPU executor and oracle until
   the graph-driven CPU engine exists (a later step with its own gate).
   Dense Qwen3 performance vs llama.cpp is not measured yet.
+
+## Engine note (2026-10-27): dense Qwen3 prefill — attention scores without reductions
+
+- **Profile.** Pinned Qwen3-0.6B Q8_0, 512 tokens, f16 KV, ungrouped,
+  from the new opt-in `real_qwen3_prefill_timing_and_profile_when_available`
+  test:
+  - GEMM 207 ms (62%), at llama.cpp's speed except the documented f16
+    operand precision;
+  - attention 77 ms (23%): every one of the 28 layers is full attention
+    (head_dim 128, group 2);
+  - RMS norm 23 ms, mostly per-buffer overhead.
+- **Attention split** (throwaway diagnostic builds): the value pass was
+  ~30 ms, the per-key SIMD reductions of the scores ~15 ms, and score
+  loads and softmax ~31 ms. At head_dim 128 each lane held 4 dims, so
+  every score paid a 5-step reduction for 4 FMAs.
+- **Tried and not kept:** R = 4 query rows per threadgroup sharing K/V
+  loads. It was bit-identical but slower (attention 77 -> 131 ms): 4x
+  fewer threadgroups while the per-key reductions stayed serial.
+- **Kept, both in `tm_qwen35_attention_gqa`:**
+  - The G queries are staged in threadgroup memory, and each thread owns
+    whole keys: one sequential dot product per (key, head), with no
+    cross-lane reduction.
+  - The value pass reads probabilities from 256-key tiles in threadgroup
+    memory instead of device scratch, in the same per-SIMD-group key
+    order.
+  - Decode runs the same kernel (n = 1), so prefill and decode stay
+    bit-identical; the fixture gate passes unchanged.
+- **Measured** (prebuilt binaries alternated):
+  - Qwen3-0.6B 512-token prefill: 298-299 -> 261-262 ms; attention GPU
+    time 76-78 -> 40-41 ms; batched vs sequential 1.89e-3 at logit scale
+    11.5, top-1 equal.
+  - Qwen3.5-0.8B prefill unchanged (287-290 ms); drift 3.20e-4 /
+    3.93e-4, within its bound.
+  - Decode attention per token at a short context unchanged (0.126 ms).
+  - Real-model accuracy got slightly better (sequential dot products):
+    - Qwen3 vs the CPU oracle: 4.196e-5 -> 3.600e-5;
+    - Qwen3.5 logits vs the oracle: 2.78e-4 -> 2.71e-4;
+    - `verify --reference` vs pinned llama.cpp: PASS (max 0.349, top-1
+      100%, generated texts equal).

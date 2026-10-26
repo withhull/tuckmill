@@ -1064,8 +1064,9 @@ tm_qwen35_attention_chunk<float>(TM_ATTN_CHUNK_ARGS(float));
  * starting at `pos0` (decode is the n = 1 case, so prefill and decode run
  * one compiled kernel). Each K and V row is read once for all G heads
  * instead of once per head.
- * - Scores: SIMD groups take keys in turn; lane l holds head dims
- *   [l * EPL, (l + 1) * EPL) of every head's query in registers.
+ * - Scores: the G queries are staged in threadgroup memory and each
+ *   thread owns whole keys, one sequential dot product per (key, head)
+ *   with no cross-lane reduction.
  * - Softmax: SIMD group h normalizes head h with SIMD-only reductions,
  *   with the per-element expression of tm_q35_attend.
  * - Values: SIMD groups split the keys (j = sg mod 4), lane l accumulates
@@ -1092,6 +1093,9 @@ kernel void tm_qwen35_attention_gqa(device const float *q [[buffer(0)]],
                                     uint sg [[simdgroup_index_in_threadgroup]]) {
     constexpr uint EPL = (HD + 31u) / 32u;
     threadgroup float partial[4u * G * HD];
+    threadgroup float qt[G * HD];
+    constexpr uint PT = 256u; /* probability tile (keys) */
+    threadgroup float pt[G * PT];
     if (head_dim != HD || group != G) {
         return;
     }
@@ -1104,26 +1108,27 @@ kernel void tm_qwen35_attention_gqa(device const float *q [[buffer(0)]],
     const device C *kc = k_cache + (size_t)kv_head * (size_t)cap * HD;
     const device C *vc = v_cache + (size_t)kv_head * (size_t)cap * HD;
 
-    float qv[G][EPL];
-    for (uint h = 0; h < G; ++h) {
-        for (uint e = 0; e < EPL; ++e) {
-            qv[h][e] = active ? q[(row0 + h) * HD + d0 + e] : 0.0f;
-        }
+    /* Scores: the G query vectors sit in threadgroup memory and every
+     * thread owns whole keys (key j = tid, tid + 128, ...), so each score
+     * is one sequential dot product with no cross-lane reduction. */
+    for (uint idx = tid; idx < G * HD; idx += 128u) {
+        qt[idx] = q[row0 * HD + idx];
     }
-    for (uint j = sg; j < seq; j += 4u) {
-        float kv[EPL];
-        for (uint e = 0; e < EPL; ++e) {
-            kv[e] = active ? (float)kc[(size_t)j * HD + d0 + e] : 0.0f;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint j = tid; j < seq; j += 128u) {
+        const device C *kr = kc + (size_t)j * HD;
+        float part[G];
+        for (uint h = 0; h < G; ++h) {
+            part[h] = 0.0f;
+        }
+        for (uint d = 0; d < HD; d += 4u) {
+            const float4 k4 = float4(*(const device vec<C, 4> *)(kr + d));
+            for (uint h = 0; h < G; ++h) {
+                part[h] += dot(*(const threadgroup float4 *)(qt + h * HD + d), k4);
+            }
         }
         for (uint h = 0; h < G; ++h) {
-            float part = 0.0f;
-            for (uint e = 0; e < EPL; ++e) {
-                part += qv[h][e] * kv[e];
-            }
-            const float s = simd_sum(part) * scale;
-            if (lane == 0u) {
-                scratch[(row0 + h) * cap + j] = s;
-            }
+            scratch[(row0 + h) * cap + j] = part[h] * scale;
         }
     }
     threadgroup_barrier(mem_flags::mem_device | mem_flags::mem_threadgroup);
@@ -1152,17 +1157,33 @@ kernel void tm_qwen35_attention_gqa(device const float *q [[buffer(0)]],
             acc[h][e] = 0.0f;
         }
     }
-    for (uint j = sg; j < seq; j += 4u) {
-        float vv[EPL];
-        for (uint e = 0; e < EPL; ++e) {
-            vv[e] = active ? (float)vc[(size_t)j * HD + d0 + e] : 0.0f;
-        }
-        for (uint h = 0; h < G; ++h) {
-            const float p = scratch[(row0 + h) * cap + j];
-            for (uint e = 0; e < EPL; ++e) {
-                acc[h][e] += p * vv[e];
+    /* Values: probabilities are staged per tile of PT keys in threadgroup
+     * memory; each SIMD group still takes keys j = sg mod 4 in ascending
+     * order, so the accumulation order is unchanged. */
+    for (uint base = 0; base < seq; base += PT) {
+        const uint tile = min(PT, seq - base);
+        for (uint idx = tid; idx < G * PT; idx += 128u) {
+            const uint h = idx / PT;
+            const uint jj = idx % PT;
+            if (jj < tile) {
+                pt[idx] = scratch[(row0 + h) * cap + base + jj];
             }
         }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint jj = sg; jj < tile; jj += 4u) {
+            const uint j = base + jj;
+            float vv[EPL];
+            for (uint e = 0; e < EPL; ++e) {
+                vv[e] = active ? (float)vc[(size_t)j * HD + d0 + e] : 0.0f;
+            }
+            for (uint h = 0; h < G; ++h) {
+                const float p = pt[h * PT + jj];
+                for (uint e = 0; e < EPL; ++e) {
+                    acc[h][e] += p * vv[e];
+                }
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
     }
     if (active) {
         for (uint h = 0; h < G; ++h) {

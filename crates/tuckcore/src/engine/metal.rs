@@ -2894,3 +2894,117 @@ mod qwen3_tests {
         }
     }
 }
+
+#[cfg(test)]
+mod qwen3_real_tests {
+    use super::*;
+
+    /// Measurement (opt-in): 512-token prefill of the pinned dense Qwen3
+    /// (`TUCKMILL_REAL_GGUF`) on the engine with declared f16 KV, batched vs
+    /// sequential drift, and with `TUCKMILL_PROFILE=1` the ungrouped GPU time
+    /// per operator.
+    #[test]
+    fn real_qwen3_prefill_timing_and_profile_when_available() {
+        let Some(path) = std::env::var("TUCKMILL_REAL_GGUF")
+            .ok()
+            .map(std::path::PathBuf::from)
+            .filter(|p| p.exists())
+        else {
+            eprintln!("skipping: TUCKMILL_REAL_GGUF not set");
+            return;
+        };
+        if !tuckmill_metal::probe().available {
+            eprintln!("skipping: no Metal device");
+            return;
+        }
+        let file = std::fs::File::open(&path).unwrap();
+        let insp =
+            tuckmill_manifest::gguf::inspect(&path, &tuckmill_manifest::gguf::Limits::default())
+                .unwrap();
+        let registry = tuckmill_manifest::adapter::AdapterRegistry::builtin().unwrap();
+        let Ok((cfg, _)) = crate::model::resolve(&insp, &registry) else {
+            eprintln!("skipping: TUCKMILL_REAL_GGUF is not a dense Qwen3 artifact");
+            return;
+        };
+        let mut names = crate::model::TensorNames::for_layers(cfg.layers);
+        names.resolve(&insp).unwrap();
+        let graph = super::super::adapters::qwen3(&cfg, &names, &insp).unwrap();
+        let source = super::super::GgufWeights::with_inspection(&file, &insp).unwrap();
+        let capacity = 640usize;
+        let kv = KvCache::F16;
+        let plan = alloc_plan_with(&graph, &source, capacity, kv).unwrap();
+        let model = EngineModel::load_with(
+            Qwen35Gpu::open().unwrap(),
+            graph,
+            &source,
+            capacity,
+            plan.total(),
+            kv,
+        )
+        .unwrap();
+        let prompt: Vec<u32> = (0..512u32).map(|i| 1000 + (i * 7919) % 90_000).collect();
+        let prefill = |out: &mut Vec<f32>| {
+            let chunks: Vec<&[u32]> = prompt.chunks(PREFILL_BATCH).collect();
+            for (c, chunk) in chunks.iter().enumerate() {
+                model
+                    .prefill_chunk(chunk, c + 1 == chunks.len(), out)
+                    .unwrap();
+            }
+        };
+        model.reset().unwrap();
+        let mut warm = Vec::new();
+        prefill(&mut warm);
+        model.reset().unwrap();
+        let t0 = std::time::Instant::now();
+        let mut batched = Vec::new();
+        prefill(&mut batched);
+        let ms = t0.elapsed().as_secs_f64() * 1e3;
+        model.reset().unwrap();
+        let mut seq = Vec::new();
+        for t in &prompt {
+            model.forward_token(*t, &mut seq).unwrap();
+        }
+        let drift = batched
+            .iter()
+            .zip(&seq)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0f32, f32::max);
+        let scale = seq.iter().fold(0f32, |m, v| m.max(v.abs())).max(1.0);
+        eprintln!(
+            "qwen3 512-token prefill x{PREFILL_BATCH}: {ms:.0} ms ({:.0} tok/s); batched vs sequential max|diff| {drift:.3e} (logit scale {scale:.2})",
+            512e3 / ms
+        );
+        // The registered dense-Qwen3 GPU policy (executor tests): 1e-2 of
+        // the logit scale, and the same top-1.
+        assert!(drift <= 1e-2 * scale, "batched vs sequential within policy");
+        assert_eq!(
+            crate::sampling::argmax(&batched),
+            crate::sampling::argmax(&seq),
+            "top-1"
+        );
+
+        if std::env::var("TUCKMILL_PROFILE").ok().as_deref() == Some("1") {
+            let ctx = model.context();
+            model.reset().unwrap();
+            model.set_grouped(false);
+            ctx.set_profiling(true);
+            let mut l = Vec::new();
+            prefill(&mut l);
+            ctx.fence().unwrap();
+            let mut table = ctx.profile_snapshot();
+            ctx.set_profiling(false);
+            model.set_grouped(true);
+            table.sort_by_key(|row| std::cmp::Reverse(row.1));
+            let total: u64 = table.iter().map(|r| r.1).sum();
+            eprintln!("ungrouped qwen3 prefill GPU time per operator (512 tokens):");
+            for (label, nanos, count) in table.iter().take(16) {
+                eprintln!(
+                    "  {label:<28} {:>8.1} ms  {:>5.1}%  {:>6} buffers",
+                    *nanos as f64 / 1e6,
+                    100.0 * *nanos as f64 / total.max(1) as f64,
+                    count
+                );
+            }
+        }
+    }
+}
