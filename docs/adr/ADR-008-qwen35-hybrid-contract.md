@@ -371,3 +371,31 @@ never accepted by any real artifact.
 - Scope: sequential prefill (one token per step) and per-layer dispatch
   as qualified in Q35-2C. The measured baseline is recorded in
   `benchmarks/results/8gb/`; performance work is Q35-2D/Phase 1.
+
+## Addendum 14 (Phase 1B: decode profile, column-parallel delta rule)
+
+- **Measured first.** The Metal context now accumulates GPU time over
+  every completed command buffer (`tm_metal_gpu_nanos_total`) and, opt-in,
+  per operator label (`tm_metal_profile_set` / `_read`; grouped buffers
+  count as "group"). A machine-local harness
+  (`profile_pinned_decode_when_requested`, `TUCKMILL_PROFILE=1`) prints
+  per-token wall time, GPU busy time, command buffers, and GPU time per
+  operator on the pinned 0.8B.
+- **Finding.** The decode was GPU-bound, not dispatch-bound: wall 178.8
+  ms/token, GPU busy 177.5 ms (99%), host 1.25 ms for 495 command buffers.
+  `qwen35_gdn_step` took 153.6 ms (90%): one thread per head, 16 threads
+  walking 128×128 state serially. `q8_0_gemv` took 14.8 ms (8.7%).
+- **Change.** Each value column of a head's state is independent (its
+  decay, `s~ᵀk`, `d_j`, update and `o_j` touch only that column), so the
+  kernel now runs one thread per (head, column). Each thread keeps the
+  oracle's per-element arithmetic and ascending summation order over the
+  key dim, and recomputes `s~` instead of storing it.
+- **Qualification (unchanged tolerances).** Operator: pinned 16×128 max
+  |out diff| 2.441e-4, |state diff| 9.155e-5 (identical to Addendum 8).
+  Fixture model 6.6e-7 / 1.4e-6. Real artifact vs the CPU oracle: hidden
+  4.5e-5 (was 6.4e-5), logits 4.0e-4 (was 4.9e-4). Greedy output through
+  the worker still equals the CPU oracle token for token.
+- **Effect (profiler, pinned 0.8B, M3 8 GB).** 178.8 → 19.2 ms/token
+  (5.6 → 52.0 tok/s); `gdn_step` 153.6 → 1.25 ms. `q8_0_gemv` (15.1 ms,
+  81%, ~53 GB/s effective) now dominates. That is the next target (ADR-010
+  multi-row GEMV); prefill stays sequential (Q35-2D).

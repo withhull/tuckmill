@@ -1403,3 +1403,46 @@ fn batched_kv_store_and_attention_match_the_scalar_reference() {
         }
     }
 }
+
+#[test]
+fn gpu_time_is_accumulated_and_attributed_per_operator_when_profiling() {
+    let Some(ctx) = metal_context() else {
+        return;
+    };
+    let n = 1u32 << 16;
+    let a = ctx.buffer(n as usize * 4, true).unwrap();
+    let y = ctx.buffer(n as usize * 4, true).unwrap();
+
+    // Off by default: work runs, the total grows, nothing is attributed.
+    let before = ctx.gpu_nanos_total();
+    ctx.f32_axpy(&a, &y, 1.0, n).unwrap();
+    ctx.fence().unwrap();
+    assert!(ctx.gpu_nanos_total() >= before);
+    assert!(ctx.profile_snapshot().is_empty());
+
+    // On: every command buffer is attributed to its operator label, and
+    // a dispatch group counts as one "group" buffer.
+    ctx.set_profiling(true);
+    for _ in 0..3 {
+        ctx.f32_axpy(&a, &y, 1.0, n).unwrap();
+    }
+    ctx.begin_group().unwrap();
+    ctx.f32_axpy(&a, &y, 1.0, n).unwrap();
+    ctx.f32_axpy(&a, &y, 1.0, n).unwrap();
+    ctx.end_group().unwrap();
+    ctx.fence().unwrap();
+    let table = ctx.profile_snapshot();
+    let count = |label: &str| {
+        table
+            .iter()
+            .find(|(name, _, _)| name == label)
+            .map(|(_, _, c)| *c)
+            .unwrap_or(0)
+    };
+    assert_eq!(count("f32_axpy"), 3, "{table:?}");
+    assert_eq!(count("group"), 1, "{table:?}");
+
+    // Disabling clears the table.
+    ctx.set_profiling(false);
+    assert!(ctx.profile_snapshot().is_empty());
+}

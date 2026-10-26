@@ -475,6 +475,16 @@ mod imp {
         pub fn tm_metal_committed_dispatches(ctx: *const TmMetalCtx) -> u64;
         pub fn tm_metal_completed_dispatches(ctx: *const TmMetalCtx) -> u64;
         pub fn tm_metal_last_gpu_ms(ctx: *const TmMetalCtx) -> f64;
+        pub fn tm_metal_gpu_nanos_total(ctx: *const TmMetalCtx) -> u64;
+        pub fn tm_metal_profile_set(ctx: *mut TmMetalCtx, enabled: c_int) -> c_int;
+        pub fn tm_metal_profile_read(
+            ctx: *mut TmMetalCtx,
+            index: u32,
+            name: *mut c_char,
+            name_cap: usize,
+            nanos: *mut u64,
+            count: *mut u64,
+        ) -> c_int;
         pub fn tm_metal_allocated_bytes(ctx: *const TmMetalCtx) -> u64;
         pub fn tm_metal_in_flight_bytes(ctx: *const TmMetalCtx) -> u64;
     }
@@ -682,6 +692,66 @@ impl MetalContext {
         {
             0.0
         }
+    }
+
+    /// Cumulative GPU nanoseconds over every completed command buffer.
+    /// Wall time minus this over the same span is host/dispatch time.
+    pub fn gpu_nanos_total(&self) -> u64 {
+        #[cfg(target_os = "macos")]
+        unsafe {
+            // SAFETY: raw is valid while the inner lives.
+            imp::tm_metal_gpu_nanos_total(self.inner.raw)
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            0
+        }
+    }
+
+    /// Enable or disable per-operator GPU time attribution (profiling
+    /// only); either call clears the table. Grouped command buffers are
+    /// attributed to "group".
+    pub fn set_profiling(&self, enabled: bool) {
+        #[cfg(target_os = "macos")]
+        unsafe {
+            // SAFETY: raw is valid while the inner lives; the call only
+            // touches the context's lock-protected profile table.
+            imp::tm_metal_profile_set(self.inner.raw, enabled as c_int);
+        }
+        #[cfg(not(target_os = "macos"))]
+        let _ = enabled;
+    }
+
+    /// Per-operator GPU time recorded since profiling was enabled:
+    /// `(label, gpu_nanos, command_buffers)` in first-seen order.
+    pub fn profile_snapshot(&self) -> Vec<(String, u64, u64)> {
+        let mut out = Vec::new();
+        #[cfg(target_os = "macos")]
+        for index in 0u32.. {
+            let mut name = [0 as c_char; 40];
+            let (mut nanos, mut count) = (0u64, 0u64);
+            // SAFETY: raw is valid; the name buffer and out-pointers are
+            // valid for the declared capacities.
+            let found = unsafe {
+                imp::tm_metal_profile_read(
+                    self.inner.raw,
+                    index,
+                    name.as_mut_ptr(),
+                    name.len(),
+                    &mut nanos,
+                    &mut count,
+                )
+            };
+            if found == 0 {
+                break;
+            }
+            // SAFETY: the ABI NUL-terminates within the capacity.
+            let label = unsafe { std::ffi::CStr::from_ptr(name.as_ptr()) }
+                .to_string_lossy()
+                .into_owned();
+            out.push((label, nanos, count));
+        }
+        out
     }
 
     /// Allocate a GPU buffer. `shared` buffers are CPU-accessible (unified

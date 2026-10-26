@@ -8,6 +8,7 @@
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
 
+#include <os/lock.h>
 #include <stdatomic.h>
 #include <unistd.h>
 #include <stdio.h>
@@ -15,6 +16,22 @@
 #include <string.h>
 
 #include "tm_metal.h"
+
+#define TM_PROFILE_SLOTS 64
+#define TM_PROFILE_NAME 40
+
+/* One operator label's accumulated GPU time (profiling only). */
+typedef struct {
+    char name[TM_PROFILE_NAME];
+    uint64_t nanos;
+    uint64_t count;
+} tm_profile_slot;
+
+/* A label copied by value into completion handlers, so no pointer has to
+ * outlive the dispatch call that produced it. */
+typedef struct {
+    char s[TM_PROFILE_NAME];
+} tm_label;
 
 struct tm_metal_ctx {
     id<MTLDevice> device;
@@ -64,6 +81,13 @@ struct tm_metal_ctx {
     _Atomic(uint64_t) committed;
     _Atomic(uint64_t) completed;
     _Atomic(uint64_t) last_gpu_nanos;
+    /* Cumulative GPU time over every completed command buffer. */
+    _Atomic(uint64_t) gpu_nanos_total;
+    /* Opt-in per-operator attribution (profiling only; see the header). */
+    _Atomic(int) profiling;
+    os_unfair_lock profile_lock;
+    uint32_t profile_used;
+    tm_profile_slot profile[TM_PROFILE_SLOTS];
     _Atomic(uint64_t) allocated;
     /* Bytes leased by pending command buffers: physically alive until the
      * completion handler runs, even if their handles were already freed.
@@ -123,9 +147,13 @@ static int tm_check_buffer(tm_metal_ctx *ctx, tm_metal_buffer *b, size_t need,
  * dropping a buffer before an explicit fence could free storage the GPU is
  * still using. */
 static int tm_commit(tm_metal_ctx *ctx, id<MTLCommandBuffer> cb, NSArray *in_flight,
-                     char *err, size_t cap) {
+                     const char *what, char *err, size_t cap) {
     (void)err;
     (void)cap;
+    tm_label label = {{0}};
+    if (atomic_load_explicit(&ctx->profiling, memory_order_relaxed) && what != NULL) {
+        strlcpy(label.s, what, sizeof label.s);
+    }
     uint64_t leased = 0;
     for (id<MTLBuffer> buffer in in_flight) {
         leased += (uint64_t)buffer.length;
@@ -148,6 +176,23 @@ static int tm_commit(tm_metal_ctx *ctx, id<MTLCommandBuffer> cb, NSArray *in_fli
             nanos = 0.0;
         }
         atomic_store_explicit(&c->last_gpu_nanos, (uint64_t)nanos, memory_order_relaxed);
+        atomic_fetch_add_explicit(&c->gpu_nanos_total, (uint64_t)nanos, memory_order_relaxed);
+        if (label.s[0] != '\0') {
+            os_unfair_lock_lock(&c->profile_lock);
+            uint32_t slot = 0;
+            while (slot < c->profile_used && strcmp(c->profile[slot].name, label.s) != 0) {
+                slot++;
+            }
+            if (slot == c->profile_used && slot < TM_PROFILE_SLOTS) {
+                strlcpy(c->profile[slot].name, label.s, TM_PROFILE_NAME);
+                c->profile_used++;
+            }
+            if (slot < TM_PROFILE_SLOTS) {
+                c->profile[slot].nanos += (uint64_t)nanos;
+                c->profile[slot].count += 1;
+            }
+            os_unfair_lock_unlock(&c->profile_lock);
+        }
         atomic_fetch_add_explicit(&c->completed, 1, memory_order_relaxed);
     }];
     [cb commit];
@@ -318,6 +363,10 @@ tm_metal_ctx *tm_metal_create(const char *msl_source, char *err, size_t err_cap)
         atomic_init(&ctx->committed, 0);
         atomic_init(&ctx->completed, 0);
         atomic_init(&ctx->last_gpu_nanos, 0);
+        atomic_init(&ctx->gpu_nanos_total, 0);
+        atomic_init(&ctx->profiling, 0);
+        ctx->profile_lock = OS_UNFAIR_LOCK_INIT;
+        ctx->profile_used = 0;
         atomic_init(&ctx->allocated, 0);
         atomic_init(&ctx->leased, 0);
         return ctx;
@@ -532,7 +581,7 @@ static int tm_frame_commit(tm_metal_ctx *ctx, tm_frame *f, char *err, size_t cap
         return TM_METAL_OK; /* the open group commits once at end_group */
     }
     [f->enc endEncoding];
-    return tm_commit(ctx, f->cb, f->keep, err, cap);
+    return tm_commit(ctx, f->cb, f->keep, what, err, cap);
 }
 
 int tm_metal_begin_group(tm_metal_ctx *ctx, char *err, size_t err_cap) {
@@ -580,7 +629,7 @@ int tm_metal_end_group(tm_metal_ctx *ctx, char *err, size_t err_cap) {
         ctx->group_enc = nil;
         ctx->group_keep = nil;
         ctx->group_active = 0;
-        int rc = tm_commit(ctx, cb, keep, err, err_cap);
+        int rc = tm_commit(ctx, cb, keep, "group", err, err_cap);
         [enc release];
         [cb release];
         [keep release];
@@ -1294,6 +1343,39 @@ double tm_metal_last_gpu_ms(const tm_metal_ctx *ctx) {
     return (double)atomic_load_explicit(&ctx->last_gpu_nanos, memory_order_relaxed) / 1e6;
 }
 
+uint64_t tm_metal_gpu_nanos_total(const tm_metal_ctx *ctx) {
+    return ctx == NULL ? 0 : atomic_load_explicit(&ctx->gpu_nanos_total, memory_order_relaxed);
+}
+
+int tm_metal_profile_set(tm_metal_ctx *ctx, int enabled) {
+    if (ctx == NULL) {
+        return TM_METAL_ERR_UNSUPPORTED;
+    }
+    os_unfair_lock_lock(&ctx->profile_lock);
+    ctx->profile_used = 0;
+    memset(ctx->profile, 0, sizeof ctx->profile);
+    os_unfair_lock_unlock(&ctx->profile_lock);
+    atomic_store_explicit(&ctx->profiling, enabled ? 1 : 0, memory_order_relaxed);
+    return TM_METAL_OK;
+}
+
+int tm_metal_profile_read(tm_metal_ctx *ctx, uint32_t index, char *name, size_t name_cap,
+                          uint64_t *nanos, uint64_t *count) {
+    if (ctx == NULL || name == NULL || name_cap == 0 || nanos == NULL || count == NULL) {
+        return 0;
+    }
+    int found = 0;
+    os_unfair_lock_lock(&ctx->profile_lock);
+    if (index < ctx->profile_used) {
+        strlcpy(name, ctx->profile[index].name, name_cap);
+        *nanos = ctx->profile[index].nanos;
+        *count = ctx->profile[index].count;
+        found = 1;
+    }
+    os_unfair_lock_unlock(&ctx->profile_lock);
+    return found;
+}
+
 uint64_t tm_metal_allocated_bytes(const tm_metal_ctx *ctx) {
     return ctx == NULL ? 0 : atomic_load_explicit(&ctx->allocated, memory_order_relaxed);
 }
@@ -1509,9 +1591,14 @@ int tm_metal_qwen35_gdn_step(tm_metal_ctx *ctx, tm_metal_buffer *q, tm_metal_buf
         [enc setBytes:&kd length:sizeof(kd) atIndex:7];
         [enc setBytes:&vd length:sizeof(vd) atIndex:8];
         [enc setBytes:&q_scale length:sizeof(q_scale) atIndex:9];
+        /* One thread per (value column, head); columns of one head share
+         * a threadgroup row so a SIMD group reads contiguous state. */
         NSUInteger width = ctx->pso_q35_gdn_step.threadExecutionWidth;
         NSUInteger tg = width > 0 ? width : 32;
-        [enc dispatchThreads:MTLSizeMake((NSUInteger)heads, 1, 1)
+        if (tg > (NSUInteger)v_dim) {
+            tg = (NSUInteger)v_dim;
+        }
+        [enc dispatchThreads:MTLSizeMake((NSUInteger)v_dim, (NSUInteger)heads, 1)
             threadsPerThreadgroup:MTLSizeMake(tg, 1, 1)];
         return tm_frame_commit(ctx, &f, err, err_cap, "qwen35_gdn_step");
     }

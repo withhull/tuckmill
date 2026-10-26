@@ -727,14 +727,20 @@ kernel void tm_qwen35_beta_decay(device const float *raw_beta [[buffer(0)]],
 }
 
 /*
- * One token of the autoregressive delta rule, per value head, matching
- * `build_delta_net_autoregressive` exactly in arithmetic order:
+ * One token of the autoregressive delta rule, matching
+ * `build_delta_net_autoregressive` in per-element arithmetic:
  *   decay = exp(gate); s~ = s * decay; sk = s~^T k; d = beta (v - sk);
  *   s = s~ + k d^T; o = s^T (q * scale).
  * State layout: [head][i][j] with i over the key dim (contraction) and j
- * over the value dim, i-major f32. One thread per head: the recurrence is
- * sequential by construction, and per-head loops keep the CPU rule's
- * order for deterministic comparisons.
+ * over the value dim, i-major f32.
+ *
+ * Every value column j is independent: its decay, its sk_j, d_j, column
+ * update and o_j touch only column j. One thread per (head, column), so
+ * the recurrence stays sequential where it must (over i, ascending, as in
+ * the CPU rule) and parallel where it can. Adjacent threads read adjacent
+ * j at the same i (coalesced). s~ is recomputed in the second pass
+ * instead of stored: the same product, so the same rounding.
+ * (Phase 1B: the earlier one-thread-per-head form was 90% of decode time.)
  */
 kernel void tm_qwen35_gdn_step(device const float *q [[buffer(0)]],
                                device const float *k [[buffer(1)]],
@@ -746,39 +752,32 @@ kernel void tm_qwen35_gdn_step(device const float *q [[buffer(0)]],
                                constant uint &k_dim [[buffer(7)]],
                                constant uint &v_dim [[buffer(8)]],
                                constant float &q_scale [[buffer(9)]],
-                               uint head [[thread_position_in_grid]]) {
+                               uint2 gid [[thread_position_in_grid]]) {
+    const uint j = gid.x;
+    const uint head = gid.y;
     const uint sk = k_dim;
     const uint sv = v_dim;
+    if (j >= sv) {
+        return;
+    }
     device float *s = state + (size_t)head * (size_t)sk * (size_t)sv;
     const device float *kk = k + (size_t)head * (size_t)sk;
-    const device float *vv = v + (size_t)head * (size_t)sv;
     const device float *qq = q + (size_t)head * (size_t)sk;
-    device float *o = out + (size_t)head * (size_t)sv;
     const float decay = exp(gate[head]);
     const float b = beta[head];
 
+    float sk_acc = 0.0f;
     for (uint i = 0; i < sk; ++i) {
-        for (uint j = 0; j < sv; ++j) {
-            s[i * sv + j] *= decay;
-        }
+        sk_acc += (s[i * sv + j] * decay) * kk[i];
     }
-    for (uint j = 0; j < sv; ++j) {
-        float sk_acc = 0.0f;
-        for (uint i = 0; i < sk; ++i) {
-            sk_acc += s[i * sv + j] * kk[i];
-        }
-        const float d = b * (vv[j] - sk_acc);
-        for (uint i = 0; i < sk; ++i) {
-            s[i * sv + j] += kk[i] * d;
-        }
+    const float d = b * (v[(size_t)head * (size_t)sv + j] - sk_acc);
+    float acc = 0.0f;
+    for (uint i = 0; i < sk; ++i) {
+        const float updated = s[i * sv + j] * decay + kk[i] * d;
+        s[i * sv + j] = updated;
+        acc += updated * (qq[i] * q_scale);
     }
-    for (uint j = 0; j < sv; ++j) {
-        float acc = 0.0f;
-        for (uint i = 0; i < sk; ++i) {
-            acc += s[i * sv + j] * (qq[i] * q_scale);
-        }
-        o[j] = acc;
-    }
+    out[(size_t)head * (size_t)sv + j] = acc;
 }
 
 /*

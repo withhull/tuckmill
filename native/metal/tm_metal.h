@@ -297,6 +297,18 @@ uint64_t tm_metal_completed_dispatches(const tm_metal_ctx *ctx);
 /* GPU time of the most recently completed command buffer, milliseconds
  * (0.0 before the first completion). */
 double tm_metal_last_gpu_ms(const tm_metal_ctx *ctx);
+/* Cumulative GPU nanoseconds over every completed command buffer. Wall
+ * time minus this, over the same span, is host/dispatch time. */
+uint64_t tm_metal_gpu_nanos_total(const tm_metal_ctx *ctx);
+/* Opt-in per-operator GPU time attribution (profiling only). When
+ * enabled, each committed command buffer carries its operator label and
+ * its GPU time accumulates per label; buffers of an open dispatch group
+ * are attributed to "group". Setting either value clears the table. */
+int tm_metal_profile_set(tm_metal_ctx *ctx, int enabled);
+/* Reads table entry `index`: returns 1 and fills name/nanos/count while
+ * index is below the number of labels seen, 0 past the end. */
+int tm_metal_profile_read(tm_metal_ctx *ctx, uint32_t index, char *name, size_t name_cap,
+                          uint64_t *nanos, uint64_t *count);
 /* Live bytes currently allocated in buffers from this context. */
 uint64_t tm_metal_allocated_bytes(const tm_metal_ctx *ctx);
 
