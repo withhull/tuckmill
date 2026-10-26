@@ -161,7 +161,7 @@ native/llamaref     tm_llama_shim.c: narrow C surface over pinned llama.cpp
 kernels/            K01–K09 work-package registry (K01 implemented increment; K02–K09 specified)
 adapters/           qwen3, qwen3moe, qwen3.5-hybrid, bonsai2-hybrid specs
 benchmarks/         standard-v1 frozen workload; comparator program; per-tier results/
-docs/adr/           ADR-001..010
+docs/adr/           ADR-001..011
 docs/               certification matrix, claim ledger
 scripts/            build.sh, test.sh, demo.sh, fetch-llama.sh, bench-baseline.sh
 ```
