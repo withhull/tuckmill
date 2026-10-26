@@ -45,3 +45,26 @@ step 1).
   side of the worker. Unexplained; it goes first in the memory work.
 - Prefill is 5.7× behind llama.cpp. The rest is the per-token DeltaNet,
   attention and copies inside each chunk (see ADR-008 Add. 15/16).
+
+## Correction (added after the run; records unchanged)
+
+- **The footprint comparison is not like-for-like.** `footprint_peak`
+  is the kernel's phys_footprint, which **excludes memory-mapped file
+  pages**. llama.cpp memory-maps the 833 MB artifact, so its weights don't
+  appear in its 241 MiB; TuckCore copies the weights into GPU memory,
+  which does count. Measured on the same request (`tuckmill run`, 300
+  tokens):
+
+  | engine | peak RSS | peak phys_footprint |
+  | --- | --- | --- |
+  | TuckCore | 527 MB | 946 MB |
+  | llama.cpp | 1,001 MB | 235 MB |
+
+  The RAM each occupies is about the same (~950 vs ~1,000 MB). The earlier
+  "~3.8× llama.cpp's footprint" reading is withdrawn.
+- **The 928 → 1,109 MiB regression is fixed** in the next commit. The
+  cause was unbounded prefill chunks in flight: each chunk's command
+  buffer holds ~3 MB of Metal encoding memory, and 32 chunks were
+  committed at once for a 512-token prompt (+103 MB, +3,217 GPU regions).
+  A secondary cause was host heap: the worker's full tokenizer
+  (750,568 allocations, ~55 MB) and per-request host zero buffers.

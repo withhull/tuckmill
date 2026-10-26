@@ -61,6 +61,13 @@ impl Tokenizer {
     /// Build from a GGUF inspection. Only `model = "gpt2"` (byte-level BPE)
     /// is supported in this build; anything else is a typed refusal.
     pub fn from_gguf(inspection: &GgufInspection) -> Result<Self> {
+        Self::from_gguf_with(inspection, true)
+    }
+
+    /// `with_merges: false` validates the merge list exactly as encoding
+    /// would but skips building its table (decode-only consumers never
+    /// use it; on a 250k-merge vocabulary it is the largest allocation).
+    fn from_gguf_with(inspection: &GgufInspection, with_merges: bool) -> Result<Self> {
         let model = inspection
             .get_str("tokenizer.ggml.model")
             .unwrap_or("")
@@ -138,6 +145,9 @@ impl Tokenizer {
                         "tokenizer.ggml.merges contains a non-string entry",
                     ));
                 };
+                if !with_merges {
+                    continue;
+                }
                 if let Some((left, right)) = s.split_once(' ') {
                     merges
                         .entry((left.to_string(), right.to_string()))
@@ -417,6 +427,73 @@ impl Tokenizer {
     }
 }
 
+/// Decode-only view of a vocabulary for the worker: every token's output
+/// bytes in one blob plus offsets. The worker never encodes (requests carry
+/// token ids), so it keeps this instead of the full encoder; on a 248,320
+/// entry vocabulary that is ~3 MB instead of ~55 MB of per-token strings
+/// and merge tables. Bytes are exactly [`Tokenizer::token_bytes`].
+pub struct DecodeVocab {
+    bytes: Vec<u8>,
+    /// `offsets[id]..offsets[id + 1]` is token `id`'s byte range.
+    offsets: Vec<u32>,
+    pretokenizer_note: Option<String>,
+}
+
+impl DecodeVocab {
+    /// Build straight from the artifact without the encoder's merge table
+    /// (the same refusals as [`Tokenizer::from_gguf`]).
+    pub fn from_gguf(inspection: &GgufInspection) -> Result<Self> {
+        Self::from_tokenizer(&Tokenizer::from_gguf_with(inspection, false)?)
+    }
+
+    pub fn from_tokenizer(tokenizer: &Tokenizer) -> Result<Self> {
+        let count = tokenizer.tokens.len();
+        let mut bytes = Vec::new();
+        let mut offsets = Vec::with_capacity(count + 1);
+        offsets.push(0u32);
+        for id in 0..count as u32 {
+            bytes.extend_from_slice(&tokenizer.token_bytes(id));
+            let end = u32::try_from(bytes.len()).map_err(|_| {
+                TuckmillError::new(
+                    ErrorCode::InvalidArtifact,
+                    "vocabulary bytes exceed the decode table's u32 offsets",
+                )
+            })?;
+            offsets.push(end);
+        }
+        bytes.shrink_to_fit();
+        Ok(Self {
+            bytes,
+            offsets,
+            pretokenizer_note: tokenizer.pretokenizer_note(),
+        })
+    }
+
+    /// Whether `id` names a vocabulary entry.
+    pub fn contains(&self, id: u32) -> bool {
+        (id as usize) + 1 < self.offsets.len()
+    }
+
+    /// Exact output bytes of `id` (empty for control tokens and unknown
+    /// ids), identical to [`Tokenizer::token_bytes`].
+    pub fn token_bytes(&self, id: u32) -> &[u8] {
+        let id = id as usize;
+        match (self.offsets.get(id), self.offsets.get(id + 1)) {
+            (Some(start), Some(end)) => &self.bytes[*start as usize..*end as usize],
+            _ => &[],
+        }
+    }
+
+    pub fn pretokenizer_note(&self) -> Option<String> {
+        self.pretokenizer_note.clone()
+    }
+
+    /// Heap bytes held by the table.
+    pub fn heap_bytes(&self) -> usize {
+        self.bytes.capacity() + self.offsets.capacity() * 4
+    }
+}
+
 fn meta_u32(inspection: &GgufInspection, key: &str) -> Option<u32> {
     match inspection.get(key) {
         Some(GgufValue::U32(v)) => Some(*v),
@@ -521,17 +598,79 @@ mod tests {
     use super::*;
     use tuckmill_manifest::testing::{synthetic_qwen3_bytes, SyntheticConfig};
 
-    fn fixture_tokenizer() -> Tokenizer {
+    #[test]
+    fn decode_vocab_matches_the_tokenizer_for_every_id() {
+        let tok = fixture_tokenizer();
+        let vocab = DecodeVocab::from_tokenizer(&tok).unwrap();
+        let count = tok.tokens.len() as u32;
+        for id in 0..count + 3 {
+            assert_eq!(vocab.contains(id), tok.token_text(id).is_some(), "id {id}");
+            assert_eq!(
+                vocab.token_bytes(id),
+                tok.token_bytes(id).as_slice(),
+                "id {id}"
+            );
+        }
+        assert_eq!(vocab.pretokenizer_note(), tok.pretokenizer_note());
+        let insp = fixture_inspection();
+        let direct = DecodeVocab::from_gguf(&insp).unwrap();
+        assert_eq!(direct.bytes, vocab.bytes);
+        assert_eq!(direct.offsets, vocab.offsets);
+    }
+
+    /// Machine-local: the same equality over the pinned Qwen3.5 vocabulary
+    /// (248,320 entries), with the heap it saves.
+    #[test]
+    fn decode_vocab_matches_the_pinned_vocabulary_when_available() {
+        let Some(path) = std::env::var("TUCKMILL_QWEN35_GGUF")
+            .ok()
+            .map(std::path::PathBuf::from)
+            .filter(|p| p.exists())
+        else {
+            eprintln!("skipping: TUCKMILL_QWEN35_GGUF not set");
+            return;
+        };
+        let insp =
+            tuckmill_manifest::gguf::inspect(&path, &tuckmill_manifest::gguf::Limits::default())
+                .unwrap();
+        let tok = Tokenizer::from_gguf(&insp).unwrap();
+        let vocab = DecodeVocab::from_tokenizer(&tok).unwrap();
+        let count = tok.tokens.len() as u32;
+        for id in 0..count {
+            assert_eq!(
+                vocab.token_bytes(id),
+                tok.token_bytes(id).as_slice(),
+                "id {id}"
+            );
+            assert!(vocab.contains(id));
+        }
+        assert!(!vocab.contains(count));
+        let direct = DecodeVocab::from_gguf(&insp).unwrap();
+        assert_eq!(
+            direct.bytes, vocab.bytes,
+            "decode-only build is byte-identical"
+        );
+        assert_eq!(direct.offsets, vocab.offsets);
+        eprintln!(
+            "decode vocab: {count} entries in {} heap bytes",
+            vocab.heap_bytes()
+        );
+    }
+
+    fn fixture_inspection() -> GgufInspection {
         let bytes = synthetic_qwen3_bytes(&SyntheticConfig::tiny_qwen3());
         let mut cursor = std::io::Cursor::new(bytes.clone());
-        let insp = tuckmill_manifest::gguf::inspect_reader(
+        tuckmill_manifest::gguf::inspect_reader(
             &mut cursor,
             bytes.len() as u64,
             &tuckmill_manifest::gguf::Limits::default(),
             None,
         )
-        .unwrap();
-        Tokenizer::from_gguf(&insp).unwrap()
+        .unwrap()
+    }
+
+    fn fixture_tokenizer() -> Tokenizer {
+        Tokenizer::from_gguf(&fixture_inspection()).unwrap()
     }
 
     #[test]

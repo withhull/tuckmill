@@ -35,7 +35,7 @@ use crate::qwen35_forward::{ArtifactTensorSource, TensorSource};
 use crate::qwen35_gpu::{GpuAllocPlan, Qwen35Gpu};
 use crate::sampling::{self, Rng, SamplingConfig};
 use crate::tensor;
-use crate::tokenizer::{Tokenizer, Utf8StreamDecoder};
+use crate::tokenizer::{DecodeVocab, Utf8StreamDecoder};
 
 /// Defaults; overridable per run through the versioned Load options.
 pub const DEFAULT_CACHE_BYTES: u64 = 512 * 1024 * 1024;
@@ -78,7 +78,7 @@ struct Loaded {
     loader: Arc<BlockLoader>,
     tracker: Arc<CompletionTracker>,
     weights: Arc<ModelWeights>,
-    tokenizer: Tokenizer,
+    tokenizer: DecodeVocab,
     context_total: u64,
     profile: NumericalProfile,
     kv_precision: KvPrecision,
@@ -110,7 +110,7 @@ struct Loaded {
 struct HybridLoaded {
     /// The qwen35 graph executed by the unified engine (ADR-011).
     model: EngineModel,
-    tokenizer: Tokenizer,
+    tokenizer: DecodeVocab,
     eos_token_id: Option<u32>,
     context_total: u64,
     /// Exact preflighted GPU allocation (equal to the device ledger after
@@ -491,7 +491,9 @@ impl InferenceBackend for TuckCore {
         }
         let mut names = model::TensorNames::for_layers(cfg.layers);
         names.resolve(&insp)?;
-        let tokenizer = Tokenizer::from_gguf(&insp)?;
+        // The worker only decodes (requests carry token ids): keep the
+        // compact decode table, not the encoder.
+        let tokenizer = DecodeVocab::from_gguf(&insp)?;
 
         // ---- Metal resident path (C2): build after identity verification,
         // with the plan's arena classes checked against the exact GPU
@@ -662,6 +664,7 @@ impl InferenceBackend for TuckCore {
             retained_weight_bytes,
             metal,
         });
+        crate::release_freed_heap();
         Ok(note)
     }
 
@@ -936,7 +939,7 @@ impl InferenceBackend for TuckCore {
 
 /// What the shared decode loop needs from a loaded model family.
 struct SessionSpec<'a> {
-    tokenizer: &'a Tokenizer,
+    tokenizer: &'a DecodeVocab,
     eos_token_id: Option<u32>,
     prefill_batch: usize,
     per_token_delay: Duration,
@@ -1065,9 +1068,9 @@ fn run_session(
                 break 'decode GenOutcome::new(FinishReason::Eos, buffer.visible_tokens())
                     .with_generated(generated_ids);
             }
-            let piece = match spec.tokenizer.token_text(token) {
-                Some(_) => decoder.push_token(&spec.tokenizer.token_bytes(token), i),
-                None => {
+            let piece = match spec.tokenizer.contains(token) {
+                true => decoder.push_token(spec.tokenizer.token_bytes(token), i),
+                false => {
                     let placeholder = format!("<tok {token}>");
                     decoder.push_token(placeholder.as_bytes(), i)
                 }
@@ -1098,8 +1101,8 @@ fn run_session(
             if i + 1 < req.max_output_tokens {
                 // The generated token i occupies position prompt_len + i.
                 let pos = (prompt_len + i) as usize;
-                match engine.step(token, pos, &cancelled) {
-                    Ok(l) => logits = l,
+                match engine.step(token, pos, &cancelled, &mut logits) {
+                    Ok(()) => {}
                     Err(e) if e.code() == ErrorCode::Cancelled => {
                         let r = buffer.flush();
                         let _ = emit(&r.text, &mut release_index, ctl);
@@ -1153,12 +1156,25 @@ enum StepEngine<'a> {
 }
 
 impl StepEngine<'_> {
-    fn step(&mut self, token: u32, pos: usize, cancelled: &dyn Fn() -> bool) -> Result<Vec<f32>> {
+    /// One decode step into `logits` (reused across steps: the hybrid
+    /// engine fills it in place instead of allocating per token).
+    fn step(
+        &mut self,
+        token: u32,
+        pos: usize,
+        cancelled: &dyn Fn() -> bool,
+        logits: &mut Vec<f32>,
+    ) -> Result<()> {
         match self {
-            StepEngine::Cpu { fwd, kv } => fwd.forward_token(kv, token, pos, cancelled),
-            StepEngine::Gpu { forward, kv } => forward.forward_token(kv, token, pos, cancelled),
-            StepEngine::Hybrid { model } => hybrid_step(model, token, pos, cancelled),
+            StepEngine::Cpu { fwd, kv } => {
+                *logits = fwd.forward_token(kv, token, pos, cancelled)?;
+            }
+            StepEngine::Gpu { forward, kv } => {
+                *logits = forward.forward_token(kv, token, pos, cancelled)?;
+            }
+            StepEngine::Hybrid { model } => hybrid_step(model, token, pos, cancelled, logits)?,
         }
+        Ok(())
     }
 
     /// Process a prefix chunk; logits are produced only when requested
@@ -1217,7 +1233,8 @@ fn hybrid_step(
     token: u32,
     pos: usize,
     cancelled: &dyn Fn() -> bool,
-) -> Result<Vec<f32>> {
+    logits: &mut Vec<f32>,
+) -> Result<()> {
     if cancelled() {
         return Err(TuckmillError::new(
             ErrorCode::Cancelled,
@@ -1233,9 +1250,7 @@ fn hybrid_step(
             ),
         ));
     }
-    let mut logits = Vec::new();
-    model.forward_token(token, &mut logits)?;
-    Ok(logits)
+    model.forward_token(token, logits)
 }
 
 /// Identity of the hybrid device path: the Q35-2C GPU model over raw
@@ -1317,7 +1332,9 @@ impl TuckCore {
         }
 
         // The tensor source reads through the verified handle.
-        let source = ArtifactTensorSource::from_open_file(artifact_file)?;
+        // Reuses the identity-checked inspection (hashes vs the record, full
+        // content digest of this handle) instead of parsing it again.
+        let source = ArtifactTensorSource::with_inspection(artifact_file, insp)?;
         let capacity = usize::try_from(plan.context.total_context).map_err(|_| {
             TuckmillError::new(
                 ErrorCode::ContextExceedsBudget,
@@ -1356,7 +1373,7 @@ impl TuckCore {
                 ),
             ));
         }
-        let tokenizer = Tokenizer::from_gguf(insp)?;
+        let tokenizer = DecodeVocab::from_gguf(insp)?;
         let mut note = format!(
             "tuckcore (experimental, uncertified): unified engine (ADR-011), graph {} with {} layers, vocab {}, kernels metal [oracle-f32], kv f16 packed, batched prefill x{}; real weights from {} ({} payload), GPU ledger {} = weights {} + state {} + scratch {}",
             model.graph().architecture,
@@ -1393,6 +1410,7 @@ impl TuckCore {
             session_kv_bytes: Arc::new(AtomicU64::new(0)),
             counters: ctx.counters,
         });
+        crate::release_freed_heap();
         Ok(note)
     }
 

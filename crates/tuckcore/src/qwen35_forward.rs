@@ -182,8 +182,17 @@ impl ArtifactTensorSource {
             )
         })?;
         let insp = gguf::inspect_reader(&mut reader, len, &Limits::default(), None)?;
+        Self::with_inspection(file, &insp)
+    }
+
+    /// Build over an opened handle from an inspection the caller already
+    /// holds, without parsing the artifact's metadata a second time. The
+    /// caller vouches that `insp` describes these exact bytes: the executor
+    /// checks its metadata and tensor-index hashes against the import
+    /// record and verifies the handle's full content digest before use.
+    pub fn with_inspection(file: &File, insp: &gguf::GgufInspection) -> Result<Self> {
         let registry = AdapterRegistry::builtin()?;
-        let (cfg, layout) = resolve(&insp, &registry)?;
+        let (cfg, layout) = resolve(insp, &registry)?;
         Ok(Self {
             file: file.try_clone().map_err(|e| {
                 TuckmillError::new(
@@ -191,7 +200,7 @@ impl ArtifactTensorSource {
                     format!("cannot clone the verified artifact handle: {e}"),
                 )
             })?,
-            meta: build_tensor_meta(&insp)?,
+            meta: build_tensor_meta(insp)?,
             cfg,
             layout,
         })

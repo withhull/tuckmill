@@ -57,3 +57,22 @@ pub fn format_build_id() -> String {
         env!("TUCKMILL_SOURCE_REV")
     )
 }
+
+/// Return freed heap pages to the OS. macOS's allocator keeps freed large
+/// blocks dirty in its caches, and they count toward the process
+/// footprint; after loading (which builds and drops the full tokenizer and
+/// GGUF metadata) the worker hands them back.
+pub fn release_freed_heap() {
+    #[cfg(target_os = "macos")]
+    {
+        extern "C" {
+            fn malloc_zone_pressure_relief(zone: *mut std::ffi::c_void, goal: usize) -> usize;
+        }
+        // SAFETY: a null zone means every zone and goal 0 means "as much as
+        // possible"; the call only returns free pages to the OS and never
+        // touches live allocations.
+        unsafe {
+            malloc_zone_pressure_relief(std::ptr::null_mut(), 0);
+        }
+    }
+}

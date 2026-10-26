@@ -14,10 +14,17 @@ use tuckmill_metal::{MetalBuffer, MetalContext};
 
 use super::graph::{AttentionSpec, FfnSpec, GatedDeltaNetSpec, MixerSpec, ModelGraph, Tensor};
 use super::WeightSource;
-use crate::qwen35_gpu::{bytes_f32, f32_bytes, GpuAllocPlan, Qwen35Gpu, STAGING_CHUNK_BYTES};
+use crate::qwen35_gpu::{f32_bytes, GpuAllocPlan, Qwen35Gpu, STAGING_CHUNK_BYTES};
 
 /// Prompt tokens per batched prefill chunk (one command buffer each).
 pub const PREFILL_BATCH: usize = 16;
+
+/// Prefill chunks allowed in flight on the GPU at once. Each chunk is one
+/// command buffer of thousands of dispatches, and Metal backs its encoding
+/// with driver memory (~3 MB on the pinned 0.8B) that it then keeps
+/// pooled. Committing a long prompt's chunks unbounded held ~100 MB of it
+/// at once; two keeps the next chunk queued behind the running one.
+const MAX_PREFILL_IN_FLIGHT: usize = 2;
 
 /// Stage reported to a traced decode step.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -774,8 +781,11 @@ impl AttentionBlock {
     }
 }
 
+/// Zero a session-state buffer on the device side (no host staging: the
+/// earlier host zero vectors, up to ~2 MB each, were allocated on every
+/// request reset).
 fn zero_fill(buf: &MetalBuffer) -> Result<()> {
-    buf.upload(0, &vec![0u8; buf.len()])
+    buf.zero(0, buf.len())
 }
 
 enum Mixer {
@@ -934,6 +944,11 @@ pub struct EngineModel {
     positions: std::cell::Cell<usize>,
     session_valid: std::cell::Cell<bool>,
     grouped: std::cell::Cell<bool>,
+    /// Commit counts of the prefill chunks still possibly in flight.
+    prefill_in_flight: std::cell::RefCell<std::collections::VecDeque<u64>>,
+    /// Reused host staging for the logits download (one block for the
+    /// session instead of one allocation per generated token).
+    logits_staging: std::cell::RefCell<Vec<u8>>,
 }
 
 impl EngineModel {
@@ -991,7 +1006,25 @@ impl EngineModel {
             positions: std::cell::Cell::new(0),
             session_valid: std::cell::Cell::new(true),
             grouped: std::cell::Cell::new(true),
+            prefill_in_flight: Default::default(),
+            logits_staging: Default::default(),
         })
+    }
+
+    /// Block until fewer than [`MAX_PREFILL_IN_FLIGHT`] prefill chunks are
+    /// in flight. Command buffers complete in queue order, so waiting for a
+    /// chunk's commit count also covers everything before it.
+    fn bound_prefill_in_flight(&self) {
+        let ctx = self.gpu.context();
+        let mut in_flight = self.prefill_in_flight.borrow_mut();
+        while in_flight.len() >= MAX_PREFILL_IN_FLIGHT {
+            let Some(target) = in_flight.pop_front() else {
+                break;
+            };
+            while ctx.completed_dispatches() < target {
+                std::thread::sleep(std::time::Duration::from_micros(100));
+            }
+        }
     }
 
     pub fn graph(&self) -> &ModelGraph {
@@ -1076,10 +1109,15 @@ impl EngineModel {
 
     fn download_logits(&self, logits: &mut Vec<f32>) -> Result<()> {
         let vocab = self.graph.vocab;
-        logits.resize(vocab, 0.0);
-        let mut bytes = vec![0u8; vocab * 4];
+        let mut bytes = self.logits_staging.borrow_mut();
+        bytes.resize(vocab * 4, 0);
         self.logits_buf.download(0, &mut bytes)?;
-        logits.copy_from_slice(&bytes_f32(&bytes));
+        logits.clear();
+        logits.extend(
+            bytes
+                .chunks_exact(4)
+                .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]])),
+        );
         Ok(())
     }
 
@@ -1158,6 +1196,7 @@ impl EngineModel {
             }
             let pos = self.check_tokens(tokens)?;
             let (hidden, eps) = (self.graph.hidden, self.graph.eps);
+            self.bound_prefill_in_flight();
             let s = &self.prefill;
             let encode = || -> Result<()> {
                 for (i, token) in tokens.iter().enumerate() {
@@ -1181,10 +1220,16 @@ impl EngineModel {
                 encode()?;
             }
             if want_logits {
+                // The download waits for all committed work.
                 self.download_logits(logits)?;
+                self.prefill_in_flight.borrow_mut().clear();
+            } else {
+                // Without logits nothing waits here: the queue orders the
+                // next chunk after this one, bounded by the in-flight cap.
+                self.prefill_in_flight
+                    .borrow_mut()
+                    .push_back(self.gpu.context().committed_dispatches());
             }
-            // Without logits nothing waits: the queue orders the next
-            // chunk after this one.
             self.positions.set(pos + n);
             Ok(())
         })();
@@ -1198,6 +1243,7 @@ mod oracle_tests {
     //! per-family model to the unified engine executing the qwen35 graph.
     use super::*;
     use crate::qwen35_forward::TensorSource;
+    use crate::qwen35_gpu::bytes_f32;
     use tuckmill_metal::probe;
 
     fn qwen35_graph(src: &impl TensorSource) -> ModelGraph {
