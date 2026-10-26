@@ -564,6 +564,7 @@ mod imp {
             err: *mut c_char,
             err_cap: usize,
         ) -> c_int;
+        pub fn tm_metal_set_gdn_chunk_generic(ctx: *mut TmMetalCtx, generic: c_int) -> c_int;
         pub fn tm_metal_qwen35_rope_partial_chunk(
             ctx: *mut TmMetalCtx,
             q: *mut TmMetalBuffer,
@@ -1213,6 +1214,19 @@ impl MetalContext {
             };
             (code, err)
         })
+    }
+
+    /// Testing switch: run the generic device-memory recurrence kernel
+    /// instead of the register-resident specialization (bit-identical).
+    pub fn set_gdn_chunk_generic(&self, generic: bool) {
+        #[cfg(target_os = "macos")]
+        unsafe {
+            // SAFETY: raw is valid while the inner lives; the call only sets
+            // a dispatch-selection flag.
+            imp::tm_metal_set_gdn_chunk_generic(self.inner.raw, generic as c_int);
+        }
+        #[cfg(not(target_os = "macos"))]
+        let _ = generic;
     }
 
     /// Partial split-half RoPE over `n` chunk rows at positions `pos0+t`.

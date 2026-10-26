@@ -51,6 +51,7 @@ struct tm_metal_ctx {
     id<MTLComputePipelineState> pso_q35_split_qkv_chunk;
     id<MTLComputePipelineState> pso_q35_beta_decay_chunk;
     id<MTLComputePipelineState> pso_q35_gdn_chunk;
+    id<MTLComputePipelineState> pso_q35_gdn_chunk_k128;
     id<MTLComputePipelineState> pso_q35_rope_chunk;
     id<MTLComputePipelineState> pso_q35_kv_store_chunk;
     id<MTLComputePipelineState> pso_q35_attention_chunk;
@@ -102,6 +103,9 @@ struct tm_metal_ctx {
     _Atomic(uint64_t) gpu_nanos_total;
     /* Opt-in per-operator attribution (profiling only; see the header). */
     _Atomic(int) profiling;
+    /* Force the generic (device-memory) recurrence kernel; the gate tests
+     * compare it against the register-resident specialization. */
+    int gdn_chunk_generic;
     os_unfair_lock profile_lock;
     uint32_t profile_used;
     tm_profile_slot profile[TM_PROFILE_SLOTS];
@@ -335,6 +339,7 @@ tm_metal_ctx *tm_metal_create(const char *msl_source, char *err, size_t err_cap)
         ctx->pso_q35_split_qkv_chunk = tm_pipeline(ctx, @"tm_qwen35_split_qkv_chunk", &error);
         ctx->pso_q35_beta_decay_chunk = tm_pipeline(ctx, @"tm_qwen35_beta_decay_chunk", &error);
         ctx->pso_q35_gdn_chunk = tm_pipeline(ctx, @"tm_qwen35_gdn_chunk", &error);
+        ctx->pso_q35_gdn_chunk_k128 = tm_pipeline(ctx, @"tm_qwen35_gdn_chunk_k128", &error);
         ctx->pso_q35_rope_chunk = tm_pipeline(ctx, @"tm_qwen35_rope_partial_chunk", &error);
         ctx->pso_q35_kv_store_chunk = tm_pipeline(ctx, @"tm_qwen35_kv_store_f16_chunk", &error);
         ctx->pso_q35_attention_chunk = tm_pipeline(ctx, @"tm_qwen35_attention_f16_chunk", &error);
@@ -375,7 +380,8 @@ tm_metal_ctx *tm_metal_create(const char *msl_source, char *err, size_t err_cap)
             ctx->pso_q8row_indirect == nil || ctx->pso_f16row_indirect == nil ||
             ctx->pso_q35_conv_chunk == nil || ctx->pso_q35_conv_chunk_shift == nil ||
             ctx->pso_q35_split_qkv_chunk == nil || ctx->pso_q35_beta_decay_chunk == nil ||
-            ctx->pso_q35_gdn_chunk == nil || ctx->pso_q35_rope_chunk == nil ||
+            ctx->pso_q35_gdn_chunk == nil || ctx->pso_q35_gdn_chunk_k128 == nil ||
+            ctx->pso_q35_rope_chunk == nil ||
             ctx->pso_q35_kv_store_chunk == nil || ctx->pso_q35_attention_chunk == nil ||
             ctx->pso_f16f32 == nil ||
             ctx->pso_f32f16 == nil || ctx->pso_q8gemv == nil || ctx->pso_f16gemv == nil ||
@@ -465,6 +471,7 @@ void tm_metal_destroy(tm_metal_ctx *ctx) {
         [ctx->pso_q35_split_qkv_chunk release];
         [ctx->pso_q35_beta_decay_chunk release];
         [ctx->pso_q35_gdn_chunk release];
+        [ctx->pso_q35_gdn_chunk_k128 release];
         [ctx->pso_q35_rope_chunk release];
         [ctx->pso_q35_kv_store_chunk release];
         [ctx->pso_q35_attention_chunk release];
@@ -2359,7 +2366,12 @@ int tm_metal_qwen35_gdn_chunk(tm_metal_ctx *ctx, tm_metal_buffer *q, tm_metal_bu
     memcpy(&scale_bits, &q_scale, sizeof scale_bits);
     uint32_t consts[8] = {k_dim, v_dim, scale_bits, heads, n, qk_stride, v_stride, g_stride};
     NSUInteger tg = v_dim < 32u ? v_dim : 32u;
-    return tm_dispatch_args(ctx, ctx->pso_q35_gdn_chunk, bufs, 7, consts, 8,
+    /* Register-resident state column when the key dimension has an
+     * instantiation (bit-identical; see kernels.metal). */
+    id<MTLComputePipelineState> pso =
+        (k_dim == 128u && !ctx->gdn_chunk_generic) ? ctx->pso_q35_gdn_chunk_k128
+                                                   : ctx->pso_q35_gdn_chunk;
+    return tm_dispatch_args(ctx, pso, bufs, 7, consts, 8,
                             MTLSizeMake(v_dim, heads, 1), MTLSizeMake(tg, 1, 1), err, err_cap,
                             "qwen35_gdn_chunk");
 }
@@ -2433,5 +2445,13 @@ int tm_metal_qwen35_attention_f16_chunk(tm_metal_ctx *ctx, tm_metal_buffer *q,
     return tm_dispatch_args(ctx, ctx->pso_q35_attention_chunk, bufs, 5, consts, 6,
                             MTLSizeMake((NSUInteger)heads * 128u, n, 1), MTLSizeMake(128, 1, 1),
                             err, err_cap, "qwen35_attention_f16_chunk");
+}
+
+int tm_metal_set_gdn_chunk_generic(tm_metal_ctx *ctx, int generic) {
+    if (ctx == NULL) {
+        return TM_METAL_ERR_UNSUPPORTED;
+    }
+    ctx->gdn_chunk_generic = generic ? 1 : 0;
+    return TM_METAL_OK;
 }
 

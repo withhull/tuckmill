@@ -156,3 +156,30 @@ never in a family-specific path.
 - Effect (pinned 0.8B, M3 8 GB, in-process): 512-token prefill
   1.73 s → 1.29 s (DeltaNet core) → 0.84 s (plus attention). Profile now:
   the matrix-unit GEMM 58%, the DeltaNet chunk recurrence 27%.
+
+## Engine note (2026-10-26): register-resident DeltaNet recurrence; fast-math caveat
+
+- The chunk recurrence was memory-traffic bound: it re-read each 128-float
+  state column from device memory twice per token and wrote it once
+  (~48 MB per 16-token launch, ~27 GB per 512-token prompt).
+  `tm_qwen35_gdn_chunk_k128` (a template instance for key dim 128) keeps
+  the column in registers for the whole chunk: read once, written once.
+  Other key dims keep the generic kernel.
+- **Fast-math caveat.** The kernel library is compiled with Metal's
+  default options, i.e. fast math, which may reassociate sums per
+  kernel. Source-identical arithmetic in two kernels is therefore not
+  guaranteed to round identically. The register kernel differs from the
+  generic one by 5.0e-4 / 7.2e-4 on 512-token logits / next step (within
+  the registered 2e-3 GPU bound). Earlier "bit-identical" results held
+  because those kernels compiled identically, not by guarantee. Rule from
+  here on: paths that must agree bit-for-bit share one compiled kernel.
+  Decode's single-token step now runs the same chunk kernel with n = 1,
+  so chunked prefill and decode stay bit-identical to each other (gated).
+- Qualification against the CPU oracle (registered tolerances unchanged):
+  pinned delta operator 4.27e-4 out / 1.37e-4 state, real artifact hidden
+  7.0e-5 / logits 4.7e-4, fixture model 6.6e-7 / 1.4e-6, batched vs
+  sequential 4.6e-4 / 4.0e-4 with identical top-1; worker greedy output
+  equals the CPU oracle.
+- Effect (pinned 0.8B, M3 8 GB, in-process): 512-token prefill 879 →
+  646 ms; recurrence per decode token 1.25 → 0.47 ms; greedy decode
+  ~73–77 tok/s in-process.

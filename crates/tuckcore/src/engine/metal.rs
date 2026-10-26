@@ -2606,9 +2606,27 @@ mod chunk_core_tests {
                 "len {len}: prefill logits"
             );
             assert_eq!(bits(&b_next), bits(&a_next), "len {len}: next decode step");
+            // The register-resident recurrence vs the generic device-memory
+            // kernel: same source arithmetic, but separately compiled under
+            // fast math, so equal within the registered GPU logits bound
+            // (2e-3), not bitwise.
+            model.context().set_gdn_chunk_generic(true);
+            let (c_logits, c_next, c_ms) = run(&model, &prompt);
+            model.context().set_gdn_chunk_generic(false);
+            let drift = |x: &[f32], y: &[f32]| {
+                x.iter()
+                    .zip(y)
+                    .map(|(p, q)| (p - q).abs())
+                    .fold(0f32, f32::max)
+            };
+            let (dl, dn) = (drift(&b_logits, &c_logits), drift(&b_next, &c_next));
+            assert!(
+                dl <= 2e-3 && dn <= 2e-3,
+                "len {len}: register vs generic {dl:e} / {dn:e}"
+            );
             if len >= 256 {
                 eprintln!(
-                    "{len}-token prefill: per-token cores {a_ms:.0} ms, chunk cores {b_ms:.0} ms"
+                    "{len}-token prefill: per-token cores {a_ms:.0} ms, chunk cores (generic recurrence) {c_ms:.0} ms, chunk cores (register recurrence) {b_ms:.0} ms; register vs generic max|diff| {dl:.2e} / {dn:.2e}"
                 );
             }
         }

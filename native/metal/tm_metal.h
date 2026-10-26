@@ -398,6 +398,10 @@ int tm_metal_qwen35_attention_f16_chunk(tm_metal_ctx *ctx, tm_metal_buffer *q,
                                         uint32_t head_dim, uint32_t group, float scale, uint32_t n,
                                         char *err, size_t err_cap);
 
+/* Testing switch: use the generic device-memory recurrence kernel instead
+ * of the register-resident specialization (results are bit-identical). */
+int tm_metal_set_gdn_chunk_generic(tm_metal_ctx *ctx, int generic);
+
 #ifdef __cplusplus
 }
 #endif

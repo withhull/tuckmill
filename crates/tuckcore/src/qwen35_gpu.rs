@@ -159,8 +159,24 @@ impl Qwen35Gpu {
         v_dim: u32,
         q_scale: f32,
     ) -> Result<()> {
-        self.ctx.qwen35_gdn_step(
-            q, k, v, gate, beta, state, out, heads, k_dim, v_dim, q_scale,
+        // One token through the chunk recurrence, so decode and chunked
+        // prefill run the same compiled kernel (the library is built with
+        // fast math, which may reassociate sums differently per kernel; one
+        // kernel keeps the two paths bit-identical to each other).
+        self.ctx.qwen35_gdn_chunk(
+            q,
+            k,
+            v,
+            gate,
+            beta,
+            state,
+            out,
+            heads,
+            k_dim,
+            v_dim,
+            q_scale,
+            1,
+            (heads * k_dim, heads * v_dim, heads),
         )
     }
 
