@@ -1446,3 +1446,59 @@ fn gpu_time_is_accumulated_and_attributed_per_operator_when_profiling() {
     ctx.set_profiling(false);
     assert!(ctx.profile_snapshot().is_empty());
 }
+
+/// Phase 1C measurement (opt-in, `TUCKMILL_PROFILE=1`): GPU time and
+/// effective weight bandwidth of the Q8_0 GEMV on the pinned Qwen3.5-0.8B
+/// matrix shapes. Prints only; asserts nothing about speed.
+#[test]
+fn q8_0_gemv_shape_bandwidth_when_requested() {
+    if std::env::var("TUCKMILL_PROFILE").ok().as_deref() != Some("1") {
+        eprintln!("skipping: TUCKMILL_PROFILE=1 not set (measurement only)");
+        return;
+    }
+    let Some(ctx) = metal_context() else {
+        return;
+    };
+    // (rows, cols, calls per decoded token) for the pinned 0.8B.
+    let shapes = [
+        (248_320usize, 1024usize, 1usize),
+        (6144, 1024, 18),
+        (4096, 1024, 6),
+        (3584, 1024, 48),
+        (2048, 1024, 18),
+        (1024, 3584, 24),
+        (1024, 2048, 24),
+        (512, 1024, 12),
+        (16, 1024, 36),
+    ];
+    let mut per_token_us = 0.0f64;
+    for (rows, cols, calls) in shapes {
+        let w = boundary_weights(rows, cols, 3);
+        let x = boundary_input(cols, 5);
+        let wb = ctx.buffer(w.len(), true).unwrap();
+        wb.upload(0, &w).unwrap();
+        let xb = ctx.buffer(cols * 4, true).unwrap();
+        xb.upload(0, &f32_bytes(&x)).unwrap();
+        let yb = ctx.buffer(rows * 4, true).unwrap();
+        for _ in 0..3 {
+            ctx.q8_0_gemv(&wb, &xb, &yb, rows as u32, cols as u32)
+                .unwrap();
+        }
+        ctx.fence().unwrap();
+        let iters = 30u32;
+        let g0 = ctx.gpu_nanos_total();
+        for _ in 0..iters {
+            ctx.q8_0_gemv(&wb, &xb, &yb, rows as u32, cols as u32)
+                .unwrap();
+        }
+        ctx.fence().unwrap();
+        let us = (ctx.gpu_nanos_total() - g0) as f64 / 1e3 / iters as f64;
+        let gbs = w.len() as f64 / (us * 1e-6) / 1e9;
+        per_token_us += us * calls as f64;
+        eprintln!(
+            "q8_0_gemv {rows:>6}x{cols:<5} {us:>9.1} us  {gbs:>6.1} GB/s  x{calls:<3} = {:>8.1} us/token",
+            us * calls as f64
+        );
+    }
+    eprintln!("q8_0_gemv total per token: {:.2} ms", per_token_us / 1e3);
+}

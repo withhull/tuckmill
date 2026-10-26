@@ -12,6 +12,7 @@
 #   CONTEXT=2048        admitted context
 #   MIN_RECLAIMABLE_MIB=1536      refuse to start a model process below this
 #   SWAP_DISCARD_MIB=64 a run that grows swap by more than this is discarded
+#                       (and retried once after a pause; both attempts are listed)
 #   TUCKMILL_LLAMA_LIB  pinned shim (default .deps/llama/libtm_llama.dylib)
 #   SKIP_LLAMA_BENCH=1  skip the llama-bench vendor-tool row
 #
@@ -109,13 +110,28 @@ export TUCKMILL_DATA_DIR="$DATA"
 RUNS="$OUT/runs.tsv"
 printf 'round\tslot\tengine\tstatus\treclaimable_mib_before\tswap_delta_mib\trecord\n' > "$RUNS"
 
-run_engine() { # round slot engine
-    round=$1; slot=$2; engine=$3
+run_engine() { # round slot engine; a swap-discarded attempt is retried once
+    attempt=1
+    while :; do
+        run_engine_once "$1" "$2" "$3" "$attempt"
+        if [ "$status" != discarded-swap ] || [ "$attempt" -ge 2 ]; then
+            break
+        fi
+        attempt=$((attempt + 1))
+        sleep 10
+    done
+}
+
+run_engine_once() { # round slot engine attempt
+    round=$1; slot=$2; engine=$3; attempt=$4
     no_model_processes
     wait_for_memory
     before_mem=$(reclaimable_mib)
     swap0=$(swap_used_mib)
     rec="$OUT/records/r${round}-${slot}-${engine}.json"
+    if [ "$attempt" -gt 1 ]; then
+        rec="$OUT/records/r${round}-${slot}-${engine}-attempt${attempt}.json"
+    fi
     case "$engine" in
         tuckcore-metal) set -- --engine tuckcore --kernels metal ;;
         llama-metal) set -- --engine llama --gpu-layers 99 ;;

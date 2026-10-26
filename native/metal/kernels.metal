@@ -59,34 +59,60 @@ kernel void tm_cast_f32_f16(device const float *x [[buffer(0)]],
 /*
  * Packed Q8_0 matrix-vector decode: y[r] = dot(dequant_q8_0(w_row_r), x).
  *
- * Q8_0 blocks are 34 bytes: [f16 d][i8 qs; 32]; dequant(w) = d * q. One
- * threadgroup (one SIMD group of 32 lanes) per output row; lane L owns
- * element L of every block, so loads within a row are coalesced and the
- * per-block partial reductions use simd_sum. `cols` must be a positive
- * multiple of 32 (validated C-side).
+ * Q8_0 blocks are 34 bytes: [f16 d][i8 qs; 32]; dequant(w) = d * q.
+ * Multi-row form (Phase 1C): each SIMD group computes TM_Q8_ROWS rows, and
+ * a threadgroup holds TM_Q8_SG SIMD groups. Lane L handles quants
+ * (L % 4) * 8 .. +7 of block (L / 4), so one SIMD-group step covers 8
+ * blocks; the 8 matching x values are loaded once into registers and
+ * reused for every row. Per-lane partials reduce with simd_sum. Reduction
+ * order differs from the CPU sequence (tolerance-registered, ADR-007).
+ * `cols` must be a positive multiple of 32 (validated C-side).
  */
+#define TM_Q8_ROWS 4u
+#define TM_Q8_SG 2u
+
 kernel void tm_q8_0_gemv(device const uchar *w [[buffer(0)]],
                          device const float *x [[buffer(1)]],
                          device float *y [[buffer(2)]],
                          constant uint &rows [[buffer(3)]],
                          constant uint &cols [[buffer(4)]],
-                         uint row [[threadgroup_position_in_grid]],
-                         uint lane [[thread_position_in_threadgroup]]) {
-    if (row >= rows) {
+                         uint tg [[threadgroup_position_in_grid]],
+                         uint sg [[simdgroup_index_in_threadgroup]],
+                         uint lane [[thread_index_in_simdgroup]]) {
+    const uint blocks = cols / 32u;
+    const size_t row_bytes = (size_t)blocks * 34u;
+    const uint first = (tg * TM_Q8_SG + sg) * TM_Q8_ROWS;
+    if (first >= rows) {
         return;
     }
-    const uint blocks = cols / 32u;
-    const device uchar *wrow = w + (size_t)row * (size_t)blocks * 34u;
-    float acc = 0.0f;
-    for (uint b = 0; b < blocks; ++b) {
-        const device uchar *blk = wrow + (size_t)b * 34u;
-        const float d = (float)(*(const device half *)blk);
-        const float q = (float)((const device char *)(blk + 2))[lane];
-        acc += d * q * x[b * 32u + lane];
+    const uint sub = lane % 4u;   /* which 8-quant slice of the block */
+    const uint lane_blk = lane / 4u; /* which of the 8 blocks this step */
+
+    float acc[TM_Q8_ROWS] = {0.0f, 0.0f, 0.0f, 0.0f};
+    for (uint b = lane_blk; b < blocks; b += 8u) {
+        const device packed_float4 *xv =
+            (const device packed_float4 *)(x + (size_t)b * 32u + sub * 8u);
+        const float4 x0 = float4(xv[0]);
+        const float4 x1 = float4(xv[1]);
+        for (uint r = 0; r < TM_Q8_ROWS; ++r) {
+            const uint row = first + r;
+            if (row >= rows) {
+                break;
+            }
+            const device uchar *blk = w + (size_t)row * row_bytes + (size_t)b * 34u;
+            const float d = (float)(*(const device half *)blk);
+            const device packed_char4 *qv = (const device packed_char4 *)(blk + 2u + sub * 8u);
+            const float4 q0 = float4(char4(qv[0]));
+            const float4 q1 = float4(char4(qv[1]));
+            acc[r] += d * (dot(q0, x0) + dot(q1, x1));
+        }
     }
-    const float total = simd_sum(acc);
-    if (lane == 0u) {
-        y[row] = total;
+    for (uint r = 0; r < TM_Q8_ROWS; ++r) {
+        const float total = simd_sum(acc[r]);
+        const uint row = first + r;
+        if (lane == 0u && row < rows) {
+            y[row] = total;
+        }
     }
 }
 
@@ -388,10 +414,12 @@ kernel void tm_rmsnorm_f16w(device const float *x [[buffer(0)]],
 
 /*
  * Batched packed Q8_0 GEMM: Y[b, :] = W · X[b, :] for b < batch. One SIMD
- * group per output row; each q element is loaded once and FMA'd across the
- * whole batch, so weight traffic does not multiply with batch size. Per-b
- * accumulation order is identical to the single-token GEMV (blocks in
- * order, same simd_sum), so batch=1 is bit-identical to tm_q8_0_gemv.
+ * group per output row; each weight slice is loaded once and applied to
+ * the whole batch, so weight traffic does not multiply with batch size.
+ * Per-(row, b) arithmetic is exactly the single-token GEMV's: the same
+ * lane-to-quant mapping (lane L: block L/4 of each 8-block step, quants
+ * (L%4)*8..+7), the same block order, the same per-block expression and
+ * the same simd_sum, so batch=1 is bit-identical to tm_q8_0_gemv.
  * X is [batch, cols] at element offset `x_off`; Y is [batch, rows] at
  * `y_off`; batch must be 1..=32 (validated C-side).
  */
@@ -410,17 +438,25 @@ kernel void tm_q8_0_gemm(device const uchar *w [[buffer(0)]],
     }
     const uint blocks = cols / 32u;
     const device uchar *wrow = w + (size_t)row * (size_t)blocks * 34u;
+    const uint sub = lane % 4u;
+    const uint lane_blk = lane / 4u;
     float acc[32];
     for (uint b = 0; b < batch; ++b) {
         acc[b] = 0.0f;
     }
-    for (uint blk = 0; blk < blocks; ++blk) {
+    for (uint blk = lane_blk; blk < blocks; blk += 8u) {
         const device uchar *block = wrow + (size_t)blk * 34u;
         const float d = (float)(*(const device half *)block);
-        const float q = (float)((const device char *)(block + 2))[lane];
-        const uint col = blk * 32u + lane;
+        const device packed_char4 *qv = (const device packed_char4 *)(block + 2u + sub * 8u);
+        const float4 q0 = float4(char4(qv[0]));
+        const float4 q1 = float4(char4(qv[1]));
+        const uint col = blk * 32u + sub * 8u;
         for (uint b = 0; b < batch; ++b) {
-            acc[b] += d * q * x[x_off + b * cols + col];
+            const device packed_float4 *xv =
+                (const device packed_float4 *)(x + x_off + b * cols + col);
+            const float4 x0 = float4(xv[0]);
+            const float4 x1 = float4(xv[1]);
+            acc[b] += d * (dot(q0, x0) + dot(q1, x1));
         }
     }
     for (uint b = 0; b < batch; ++b) {

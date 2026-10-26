@@ -35,6 +35,10 @@ fn bytes_f32(bytes: &[u8]) -> Vec<f32> {
 #[derive(Clone)]
 pub struct Qwen35Gpu {
     ctx: MetalContext,
+    /// True while a caller-level dispatch group (one command buffer per
+    /// token) is open; operator helpers that group internally then just
+    /// encode into it, since groups do not nest.
+    outer_group: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl Qwen35Gpu {
@@ -48,11 +52,36 @@ impl Qwen35Gpu {
         }
         Ok(Self {
             ctx: MetalContext::open()?,
+            outer_group: Default::default(),
         })
     }
 
     pub fn context(&self) -> &MetalContext {
         &self.ctx
+    }
+
+    /// Run `encode` inside one dispatch group: everything it dispatches is
+    /// committed as a single command buffer, or, on any error, discarded
+    /// without committing (no partial GPU work).
+    pub fn grouped<T>(&self, encode: impl FnOnce() -> Result<T>) -> Result<T> {
+        use std::sync::atomic::Ordering;
+        if self.outer_group.load(Ordering::Relaxed) {
+            return encode();
+        }
+        self.ctx.begin_group()?;
+        self.outer_group.store(true, Ordering::Relaxed);
+        let result = encode();
+        self.outer_group.store(false, Ordering::Relaxed);
+        match result {
+            Ok(value) => {
+                self.ctx.end_group()?;
+                Ok(value)
+            }
+            Err(e) => {
+                let _ = self.ctx.abort_group();
+                Err(e)
+            }
+        }
     }
 
     /// Allocate a shared-storage buffer of `bytes`, zeroed without any
@@ -83,18 +112,10 @@ impl Qwen35Gpu {
         channels: u32,
         kernel: u32,
     ) -> Result<()> {
-        self.ctx.begin_group()?;
-        let result = (|| {
+        self.grouped(|| {
             self.ctx.qwen35_conv_step(hist, x, w, y, channels, kernel)?;
             self.ctx.qwen35_conv_shift(hist, x, channels, kernel)
-        })();
-        match result {
-            Ok(()) => self.ctx.end_group(),
-            Err(e) => {
-                let _ = self.ctx.abort_group();
-                Err(e)
-            }
-        }
+        })
     }
 
     pub fn l2norm_dev(
@@ -1658,6 +1679,9 @@ pub struct Qwen35GpuModel {
     capacity: usize,
     positions: std::cell::Cell<usize>,
     session_valid: std::cell::Cell<bool>,
+    /// Encode each decode step as one command buffer (default). Profiling
+    /// turns it off to attribute GPU time per operator.
+    grouped: std::cell::Cell<bool>,
 }
 
 impl Qwen35GpuModel {
@@ -1711,6 +1735,7 @@ impl Qwen35GpuModel {
             capacity,
             positions: std::cell::Cell::new(0),
             session_valid: std::cell::Cell::new(true),
+            grouped: std::cell::Cell::new(true),
         })
     }
 
@@ -1770,10 +1795,18 @@ impl Qwen35GpuModel {
         result
     }
 
+    /// Encode each decode step as one command buffer (`true`, default) or
+    /// one per operator (`false`, for per-operator GPU time attribution).
+    /// Arithmetic is identical either way.
+    pub fn set_grouped(&self, grouped: bool) {
+        self.grouped.set(grouped);
+    }
+
     /// One decode step; the full vocabulary logits are downloaded for
-    /// the caller (sampling/verification happen on the host).
+    /// the caller (sampling/verification happen on the host). The whole
+    /// step is one command buffer unless grouping was turned off.
     pub fn forward_token(&self, token: u32, logits: &mut Vec<f32>) -> Result<()> {
-        self.forward_token_traced(token, logits, |_, _| Ok(()))
+        self.step(token, logits, self.grouped.get(), |_, _| Ok(()))
     }
 
     /// Same step with a per-stage callback (embedding row, then after
@@ -1784,6 +1817,18 @@ impl Qwen35GpuModel {
         &self,
         token: u32,
         logits: &mut Vec<f32>,
+        on_stage: impl FnMut(Stage, &MetalBuffer) -> Result<()>,
+    ) -> Result<()> {
+        // Stage callbacks read activations mid-step, so a traced step is
+        // never grouped.
+        self.step(token, logits, false, on_stage)
+    }
+
+    fn step(
+        &self,
+        token: u32,
+        logits: &mut Vec<f32>,
+        grouped: bool,
         mut on_stage: impl FnMut(Stage, &MetalBuffer) -> Result<()>,
     ) -> Result<()> {
         self.ensure_valid()?;
@@ -1807,21 +1852,28 @@ impl Qwen35GpuModel {
                     ),
                 ));
             }
-            self.tied.row_into(&self.gpu, token, &self.x, 0)?;
-            on_stage(Stage::Embedding, &self.x)?;
-            for (l, layer) in self.layers.iter().enumerate() {
-                layer.forward(&self.gpu, &self.x, pos as u32)?;
-                on_stage(Stage::Layer(l), &self.x)?;
+            let mut encode = || -> Result<()> {
+                self.tied.row_into(&self.gpu, token, &self.x, 0)?;
+                on_stage(Stage::Embedding, &self.x)?;
+                for (l, layer) in self.layers.iter().enumerate() {
+                    layer.forward(&self.gpu, &self.x, pos as u32)?;
+                    on_stage(Stage::Layer(l), &self.x)?;
+                }
+                self.gpu.context().rmsnorm(
+                    &self.x,
+                    &self.output_norm,
+                    &self.h,
+                    1,
+                    self.hidden as u32,
+                    self.eps,
+                )?;
+                self.tied.gemv(&self.gpu, &self.h, &self.logits_buf)
+            };
+            if grouped {
+                self.gpu.grouped(encode)?;
+            } else {
+                encode()?;
             }
-            self.gpu.context().rmsnorm(
-                &self.x,
-                &self.output_norm,
-                &self.h,
-                1,
-                self.hidden as u32,
-                self.eps,
-            )?;
-            self.tied.gemv(&self.gpu, &self.h, &self.logits_buf)?;
             logits.resize(self.vocab, 0.0);
             let mut bytes = vec![0u8; self.vocab * 4];
             self.logits_buf.download(0, &mut bytes)?;
@@ -2167,8 +2219,19 @@ mod layer_tests {
         );
         assert!(gpu_ms <= wall_ms * 1.05, "GPU time cannot exceed wall time");
 
+        model.set_grouped(false);
+        let (u0, t1) = (ctx.gpu_nanos_total(), std::time::Instant::now());
+        for t in &tokens[40..48] {
+            model.forward_token(*t, &mut logits).unwrap();
+        }
+        ctx.fence().unwrap();
+        eprintln!(
+            "ungrouped (one command buffer per operator): wall {:.2} ms, GPU busy {:.2} ms per token",
+            t1.elapsed().as_secs_f64() * 1e3 / 8.0,
+            (ctx.gpu_nanos_total() - u0) as f64 / 1e6 / 8.0
+        );
         ctx.set_profiling(true);
-        let profiled = &tokens[40..56];
+        let profiled = &tokens[48..56];
         for t in profiled {
             model.forward_token(*t, &mut logits).unwrap();
         }

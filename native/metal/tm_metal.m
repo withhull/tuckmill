@@ -764,9 +764,20 @@ int tm_metal_q8_0_gemv(tm_metal_ctx *ctx, tm_metal_buffer *w, tm_metal_buffer *x
             return tm_fail(err, err_cap, TM_METAL_ERR_INTERNAL,
                            [NSString stringWithFormat:@"q8_0_gemv: device simd width %lu != 32", (unsigned long)lanes]);
         }
-        [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)rows, 1, 1)
-            threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
-        return tm_frame_commit(ctx, &f, err, err_cap, "q8_0_gemv");
+        /* Multi-row kernel: 2 SIMD groups x 4 rows per threadgroup (the
+         * TM_Q8_SG / TM_Q8_ROWS constants in kernels.metal). */
+        const NSUInteger rows_per_tg = 8;
+        NSUInteger groups = ((NSUInteger)rows + rows_per_tg - 1) / rows_per_tg;
+        [enc dispatchThreadgroups:MTLSizeMake(groups, 1, 1)
+            threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
+        /* Profiling attributes GEMV time per matrix shape. */
+        char label[TM_PROFILE_NAME];
+        if (atomic_load_explicit(&ctx->profiling, memory_order_relaxed)) {
+            snprintf(label, sizeof label, "q8_0_gemv:%ux%u", rows, cols);
+        } else {
+            strlcpy(label, "q8_0_gemv", sizeof label);
+        }
+        return tm_frame_commit(ctx, &f, err, err_cap, label);
     }
 }
 
