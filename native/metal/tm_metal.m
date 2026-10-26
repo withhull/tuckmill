@@ -55,6 +55,8 @@ struct tm_metal_ctx {
     id<MTLComputePipelineState> pso_q35_rope_chunk;
     id<MTLComputePipelineState> pso_q35_kv_store_chunk;
     id<MTLComputePipelineState> pso_q35_attention_chunk;
+    id<MTLComputePipelineState> pso_q35_attention_gqa_256x4;
+    id<MTLComputePipelineState> pso_q35_attention_gqa_16x2;
     id<MTLComputePipelineState> pso_f16row_indirect;
     id<MTLComputePipelineState> pso_f16f32;
     id<MTLComputePipelineState> pso_f32f16;
@@ -343,6 +345,10 @@ tm_metal_ctx *tm_metal_create(const char *msl_source, char *err, size_t err_cap)
         ctx->pso_q35_rope_chunk = tm_pipeline(ctx, @"tm_qwen35_rope_partial_chunk", &error);
         ctx->pso_q35_kv_store_chunk = tm_pipeline(ctx, @"tm_qwen35_kv_store_f16_chunk", &error);
         ctx->pso_q35_attention_chunk = tm_pipeline(ctx, @"tm_qwen35_attention_f16_chunk", &error);
+        ctx->pso_q35_attention_gqa_256x4 =
+            tm_pipeline(ctx, @"tm_qwen35_attention_gqa_256x4", &error);
+        ctx->pso_q35_attention_gqa_16x2 =
+            tm_pipeline(ctx, @"tm_qwen35_attention_gqa_16x2", &error);
         ctx->pso_f16row_indirect = tm_pipeline(ctx, @"tm_f16_row_indirect_f32", &error);
         ctx->pso_f16f32 = tm_pipeline(ctx, @"tm_cast_f16_f32", &error);
         ctx->pso_f32f16 = tm_pipeline(ctx, @"tm_cast_f32_f16", &error);
@@ -383,6 +389,7 @@ tm_metal_ctx *tm_metal_create(const char *msl_source, char *err, size_t err_cap)
             ctx->pso_q35_gdn_chunk == nil || ctx->pso_q35_gdn_chunk_k128 == nil ||
             ctx->pso_q35_rope_chunk == nil ||
             ctx->pso_q35_kv_store_chunk == nil || ctx->pso_q35_attention_chunk == nil ||
+            ctx->pso_q35_attention_gqa_256x4 == nil || ctx->pso_q35_attention_gqa_16x2 == nil ||
             ctx->pso_f16f32 == nil ||
             ctx->pso_f32f16 == nil || ctx->pso_q8gemv == nil || ctx->pso_f16gemv == nil ||
             ctx->pso_q8row == nil || ctx->pso_rmsnorm == nil || ctx->pso_rope == nil ||
@@ -475,6 +482,8 @@ void tm_metal_destroy(tm_metal_ctx *ctx) {
         [ctx->pso_q35_rope_chunk release];
         [ctx->pso_q35_kv_store_chunk release];
         [ctx->pso_q35_attention_chunk release];
+        [ctx->pso_q35_attention_gqa_256x4 release];
+        [ctx->pso_q35_attention_gqa_16x2 release];
         [ctx->pso_f16row_indirect release];
         [ctx->pso_scale release];
         [ctx->library release];
@@ -2040,6 +2049,9 @@ int tm_metal_qwen35_kv_store_f16(tm_metal_ctx *ctx, tm_metal_buffer *k_src, tm_m
     }
 }
 
+static id<MTLComputePipelineState> tm_attention_gqa_pso(tm_metal_ctx *ctx, uint32_t head_dim,
+                                                        uint32_t group);
+
 int tm_metal_qwen35_attention_f16(tm_metal_ctx *ctx, tm_metal_buffer *q, tm_metal_buffer *k_cache,
                                   tm_metal_buffer *v_cache, tm_metal_buffer *out,
                                   tm_metal_buffer *scratch, uint32_t heads, uint32_t pos,
@@ -2050,6 +2062,13 @@ int tm_metal_qwen35_attention_f16(tm_metal_ctx *ctx, tm_metal_buffer *q, tm_meta
     }
     if (heads == 0 || head_dim == 0 || group == 0 || pos >= cap || heads % group != 0u) {
         return tm_fail(err, err_cap, TM_METAL_ERR_BOUNDS, @"attn_f16: geometry out of range");
+    }
+    /* One query row through the grouped chunk kernel, so decode and
+     * chunked prefill share one compiled kernel (bit-identical). */
+    if (tm_attention_gqa_pso(ctx, head_dim, group) != nil) {
+        return tm_metal_qwen35_attention_f16_chunk(ctx, q, k_cache, v_cache, out, scratch, heads,
+                                                   pos, cap, head_dim, group, scale, 1u, err,
+                                                   err_cap);
     }
     size_t qb = (size_t)heads * head_dim * 4u;
     size_t cache = (size_t)(heads / group) * cap * head_dim * 2u;
@@ -2431,6 +2450,18 @@ int tm_metal_qwen35_kv_store_f16_chunk(tm_metal_ctx *ctx, tm_metal_buffer *k_src
                             MTLSizeMake(128, 1, 1), err, err_cap, "qwen35_kv_store_f16_chunk");
 }
 
+/* The grouped attention instance for this geometry, or nil. */
+static id<MTLComputePipelineState> tm_attention_gqa_pso(tm_metal_ctx *ctx, uint32_t head_dim,
+                                                        uint32_t group) {
+    if (head_dim == 256u && group == 4u) {
+        return ctx->pso_q35_attention_gqa_256x4;
+    }
+    if (head_dim == 16u && group == 2u) {
+        return ctx->pso_q35_attention_gqa_16x2;
+    }
+    return nil;
+}
+
 int tm_metal_qwen35_attention_f16_chunk(tm_metal_ctx *ctx, tm_metal_buffer *q,
                                         tm_metal_buffer *k_cache, tm_metal_buffer *v_cache,
                                         tm_metal_buffer *out, tm_metal_buffer *scratch,
@@ -2453,6 +2484,15 @@ int tm_metal_qwen35_attention_f16_chunk(tm_metal_ctx *ctx, tm_metal_buffer *q,
     uint32_t scale_bits;
     memcpy(&scale_bits, &scale, sizeof scale_bits);
     uint32_t consts[6] = {pos0, cap, head_dim, group, scale_bits, heads};
+    /* Grouped kernel (one threadgroup per KV head and row) when the
+     * geometry has an instantiation; decode routes here too (n = 1). */
+    id<MTLComputePipelineState> gqa = tm_attention_gqa_pso(ctx, head_dim, group);
+    if (gqa != nil) {
+        return tm_dispatch_args(ctx, gqa, bufs, 5, consts, 6,
+                                MTLSizeMake((NSUInteger)kv_heads * 128u, n, 1),
+                                MTLSizeMake(128, 1, 1), err, err_cap,
+                                "qwen35_attention_f16_chunk");
+    }
     return tm_dispatch_args(ctx, ctx->pso_q35_attention_chunk, bufs, 5, consts, 6,
                             MTLSizeMake((NSUInteger)heads * 128u, n, 1), MTLSizeMake(128, 1, 1),
                             err, err_cap, "qwen35_attention_f16_chunk");

@@ -298,3 +298,34 @@ at 128 tokens: 3584x1024 470-500 us, 6144x1024 787-830 us, 1024x3584
 - Whole 512-token prefill, in-process, five alternating passes
   (the Claude app's renderer was using up to 65% CPU, so passes are noisy):
   best 407 -> 368 ms, median 422 -> 399 ms. Locally-calibrated.
+
+## Engine note (2026-10-26): grouped-query attention kernel
+
+- The attention kernel ran one threadgroup per (query head, row). The
+  four query heads sharing a KV head each re-read the K/V prefix, each
+  thread walked every key serially for its two output dims, and both
+  softmax reductions used threadgroup barriers.
+- `tm_qwen35_attention_gqa<HD, G>` runs one threadgroup per (KV head,
+  row) for all G heads:
+  - each K and V row is read once;
+  - lanes hold contiguous head dims of every head's query in registers;
+  - SIMD group h normalizes head h with SIMD-only reductions, using the
+    same per-element softmax expression;
+  - the V pass splits keys across SIMD groups and sums the four partials
+    in a fixed order.
+- Instantiated for (256, 4), which covers the 0.8B and the 2B, and for
+  (16, 2), the fixture, so its bit-identity gate exercises it. Other
+  geometries keep the old kernel. Decode's single-token call routes
+  through the same kernel (n = 1), so prefill and decode stay
+  bit-identical.
+- Measured (pinned 0.8B, M3 8 GB, alternating prebuilt binaries):
+  - attention GPU time, 512-token prefill: 39.5-40.4 -> 8.8-9.0 ms;
+  - decode, per token at a short context: 0.333-0.340 -> 0.113-0.117 ms
+    (this grows with context);
+  - whole 512-token prefill, five passes each: 362-365 -> 329-333 ms.
+- Accuracy (registered tolerances unchanged):
+  - fixture prefill is still bit-identical to sequential decode;
+  - operator tests vs the CPU packed-cache reference pass (4x2x16 and
+    8x2x256);
+  - real-artifact GPU vs CPU oracle: hidden 6.5e-5, logits 2.78e-4;
+  - 512-token batched vs sequential: 3.36e-4 / 3.36e-4, top-1 equal.
