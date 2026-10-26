@@ -2347,6 +2347,9 @@ int tm_metal_qwen35_beta_decay_chunk(tm_metal_ctx *ctx, tm_metal_buffer *raw_bet
                             "qwen35_beta_decay_chunk");
 }
 
+/* Lanes per state column in tm_qwen35_gdn_chunk_k128 (kernels.metal). */
+#define TM_GDN_LANES 8u
+
 int tm_metal_qwen35_gdn_chunk(tm_metal_ctx *ctx, tm_metal_buffer *q, tm_metal_buffer *k,
                               tm_metal_buffer *v, tm_metal_buffer *gate, tm_metal_buffer *beta,
                               tm_metal_buffer *state, tm_metal_buffer *out, uint32_t heads,
@@ -2372,15 +2375,16 @@ int tm_metal_qwen35_gdn_chunk(tm_metal_ctx *ctx, tm_metal_buffer *q, tm_metal_bu
     uint32_t scale_bits;
     memcpy(&scale_bits, &q_scale, sizeof scale_bits);
     uint32_t consts[8] = {k_dim, v_dim, scale_bits, heads, n, qk_stride, v_stride, g_stride};
-    NSUInteger tg = v_dim < 32u ? v_dim : 32u;
-    /* Register-resident state column when the key dimension has an
-     * instantiation (bit-identical; see kernels.metal). */
-    id<MTLComputePipelineState> pso =
-        (k_dim == 128u && !ctx->gdn_chunk_generic) ? ctx->pso_q35_gdn_chunk_k128
-                                                   : ctx->pso_q35_gdn_chunk;
-    return tm_dispatch_args(ctx, pso, bufs, 7, consts, 8,
-                            MTLSizeMake(v_dim, heads, 1), MTLSizeMake(tg, 1, 1), err, err_cap,
-                            "qwen35_gdn_chunk");
+    /* Register-resident state column, split across TM_GDN_LANES lanes,
+     * when the key dimension has an instantiation (see kernels.metal). */
+    const bool reg = k_dim == 128u && (v_dim % (32u / TM_GDN_LANES)) == 0u &&
+                     !ctx->gdn_chunk_generic;
+    id<MTLComputePipelineState> pso = reg ? ctx->pso_q35_gdn_chunk_k128 : ctx->pso_q35_gdn_chunk;
+    NSUInteger lanes = reg ? (NSUInteger)v_dim * TM_GDN_LANES : (NSUInteger)v_dim;
+    /* The lane-split kernel maps lanes in whole SIMD groups of 32. */
+    NSUInteger tg = lanes < 32u ? lanes : 32u;
+    return tm_dispatch_args(ctx, pso, bufs, 7, consts, 8, MTLSizeMake(lanes, heads, 1),
+                            MTLSizeMake(tg, 1, 1), err, err_cap, "qwen35_gdn_chunk");
 }
 
 /* ---- chunk-wide gated attention core (engine prefill) ---- */

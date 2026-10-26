@@ -1549,11 +1549,19 @@ kernel void tm_qwen35_kv_store_f16_chunk(device const float *k_src [[buffer(0)]]
 
 /* tm_qwen35_gdn_chunk with the state column held in registers for the
  * whole chunk (read once, written once) instead of re-read from device
- * memory twice per token. Same expressions in the same order, so results
- * are bit-identical to tm_qwen35_gdn_chunk and tm_qwen35_gdn_step.
- * Instantiated for the key dimensions in use (the array size must be a
- * compile-time constant). */
-template <uint SK>
+ * memory twice per token. Each column is split across P lanes of one
+ * SIMD group, each holding SK / P rows; the two per-token dot products
+ * are lane partial sums combined with XOR shuffles, so every lane of a
+ * column sees the same total. A SIMD group covers C = 32 / P adjacent
+ * columns and lane l works on column l % C, so neighbouring lanes touch
+ * neighbouring state columns (coalesced state loads and stores). Same per-element expressions as the generic
+ * kernel; the dot-product summation order differs (tolerance-qualified).
+ * Decode's single-token step runs this kernel with n = 1, so chunked
+ * prefill and decode stay bit-identical to each other. Instantiated for
+ * the key dimensions in use (the array size must be a compile-time
+ * constant); the grid is P * v_dim lanes per head in threadgroups of 32,
+ * and v_dim must be a multiple of C. */
+template <uint SK, uint P>
 kernel void tm_qwen35_gdn_chunk_reg(device const float *q [[buffer(0)]],
                                     device const float *k [[buffer(1)]],
                                     device const float *v [[buffer(2)]],
@@ -1570,41 +1578,59 @@ kernel void tm_qwen35_gdn_chunk_reg(device const float *q [[buffer(0)]],
                                     constant uint &v_stride [[buffer(13)]],
                                     constant uint &g_stride [[buffer(14)]],
                                     uint2 gid [[thread_position_in_grid]]) {
-    const uint j = gid.x;
+    constexpr uint RPL = SK / P;
+    constexpr uint C = 32u / P;
+    const uint lane = gid.x % 32u;
+    const uint j = (gid.x / 32u) * C + lane % C;
+    const uint part = lane / C;
     const uint head = gid.y;
     const uint sv = v_dim;
+    /* Whole columns only: a column's P lanes all pass or all return, so
+     * the shuffles below always see their partners. */
     if (j >= sv || head >= heads || k_dim != SK) {
         return;
     }
+    const uint r0 = part * RPL;
     device float *s = state + (size_t)head * (size_t)SK * (size_t)sv;
-    float col[SK];
-    for (uint i = 0; i < SK; ++i) {
-        col[i] = s[i * sv + j];
+    float col[RPL];
+    for (uint i = 0; i < RPL; ++i) {
+        col[i] = s[(r0 + i) * sv + j];
     }
     for (uint t = 0; t < n; ++t) {
-        const size_t qk_row = (size_t)t * qk_stride + (size_t)head * SK;
+        const size_t qk_row = (size_t)t * qk_stride + (size_t)head * SK + r0;
         const size_t v_row = (size_t)t * v_stride + (size_t)head * sv;
         const device float *kk = k + qk_row;
         const device float *qq = q + qk_row;
         const float decay = exp(gate[(size_t)t * g_stride + head]);
         const float b = beta[(size_t)t * g_stride + head];
         float sk_acc = 0.0f;
-        for (uint i = 0; i < SK; ++i) {
+        for (uint i = 0; i < RPL; ++i) {
             sk_acc += (col[i] * decay) * kk[i];
+        }
+        for (uint m = C; m < 32u; m <<= 1) {
+            sk_acc += simd_shuffle_xor(sk_acc, (ushort)m);
         }
         const float d = b * (v[v_row + j] - sk_acc);
         float acc = 0.0f;
-        for (uint i = 0; i < SK; ++i) {
+        for (uint i = 0; i < RPL; ++i) {
             const float updated = col[i] * decay + kk[i] * d;
             col[i] = updated;
             acc += updated * (qq[i] * q_scale);
         }
-        out[v_row + j] = acc;
+        for (uint m = C; m < 32u; m <<= 1) {
+            acc += simd_shuffle_xor(acc, (ushort)m);
+        }
+        if (part == 0u) {
+            out[v_row + j] = acc;
+        }
     }
-    for (uint i = 0; i < SK; ++i) {
-        s[i * sv + j] = col[i];
+    for (uint i = 0; i < RPL; ++i) {
+        s[(r0 + i) * sv + j] = col[i];
     }
 }
+
+/* Lanes per state column (must match the host's TM_GDN_LANES). */
+#define TM_GDN_LANES 8u
 
 #define TM_GDN_REG_ARGS                                                          \
     device const float *q [[buffer(0)]], device const float *k [[buffer(1)]],      \
@@ -1617,5 +1643,5 @@ kernel void tm_qwen35_gdn_chunk_reg(device const float *q [[buffer(0)]],
         constant uint &g_stride [[buffer(14)]], uint2 gid [[thread_position_in_grid]]
 
 template [[host_name("tm_qwen35_gdn_chunk_k128")]] kernel void
-tm_qwen35_gdn_chunk_reg<128u>(TM_GDN_REG_ARGS);
+tm_qwen35_gdn_chunk_reg<128u, TM_GDN_LANES>(TM_GDN_REG_ARGS);
 

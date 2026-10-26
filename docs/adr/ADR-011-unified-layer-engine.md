@@ -263,3 +263,38 @@ at 128 tokens: 3584x1024 470-500 us, 6144x1024 787-830 us, 1024x3584
   the same 34-byte Q8_0 blocks, a 64x32 tile and K = 32 stages, all of
   which were tried above. It is not timed in isolation here (the pinned
   tools have no matmul benchmark).
+
+## Engine note (2026-10-26): DeltaNet recurrence split across SIMD lanes
+
+- Non-GEMM profile at `00fd250` (512 tokens, ungrouped): DeltaNet
+  recurrence 61 ms, attention 39 ms, RMS norm 16 ms, then small
+  operators. The recurrence ran one thread per (head, state column):
+  16 x 128 = 2,048 threads walking every token with two 128-long dot
+  products, so it was latency-bound.
+- `tm_qwen35_gdn_chunk_k128` now splits each column across P = 8 lanes
+  of one SIMD group (16 rows each, in registers). Lane partial dot
+  products are combined with XOR shuffles, so every lane of a column sees
+  the same total. A SIMD group covers 4 adjacent columns, and lane l works
+  on column l % 4, so state loads and stores stay coalesced. Decode's
+  single-token step runs the same kernel (n = 1), so chunked prefill and
+  decode remain bit-identical to each other.
+- Measured (recurrence GPU time, profile, two passes each; decode is the
+  per-token recurrence in `profile_pinned_decode`):
+
+  | layout | prefill recurrence | decode recurrence |
+  | --- | --- | --- |
+  | one lane per column (before) | 61-62 ms | 0.445-0.468 ms |
+  | 4 lanes, blocked | 65 ms | - |
+  | 8 lanes, blocked | 35-41 ms | - |
+  | 16 lanes, blocked | 26-28 ms | 0.617-0.619 ms (slower) |
+  | 32 lanes, blocked | 44-49 ms | - |
+  | 16 lanes, interleaved | 25 ms | 0.609-0.638 ms (slower) |
+  | **8 lanes, interleaved (kept)** | **19.5 ms** | **0.404-0.424 ms** |
+
+- Accuracy (registered tolerances unchanged): real-artifact GPU vs CPU
+  oracle, hidden 7.0e-5 -> 6.5e-5 and logits 4.7e-4 -> 2.8e-4; 512-token
+  batched vs sequential 4.27e-4 / 3.52e-4, top-1 equal; lane-split vs
+  generic recurrence within 2e-3.
+- Whole 512-token prefill, in-process, five alternating passes
+  (the Claude app's renderer was using up to 65% CPU, so passes are noisy):
+  best 407 -> 368 ms, median 422 -> 399 ms. Locally-calibrated.
