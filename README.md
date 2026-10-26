@@ -36,17 +36,17 @@ statements in [docs/claims.md](docs/claims.md).
 ### Measured against llama.cpp (Qwen3.5-0.8B Q8_0, M3 8 GB)
 
 Identity-matched harness (`scripts/bench-baseline.sh`): same artifact, same
-prompt tokens, 512 tokens in and 256 out, ABBA rounds. Idle run at
+prompt tokens, 512 tokens in and 256 out, ABBA rounds. Two idle runs at
 `d95ecc1`, locally-calibrated:
 
 | | TuckCore | llama.cpp Metal | Ratio |
 | --- | --- | --- | --- |
-| Time to first token | 0.272 s | 0.270 s (0.269-0.287) | 99% of llama.cpp |
-| Decode | 84.3 tok/s | 75.9 tok/s (67.9-84.7) | 1.11× (0.99-1.24 paired) |
+| Time to first token | 0.272 s (both runs) | 0.269-0.300 s | 94-106% of llama.cpp per pair |
+| Decode | 84.2-84.3 tok/s | 66.8-84.7 tok/s | 0.99-1.26× per pair |
 
-- **Phase 1 bar** (≥ 90% of llama.cpp for decode and prefill): met in this
-  run on this model. It is one run, so a repeat comes before
-  certification.
+- **Phase 1 bar** (≥ 90% of llama.cpp for decode and prefill): met in both
+  runs, in every pair, on this model and Mac. Prefill is at parity, not a
+  lead, because llama.cpp's own spread covers the difference.
 - **Decode** is at parity or ahead. llama.cpp's own decode in this harness
   varies between runs (about 66-85 tok/s), so this is not stated as a
   lead.
