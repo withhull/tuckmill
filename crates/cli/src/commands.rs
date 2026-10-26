@@ -145,6 +145,7 @@ pub fn dispatch(cmd: &Cmd, json: bool, data_dir: Option<&Path>) -> Result<ExitCo
             gpu_layers,
             kernels,
             storage,
+            kv_precision,
         } => bench(
             model,
             suite,
@@ -158,6 +159,7 @@ pub fn dispatch(cmd: &Cmd, json: bool, data_dir: Option<&Path>) -> Result<ExitCo
             *gpu_layers,
             kernels.as_deref(),
             storage.as_deref(),
+            kv_precision.as_deref(),
             json,
             data_dir,
         ),
@@ -1173,6 +1175,7 @@ fn bench(
     gpu_layers: Option<i32>,
     kernels: Option<&str>,
     storage: Option<&str>,
+    kv_precision: Option<&str>,
     json: bool,
     data_dir: Option<&Path>,
 ) -> Result<ExitCode> {
@@ -1182,12 +1185,17 @@ fn bench(
             format!("unknown suite {suite:?}; this build provides standard-v1"),
         ));
     }
-    let runtime = open_runtime_with_options(
-        data_dir,
-        engine,
-        allow_test_engine,
-        execution_options(engine, gpu_layers, kernels, storage)?,
-    )?;
+    let mut execution = execution_options(engine, gpu_layers, kernels, storage)?;
+    if let Some(kv) = kv_precision {
+        if !matches!(kv, "f32" | "f16") {
+            return Err(TuckmillError::new(
+                ErrorCode::InvalidRequest,
+                format!("unknown --kv-precision {kv:?}; use f32 or f16"),
+            ));
+        }
+        execution.kv_precision = Some(kv.to_string());
+    }
+    let runtime = open_runtime_with_options(data_dir, engine, allow_test_engine, execution)?;
     let budget = resolve_budget(&runtime, memory_budget)?;
     let (artifact, adapter) = runtime.resolve_artifact(model)?;
     let plan = runtime.plan_for(&artifact, &adapter, budget, context, output as u64)?;

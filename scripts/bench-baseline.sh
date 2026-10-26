@@ -12,6 +12,10 @@
 #   CONTEXT=2048        admitted context
 #   MEMORY_BUDGET=      process budget passed to every run (e.g. 4GiB;
 #                       default: the planner's hardware-adaptive default)
+#   KV_PRECISION=       KV cache precision passed to BOTH engines (f32 or
+#                       f16; default: each engine's own default). Set it
+#                       whenever the engines' defaults differ (dense Qwen3:
+#                       TuckCore f32, llama.cpp f16) — identity rules.
 #   MIN_RECLAIMABLE_MIB=1536      refuse to start a model process below this
 #   SWAP_DISCARD_MIB=64 a run that grows swap by more than this is discarded
 #                       (and retried once after a pause; both attempts are listed)
@@ -34,6 +38,7 @@ OUTPUT="${OUTPUT:-256}"
 REPS="${REPS:-3}"
 CONTEXT="${CONTEXT:-2048}"
 MEMORY_BUDGET="${MEMORY_BUDGET:-}"
+KV_PRECISION="${KV_PRECISION:-}"
 MIN_RECLAIMABLE_MIB="${MIN_RECLAIMABLE_MIB:-1536}"
 SWAP_DISCARD_MIB="${SWAP_DISCARD_MIB:-64}"
 export TUCKMILL_LLAMA_LIB="${TUCKMILL_LLAMA_LIB:-$ROOT/.deps/llama/libtm_llama.dylib}"
@@ -77,6 +82,7 @@ cat > "$OUT/environment.json" <<EOF
   "artifact_bytes": $(stat -f %z "$GGUF"),
   "artifact_sha256": "$sha",
   "memory_budget": "${MEMORY_BUDGET:-planner default}",
+  "kv_precision": "${KV_PRECISION:-engine defaults}",
   "shape": {"input": $INPUT, "output": $OUTPUT, "repetitions": $REPS, "context": $CONTEXT, "rounds": $ROUNDS}
 }
 EOF
@@ -142,6 +148,9 @@ run_engine_once() { # round slot engine attempt
     esac
     if [ -n "$MEMORY_BUDGET" ]; then
         set -- "$@" --memory-budget "$MEMORY_BUDGET"
+    fi
+    if [ -n "$KV_PRECISION" ]; then
+        set -- "$@" --kv-precision "$KV_PRECISION"
     fi
     if "$BIN" bench bench-model "$@" --input "$INPUT" --output "$OUTPUT" \
         --repetitions "$REPS" --context "$CONTEXT" --json > "$rec" 2> "$rec.stderr"; then

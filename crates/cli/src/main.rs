@@ -137,7 +137,7 @@ enum Cmd {
         #[arg(long)]
         gpu_layers: Option<i32>,
         /// Kernel implementation for tuckcore: auto (default; NEON where
-        /// available), scalar (force the reference kernels), neon.
+        /// available), scalar (force the reference kernels), neon, metal.
         #[arg(long)]
         kernels: Option<String>,
         /// Weight-block storage for tuckcore: auto (default; map when
@@ -252,7 +252,7 @@ enum Cmd {
         #[arg(long)]
         gpu_layers: Option<i32>,
         /// Kernel implementation for tuckcore: auto (default; NEON where
-        /// available), scalar (force the reference kernels), neon.
+        /// available), scalar (force the reference kernels), neon, metal.
         #[arg(long)]
         kernels: Option<String>,
         /// Weight-block storage for tuckcore: auto (default; map when
@@ -260,6 +260,11 @@ enum Cmd {
         /// bounded buffers).
         #[arg(long)]
         storage: Option<String>,
+        /// KV cache precision, passed identically to the engine under test
+        /// (f32 or f16; default: the engine's own default). Comparisons
+        /// across engines must declare the same precision.
+        #[arg(long)]
+        kv_precision: Option<String>,
     },
 
     /// Show backend statistics and profile counters after a short probe run.
