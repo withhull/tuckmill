@@ -8,7 +8,10 @@
 //   L=.deps/llama
 //   clang -O2 -I$L/include benchmarks/tools/ggml-mul-mat.c -L$L -lggml -lggml-base \
 //         -Wl,-rpath,$L -o /tmp/ggml-mul-mat
-// Usage: ggml-mul-mat <rows> <cols> <tokens> [nodes=16] [iters=20]
+// Usage: ggml-mul-mat <rows> <cols> <tokens> [nodes=16] [iters=20] [chain]
+// `chain` (rows == cols only) feeds each node's output to the next node,
+// so nodes are dependent as in a model graph; otherwise nodes are
+// independent and ggml may overlap them.
 // Run (serial nodes, like a dependent model graph):
 //   GGML_METAL_CONCURRENCY_DISABLE=1 /tmp/ggml-mul-mat 3584 1024 128
 #include <stdio.h>
@@ -30,6 +33,8 @@ int main(int argc, char **argv) {
     const int rows = atoi(argv[1]), cols = atoi(argv[2]), toks = atoi(argv[3]);
     const int nodes = argc > 4 ? atoi(argv[4]) : 16;
     const int iters = argc > 5 ? atoi(argv[5]) : 20;
+    const int chain = argc > 6 && strcmp(argv[6], "chain") == 0;
+    if (chain && rows != cols) { fprintf(stderr, "chain needs rows == cols\n"); return 2; }
     ggml_backend_load_all();
     ggml_backend_t be = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_GPU, NULL);
     if (!be) { fprintf(stderr, "no GPU backend\n"); return 1; }
@@ -39,8 +44,11 @@ int main(int argc, char **argv) {
     struct ggml_tensor *w = ggml_new_tensor_2d(ctx, GGML_TYPE_Q8_0, cols, rows);
     struct ggml_tensor *x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, cols, toks);
     struct ggml_cgraph *gf = ggml_new_graph(ctx);
+    struct ggml_tensor *in = x;
     for (int i = 0; i < nodes; ++i) {
-        ggml_build_forward_expand(gf, ggml_mul_mat(ctx, w, x));
+        struct ggml_tensor *out = ggml_mul_mat(ctx, w, in);
+        ggml_build_forward_expand(gf, out);
+        if (chain) in = out;
     }
     ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors(ctx, be);
     if (!buf) { fprintf(stderr, "alloc failed\n"); return 1; }
@@ -63,7 +71,8 @@ int main(int argc, char **argv) {
     for (int i = 0; i < iters; ++i) ggml_backend_graph_compute(be, gf);
     double per = (now_s() - t0) / ((double)iters * nodes);
     double gflops = 2.0 * rows * cols * (double)toks / per / 1e9;
-    printf("ggml mul_mat %5dx%-5d tokens %3d: %8.1f us  %6.0f GFLOP/s\n", rows, cols, toks, per * 1e6, gflops);
+    printf("ggml mul_mat %5dx%-5d tokens %3d%s: %8.1f us  %6.0f GFLOP/s\n", rows, cols, toks,
+           chain ? " chain" : "", per * 1e6, gflops);
     ggml_backend_buffer_free(buf);
     ggml_free(ctx);
     ggml_backend_free(be);

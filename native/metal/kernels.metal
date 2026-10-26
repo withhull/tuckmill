@@ -638,11 +638,15 @@ kernel void tm_q8_0_gemm(device const uchar *w [[buffer(0)]],
  * edge tiles stage through threadgroup memory and store in bounds only.
  * Arithmetic is f32 throughout (oracle-f32 profile); summation order
  * differs from the GEMV, so results are tolerance-registered, not
- * bit-identical. Layout follows the pinned llama.cpp kernel_mul_mm
- * (measured 1.3x faster on the same shapes; ADR-011), kept in f32.
+ * bit-identical. Layout and code shape follow the pinned llama.cpp
+ * kernel_mul_mm, kept in f32: out-of-range rows and tokens load a clamped
+ * in-range row instead of branching, loops unroll fully, block pointers
+ * advance by increment, fragment indices are 16-bit, and SIMD barriers
+ * separate the fragment loads from the multiplies (ADR-011).
  */
 #define TM_MMA_ROWS 64u
 #define TM_MMA_TOK 32u
+#define TM_UNROLL _Pragma("clang loop unroll(full)")
 
 kernel void tm_q8_0_gemm_mma(device const uchar *w [[buffer(0)]],
                              device const float *x [[buffer(1)]],
@@ -674,13 +678,11 @@ kernel void tm_q8_0_gemm_mma(device const uchar *w [[buffer(0)]],
     /* W loader: thread t owns 16 quants (half a Q8_0 block) of row t / 2. */
     const uint w_r = tid / 2u;
     const uint w_k = (tid % 2u) * 16u;
-    const bool w_in = row0 + w_r < rows;
-    const device uchar *wrow = w + (size_t)(w_in ? row0 + w_r : 0u) * row_bytes;
+    const device uchar *wrow = w + (size_t)min(row0 + w_r, rows - 1u) * row_bytes;
     /* X loader: thread t owns 8 values of token t / 4. */
     const uint x_t = tid / 4u;
     const uint x_k = (tid % 4u) * 8u;
-    const bool x_in = x_t < tile_batch;
-    const device float *xrow = x + x_off + (size_t)(tok0 + (x_in ? x_t : 0u)) * cols + x_k;
+    const device float *xrow = x + x_off + (size_t)(tok0 + min(x_t, tile_batch - 1u)) * cols + x_k;
 
     /* Fragment slots this thread writes. */
     threadgroup float *sa_dst = sa + 64u * ((w_k / 8u) * 8u + w_r / 8u) + (w_r % 8u);
@@ -695,54 +697,53 @@ kernel void tm_q8_0_gemm_mma(device const uchar *w [[buffer(0)]],
         }
     }
 
-    for (uint blk = 0; blk < blocks; ++blk) {
+    /* Out-of-range rows and tokens load a clamped in-range row; their
+     * results land only in output positions that are never stored. */
+    const device uchar *block = wrow;
+    const device float *xblk = xrow;
+    /* This SIMD group's fragment bases; each k-block of 8 advances them. */
+    const threadgroup float *lsa = sa + 64u * sg_r;
+    const threadgroup float *lsb = sb + 64u * sg_t;
+    for (uint blk = 0; blk < blocks; ++blk, block += 34, xblk += 32) {
         float wv[16];
-        if (w_in) {
-            const device uchar *block = wrow + (size_t)blk * 34u;
-            const float d = (float)(*(const device half *)block);
-            const device packed_char4 *qv = (const device packed_char4 *)(block + 2u + w_k);
-            for (uint i = 0; i < 4u; ++i) {
-                const float4 q = float4(char4(qv[i]));
-                wv[4u * i + 0u] = d * q.x;
-                wv[4u * i + 1u] = d * q.y;
-                wv[4u * i + 2u] = d * q.z;
-                wv[4u * i + 3u] = d * q.w;
-            }
-        } else {
-            for (uint i = 0; i < 16u; ++i) {
-                wv[i] = 0.0f;
-            }
+        const float d = (float)(*(const device half *)block);
+        const device packed_char4 *qv = (const device packed_char4 *)(block + 2u + w_k);
+        TM_UNROLL for (uint i = 0; i < 4u; ++i) {
+            const float4 q = float4(char4(qv[i]));
+            wv[4u * i + 0u] = d * q.x;
+            wv[4u * i + 1u] = d * q.y;
+            wv[4u * i + 2u] = d * q.z;
+            wv[4u * i + 3u] = d * q.w;
         }
-        float4 xv0 = float4(0.0f);
-        float4 xv1 = float4(0.0f);
-        if (x_in) {
-            const device packed_float4 *xp = (const device packed_float4 *)(xrow + blk * 32u);
-            xv0 = float4(xp[0]);
-            xv1 = float4(xp[1]);
-        }
+        const device packed_float4 *xp = (const device packed_float4 *)xblk;
+        const float4 xv0 = float4(xp[0]);
+        const float4 xv1 = float4(xp[1]);
 
         threadgroup_barrier(mem_flags::mem_threadgroup);
         /* W^T fragment element (k % 8, row % 8); the 16 k values span two
          * k-blocks of 8. */
-        for (uint i = 0; i < 16u; ++i) {
-            sa_dst[64u * 8u * (i / 8u) + 8u * (i % 8u)] = wv[i];
+        TM_UNROLL for (ushort i = 0; i < 16; ++i) {
+            sa_dst[64 * 8 * (i / 8) + 8 * (i % 8)] = wv[i];
         }
         /* X fragment row (token % 8), 8 contiguous k values. */
         *(threadgroup float4 *)(sb_dst) = xv0;
         *(threadgroup float4 *)(sb_dst + 4u) = xv1;
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
-        for (uint kb = 0; kb < 4u; ++kb) {
+        TM_UNROLL for (ushort kb = 0; kb < 4; ++kb) {
             simdgroup_float8x8 ma[4];
             simdgroup_float8x8 mb[2];
-            for (uint i = 0; i < 4u; ++i) {
-                simdgroup_load(ma[i], sa + 64u * (kb * 8u + sg_r + i), 8);
+            simdgroup_barrier(mem_flags::mem_none);
+            TM_UNROLL for (ushort i = 0; i < 4; ++i) {
+                simdgroup_load(ma[i], lsa + 64 * (8 * kb + i), 8);
             }
-            for (uint j = 0; j < 2u; ++j) {
-                simdgroup_load(mb[j], sb + 64u * (kb * 4u + sg_t + j), 8);
+            simdgroup_barrier(mem_flags::mem_none);
+            TM_UNROLL for (ushort j = 0; j < 2; ++j) {
+                simdgroup_load(mb[j], lsb + 64 * (4 * kb + j), 8);
             }
-            for (uint j = 0; j < 2u; ++j) {
-                for (uint i = 0; i < 4u; ++i) {
+            simdgroup_barrier(mem_flags::mem_none);
+            TM_UNROLL for (ushort j = 0; j < 2; ++j) {
+                TM_UNROLL for (ushort i = 0; i < 4; ++i) {
                     simdgroup_multiply_accumulate(mc[j][i], mb[j], ma[i], mc[j][i]);
                 }
             }

@@ -391,3 +391,34 @@ three passes each; full prefill ~330 ms):
   - per-operator profile: GEMM GPU time 340-368 -> 270-276 ms.
   - Accuracy: GEMM tolerance tests at every shape; 512-token batched vs
     sequential 3.36e-4, top-1 equal.
+
+## Engine note (2026-10-27): GEMM gap to llama.cpp resolved; code shape kept, precision not
+
+- **The harness comparison is fair.** In
+  `benchmarks/tools/ggml-mul-mat.c`, `chain` mode makes each ggml node
+  consume the previous output. Dependent and independent nodes time the
+  same with concurrency disabled (2048x2048 x 128: 432.7 vs 428.8 us).
+  Concurrent encoding gives ggml a further ~5% on independent nodes,
+  which our serial encoder cannot get (a separate lever).
+- **Code shape, measured on a quiet Mac at 128 tokens** (3584x1024 /
+  6144x1024 / 1024x3584, in us):
+
+  | kernel | 3584x1024 | 6144x1024 | 1024x3584 |
+  | --- | --- | --- | --- |
+  | fragment layout (`b5899a1`) | 450-453 | 736-742 | 543-550 |
+  | + clamped loads, full unrolling | 432-439 | 707-715 | 508-517 |
+  | + pointer increments, 16-bit indices, SIMD barriers (kept) | 410-415 | 677-691 | 461-471 |
+  | llama.cpp `kernel_mul_mm_q8_0_f32` | 385-387 | 631-636 | 429-437 |
+
+  Not kept, because no change was measurable: aligned activation loads,
+  byte-wise quant loads, and an 8 KB threadgroup footprint.
+- **The remaining ~6% is precision.** The same kernel with f16 operand
+  tiles (information only) matches llama.cpp exactly: 388-392 / 639-674 /
+  441 us. llama.cpp rounds dequantized weights and activations to f16
+  before multiplying; TuckCore keeps f32 (the oracle-f32 profile).
+  Adopting f16 operands would be a declared profile change (ADR-010) and
+  a product decision, not an optimization.
+- **In the model** (pinned 0.8B, M3 8 GB idle, prebuilt binaries
+  alternated, six passes each): 512-token prefill 319-321 -> 286-292 ms.
+  Accuracy is unchanged (512-token batched vs sequential 3.36e-4, top-1
+  equal; GEMM tolerance tests at every shape).
