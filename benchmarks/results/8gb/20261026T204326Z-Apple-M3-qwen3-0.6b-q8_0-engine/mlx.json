@@ -1,0 +1,1 @@
+{"available": false, "artifact": "artifacts-local/Qwen3-0.6B-Q8_0.gguf", "mlx": "0.32.4", "mlx_lm": "0.32.2", "reason": "mlx-lm cannot load the identical GGUF artifact (NotADirectoryError: [Errno 20] Not a directory: 'artifacts-local/Qwen3-0.6B-Q8_0.gguf/config.json'); an MLX-format conversion would be a different artifact, so no MLX row is recorded"}

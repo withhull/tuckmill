@@ -56,6 +56,10 @@ prompt tokens, 512 tokens in and 256 out, ABBA rounds. Two idle runs at
   lead.
 - **Remaining prefill difference:** f16 vs f32 operand precision. TuckCore
   keeps f32 (ADR-011).
+- **Dense Qwen3-0.6B Q8_0** (one run, f16 KV on both engines): time to
+  first token 0.287 s vs 0.208 s (72%). Decode isn't measurable in this
+  harness yet: the frozen prompt ends in EOS after 1-2 tokens on both
+  engines.
 - **Not measured:** other models, contexts and memory tiers. Records are in
   [benchmarks/results/](benchmarks/results/).
 
