@@ -355,3 +355,39 @@ three passes each; full prefill ~330 ms):
 - The GEMMs are about 80% of prefill. Prefill parity therefore depends
   on the GEMM, where the f32 kernel variants measured earlier all
   plateau at ~2 TFLOP/s.
+
+## Engine note (2026-10-27): why llama.cpp's GEMM was faster; fragment-layout kernel
+
+- **Measured in isolation, same method on both sides:** 16 serial
+  dispatches, wall time per dispatch.
+  - llama.cpp: `benchmarks/tools/ggml-mul-mat.c`, which runs the pinned
+    ggml's `mul_mat` (it selects `kernel_mul_mm_q8_0_f32`).
+  - TuckCore: `q8_0_gemm_mma_grouped_wall_timing_when_requested`.
+  - Cross-check: the ggml per-node cost from 2-node minus 1-node graphs
+    matches its serial 16-node figure, so concurrency does not explain it.
+- **llama.cpp was 1.3-1.4x faster.** At 128 tokens: 3584x1024 391-420 vs
+  504-559 us; 6144x1024 652-750 vs 868-996 us.
+- **Cause: kernel structure, not precision.**
+  - Its threadgroup tiles hold each 8x8 fragment contiguously, so loads
+    are stride-8 with no transpose. Ours were row-major with stride 32,
+    so every row of a fragment load hit the same banks.
+  - It loads the next block into registers before the barrier, overlapping
+    device latency with other SIMD groups' multiplies.
+  - Full tiles store straight from the accumulators.
+  - Tiles are 64 x 32.
+  - Not the cause: half-precision tiles (llama.cpp uses them) gave nothing
+    in either layout, so the oracle-f32 profile stays. Removing bounds
+    branches, forced unrolling and aligned activation loads also changed
+    nothing measurable.
+- **`tm_q8_0_gemm_mma` now uses that structure in f32.** Isolated time at
+  128 tokens: 3584x1024 462-490 us, 6144x1024 792-853 us. About half the
+  gap is closed; the remaining ~15% is unexplained and close to run-to-run
+  noise.
+- **In the model** (pinned 0.8B, M3 8 GB idle, two prebuilt binaries
+  alternated, six passes each):
+  - full 512-token prefill: 311 -> 297 ms;
+  - GEMM-only (other operators skipped in a throwaway build): 260 ->
+    251-253 ms;
+  - per-operator profile: GEMM GPU time 340-368 -> 270-276 ms.
+  - Accuracy: GEMM tolerance tests at every shape; 512-token batched vs
+    sequential 3.36e-4, top-1 equal.

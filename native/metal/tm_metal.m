@@ -1424,9 +1424,9 @@ int tm_metal_q8_0_gemm_mma(tm_metal_ctx *ctx, tm_metal_buffer *w, tm_metal_buffe
                                                   cols, batch, TM_METAL_GEMM_MMA_MAX_BATCH]);
     }
     size_t w_need = (size_t)rows * ((size_t)cols / 32u) * 34u;
-    /* 4 SIMD groups own a 32-row x 32-token tile (TM_MMA_* in kernels.metal). */
+    /* 4 SIMD groups own a 64-row x 32-token tile (TM_MMA_* in kernels.metal). */
     return tm_gemm_dispatch_rows(ctx, ctx->pso_q8gemm_mma, w, w_need, x, y, rows, cols, batch,
-                                 x_off, y_off, 32, 128, TM_METAL_GEMM_MMA_MAX_BATCH, 32, err,
+                                 x_off, y_off, 64, 128, TM_METAL_GEMM_MMA_MAX_BATCH, 32, err,
                                  err_cap, "q8_0_gemm_mma");
 }
 

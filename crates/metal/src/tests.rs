@@ -1784,3 +1784,51 @@ fn argmax_matches_the_cpu_greedy_rule_exactly() {
         assert_eq!(got, want, "slot {slot} id {id}");
     }
 }
+
+/// Measurement only (`TUCKMILL_PROFILE=1`): the matrix-unit GEMM timed the
+/// way ggml's graph runs it, 16 dispatches in one command buffer, as wall
+/// time per dispatch.
+#[test]
+fn q8_0_gemm_mma_grouped_wall_timing_when_requested() {
+    if std::env::var("TUCKMILL_PROFILE").ok().as_deref() != Some("1") {
+        eprintln!("skipping: TUCKMILL_PROFILE=1 not set (measurement only)");
+        return;
+    }
+    let Some(ctx) = metal_context() else {
+        return;
+    };
+    for (rows, cols) in [(3584usize, 1024usize), (6144, 1024), (1024, 3584)] {
+        let w = boundary_weights(rows, cols, 3);
+        let wb = ctx.buffer(w.len(), true).unwrap();
+        wb.upload(0, &w).unwrap();
+        for batch in [32usize, 128, 512] {
+            let x = boundary_input(cols * batch, 5);
+            let xb = ctx.buffer(cols * batch * 4, true).unwrap();
+            xb.upload(0, &f32_bytes(&x)).unwrap();
+            let yb = ctx.buffer(rows * batch * 4, true).unwrap();
+            let group = || {
+                ctx.begin_group().unwrap();
+                for _ in 0..16 {
+                    ctx.q8_0_gemm_mma(&wb, &xb, &yb, rows as u32, cols as u32, batch as u32, 0, 0)
+                        .unwrap();
+                }
+                ctx.end_group().unwrap();
+                ctx.fence().unwrap();
+            };
+            for _ in 0..3 {
+                group();
+            }
+            let iters = 20;
+            let t0 = std::time::Instant::now();
+            for _ in 0..iters {
+                group();
+            }
+            let per = t0.elapsed().as_secs_f64() / (iters * 16) as f64;
+            eprintln!(
+                "ours mul_mat {rows:>5}x{cols:<5} tokens {batch:>3}: {:>8.1} us  {:>6.0} GFLOP/s",
+                per * 1e6,
+                2.0 * (rows * cols * batch) as f64 / per / 1e9
+            );
+        }
+    }
+}
