@@ -10,6 +10,8 @@
 #   ROUNDS=3            paired rounds; engine order alternates (ABBA)
 #   INPUT=512 OUTPUT=256 REPS=3   standard-v1 shape per bench invocation
 #   CONTEXT=2048        admitted context
+#   MEMORY_BUDGET=      process budget passed to every run (e.g. 4GiB;
+#                       default: the planner's hardware-adaptive default)
 #   MIN_RECLAIMABLE_MIB=1536      refuse to start a model process below this
 #   SWAP_DISCARD_MIB=64 a run that grows swap by more than this is discarded
 #                       (and retried once after a pause; both attempts are listed)
@@ -31,6 +33,7 @@ INPUT="${INPUT:-512}"
 OUTPUT="${OUTPUT:-256}"
 REPS="${REPS:-3}"
 CONTEXT="${CONTEXT:-2048}"
+MEMORY_BUDGET="${MEMORY_BUDGET:-}"
 MIN_RECLAIMABLE_MIB="${MIN_RECLAIMABLE_MIB:-1536}"
 SWAP_DISCARD_MIB="${SWAP_DISCARD_MIB:-64}"
 export TUCKMILL_LLAMA_LIB="${TUCKMILL_LLAMA_LIB:-$ROOT/.deps/llama/libtm_llama.dylib}"
@@ -73,6 +76,7 @@ cat > "$OUT/environment.json" <<EOF
   "artifact": "$(basename "$GGUF")",
   "artifact_bytes": $(stat -f %z "$GGUF"),
   "artifact_sha256": "$sha",
+  "memory_budget": "${MEMORY_BUDGET:-planner default}",
   "shape": {"input": $INPUT, "output": $OUTPUT, "repetitions": $REPS, "context": $CONTEXT, "rounds": $ROUNDS}
 }
 EOF
@@ -136,6 +140,9 @@ run_engine_once() { # round slot engine attempt
         tuckcore-metal) set -- --engine tuckcore --kernels metal ;;
         llama-metal) set -- --engine llama --gpu-layers 99 ;;
     esac
+    if [ -n "$MEMORY_BUDGET" ]; then
+        set -- "$@" --memory-budget "$MEMORY_BUDGET"
+    fi
     if "$BIN" bench bench-model "$@" --input "$INPUT" --output "$OUTPUT" \
         --repetitions "$REPS" --context "$CONTEXT" --json > "$rec" 2> "$rec.stderr"; then
         status=ok
