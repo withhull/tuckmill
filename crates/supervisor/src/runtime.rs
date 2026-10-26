@@ -171,6 +171,8 @@ pub struct RunRequest {
     pub stop: Vec<String>,
     pub seed: u64,
     pub sampling: tuckmill_backend::SamplingPolicy,
+    /// Benchmark workloads only (see `GenerateRequest::ignore_eos`).
+    pub ignore_eos: bool,
 }
 
 impl RunRequest {
@@ -182,6 +184,7 @@ impl RunRequest {
             stop: Vec::new(),
             seed: 0,
             sampling: tuckmill_backend::SamplingPolicy::default(),
+            ignore_eos: false,
         }
     }
 }
@@ -1193,6 +1196,7 @@ impl Runtime {
                         stop: request.stop,
                         seed: request.seed,
                         sampling: request.sampling,
+                        ignore_eos: request.ignore_eos,
                     },
                     cancel,
                     pause,
@@ -1219,6 +1223,7 @@ impl Runtime {
                     stop: request.stop,
                     seed: request.seed,
                     sampling: request.sampling,
+                    ignore_eos: request.ignore_eos,
                 };
                 let mut token_tx = |index: u64, text: &str| -> bool {
                     // Interim status only (release ordinal, not a token
@@ -1612,6 +1617,7 @@ mod tests {
                     stop: vec![],
                     seed: 42,
                     sampling: tuckmill_backend::SamplingPolicy::default(),
+                    ignore_eos: false,
                 },
             )
             .unwrap();
@@ -1936,6 +1942,7 @@ mod tests {
             stop: vec![],
             seed: 0,
             sampling: tuckmill_backend::SamplingPolicy::default(),
+            ignore_eos: false,
         };
         assert!(validate_request_against_plan(&plan, &request(2, 100)).is_ok());
         assert_eq!(

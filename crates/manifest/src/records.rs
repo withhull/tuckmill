@@ -294,6 +294,11 @@ pub struct WorkloadSpec {
     pub output_tokens: u32,
     pub repetitions: u32,
     pub prompt_set: String,
+    /// The model's end-of-sequence token did not end generation: every
+    /// engine generated the full `output_tokens` (a decode-throughput
+    /// workload; text past EOS is not meaningful). Absent means false.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub ignore_eos: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

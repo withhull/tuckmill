@@ -412,6 +412,7 @@ mod tests {
             stop: Vec::new(),
             seed: 7,
             sampling: tuckmill_backend::SamplingPolicy::default(),
+            ignore_eos: false,
         }
     }
 

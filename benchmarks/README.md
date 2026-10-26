@@ -182,3 +182,20 @@ foreground matching). Fixture numbers say nothing about real-model behavior
 which shows up in the p95 values; `serve` keeps workers warm. Further kernel
 work — K02 onward — is accepted only against measured gaps on real models
 and the numerical gates, never against these numbers.
+
+## Ignore-EOS workloads (decode throughput)
+
+Instruct models can end in their end-of-sequence token after a few tokens
+on the frozen synthetic prompts; dense Qwen3-0.6B does so after 1-2
+tokens at 512 input tokens. A decode figure over one inter-token interval
+is not a measurement. For decode comparisons on such models, run
+`tuckmill bench --ignore-eos` (harness: `IGNORE_EOS=1`):
+
+- On every engine, EOS does not end generation. It is fed back like any
+  other token and its bytes stay invisible, so all engines generate the
+  full output count. Stop sequences and cancellation still apply.
+- The record's workload carries `ignore_eos: true` plus a caveat, and the
+  harness records it in `environment.json`.
+- Use it only together with the identity rules above (same artifact,
+  prompt tokens, declared KV precision on both sides). Output text past
+  EOS is not meaningful and is never quality evidence.

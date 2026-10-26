@@ -208,6 +208,7 @@ impl IsolatedWorker {
             stop: spec.stop,
             seed: spec.seed,
             sampling: spec.sampling,
+            ignore_eos: spec.ignore_eos,
         }
         .write_to(&mut self.stream)?;
 
@@ -685,6 +686,7 @@ mod tests {
                     stop: vec![],
                     seed: 7,
                     sampling: tuckmill_backend::SamplingPolicy::default(),
+                    ignore_eos: false,
                 },
                 &cancel,
                 &pause,
@@ -726,6 +728,7 @@ mod tests {
                     stop: vec![],
                     seed: 7,
                     sampling: tuckmill_backend::SamplingPolicy::default(),
+                    ignore_eos: false,
                 },
                 &cancel,
                 &pause,
@@ -793,6 +796,7 @@ mod tests {
                     stop: vec![],
                     seed: 7,
                     sampling: tuckmill_backend::SamplingPolicy::default(),
+                    ignore_eos: false,
                 },
                 &cancel,
                 &pause,
@@ -878,6 +882,7 @@ mod tests {
                         stop: vec![],
                         seed: 0,
                         sampling: tuckmill_backend::SamplingPolicy::default(),
+                        ignore_eos: false,
                     },
                     &cancel,
                     &pause,

@@ -681,6 +681,7 @@ fn handle_chat_completions(runtime: Arc<Runtime>, mut stream: TcpStream, body: &
             stop: spec.stop.clone(),
             seed: spec.seed,
             sampling: spec.sampling,
+            ignore_eos: false,
         },
     ) {
         Ok(r) => r,

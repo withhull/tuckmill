@@ -1046,6 +1046,7 @@ impl Runtime {
                 stop: Vec::new(),
                 seed: 0,
                 sampling: tuckmill_backend::SamplingPolicy::default(),
+                ignore_eos: false,
             },
             &cancel,
             &pause,

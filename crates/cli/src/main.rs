@@ -265,6 +265,12 @@ enum Cmd {
         /// across engines must declare the same precision.
         #[arg(long)]
         kv_precision: Option<String>,
+        /// Decode-throughput workload: the model's end-of-sequence token
+        /// does not end generation, so every engine generates the full
+        /// --output count (recorded in the workload; output text past EOS
+        /// is not meaningful).
+        #[arg(long)]
+        ignore_eos: bool,
     },
 
     /// Show backend statistics and profile counters after a short probe run.

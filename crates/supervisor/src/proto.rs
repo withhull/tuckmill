@@ -5,12 +5,12 @@
 //! used. The protocol carries control messages, tokens, scores, errors, and
 //! statistics — it is deliberately not a general tensor RPC service.
 //!
-//! Protocol v7 (current): `Load` carries an `ArtifactRef` plus optional
+//! Protocol v8 (current): `Load` carries an `ArtifactRef` plus optional
 //! backend options; `Score`/`ScoreChunk`/`ScoreDone` provide bounded
 //! teacher-forced logits; `StatsAck` carries backend statistics and the
-//! prepared KV-state bytes; `Generate` carries the typed sampling policy;
-//! `Done` carries both the visible (`committed`) and raw (`generated`)
-//! token counts.
+//! prepared KV-state bytes; `Generate` carries the typed sampling policy
+//! and (v8) the benchmark-only `ignore_eos` flag; `Done` carries both the
+//! visible (`committed`) and raw (`generated`) token counts.
 
 use std::io::{Read, Write};
 
@@ -71,6 +71,10 @@ pub enum WorkerFrame {
         /// the worker validates the values before any compute.
         #[serde(default)]
         sampling: tuckmill_backend::SamplingPolicy,
+        /// v8: benchmark-only; EOS does not end generation (see
+        /// `GenerateRequest::ignore_eos`).
+        #[serde(default)]
+        ignore_eos: bool,
     },
     State {
         state: String,
@@ -285,6 +289,7 @@ mod tests {
                     temperature: 0.7,
                     top_p: Some(0.95),
                 },
+                ignore_eos: true,
             },
             WorkerFrame::Score {
                 request_id: "req_2".into(),

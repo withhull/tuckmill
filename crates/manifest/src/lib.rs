@@ -55,4 +55,4 @@ pub const BACKEND_ABI_VERSION: u32 = 1;
 /// and StatsAck carries the prepared KV-state bytes so the plan's KV
 /// reservation can be acknowledged and enforced. Plans recorded against
 /// older versions are PLAN_STALE.
-pub const WORKER_PROTOCOL_VERSION: u16 = 7;
+pub const WORKER_PROTOCOL_VERSION: u16 = 8;

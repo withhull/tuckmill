@@ -236,6 +236,7 @@ fn serve(stream: UnixStream, kind: EngineKind) -> Result<()> {
                     stop,
                     seed,
                     sampling,
+                    ignore_eos,
                 } => {
                     if !loaded {
                         write_frame(
@@ -274,6 +275,7 @@ fn serve(stream: UnixStream, kind: EngineKind) -> Result<()> {
                             stop,
                             seed,
                             sampling,
+                            ignore_eos,
                         },
                     );
                     cancel.store(false, Ordering::Relaxed);
@@ -709,6 +711,7 @@ mod tests {
             stop: vec![],
             seed: 1,
             sampling: tuckmill_backend::SamplingPolicy::default(),
+            ignore_eos: false,
         }
         .write_to(&mut stream)
         .unwrap();
@@ -858,6 +861,7 @@ mod tests {
             stop: vec![],
             seed: 0,
             sampling: tuckmill_backend::SamplingPolicy::default(),
+            ignore_eos: false,
         }
         .write_to(&mut stream)
         .unwrap();

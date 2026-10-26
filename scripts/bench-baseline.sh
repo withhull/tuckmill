@@ -16,6 +16,9 @@
 #                       f16; default: each engine's own default). Set it
 #                       whenever the engines' defaults differ (dense Qwen3:
 #                       TuckCore f32, llama.cpp f16) — identity rules.
+#   IGNORE_EOS=1        decode-throughput workload: EOS does not end
+#                       generation on either engine (instruct models that
+#                       end early on the frozen prompts); recorded.
 #   MIN_RECLAIMABLE_MIB=1536      refuse to start a model process below this
 #   SWAP_DISCARD_MIB=64 a run that grows swap by more than this is discarded
 #                       (and retried once after a pause; both attempts are listed)
@@ -39,6 +42,7 @@ REPS="${REPS:-3}"
 CONTEXT="${CONTEXT:-2048}"
 MEMORY_BUDGET="${MEMORY_BUDGET:-}"
 KV_PRECISION="${KV_PRECISION:-}"
+IGNORE_EOS="${IGNORE_EOS:-0}"
 MIN_RECLAIMABLE_MIB="${MIN_RECLAIMABLE_MIB:-1536}"
 SWAP_DISCARD_MIB="${SWAP_DISCARD_MIB:-64}"
 export TUCKMILL_LLAMA_LIB="${TUCKMILL_LLAMA_LIB:-$ROOT/.deps/llama/libtm_llama.dylib}"
@@ -83,6 +87,7 @@ cat > "$OUT/environment.json" <<EOF
   "artifact_sha256": "$sha",
   "memory_budget": "${MEMORY_BUDGET:-planner default}",
   "kv_precision": "${KV_PRECISION:-engine defaults}",
+  "ignore_eos": $([ "$IGNORE_EOS" = 1 ] && echo true || echo false),
   "shape": {"input": $INPUT, "output": $OUTPUT, "repetitions": $REPS, "context": $CONTEXT, "rounds": $ROUNDS}
 }
 EOF
@@ -151,6 +156,9 @@ run_engine_once() { # round slot engine attempt
     fi
     if [ -n "$KV_PRECISION" ]; then
         set -- "$@" --kv-precision "$KV_PRECISION"
+    fi
+    if [ "$IGNORE_EOS" = 1 ]; then
+        set -- "$@" --ignore-eos
     fi
     if "$BIN" bench bench-model "$@" --input "$INPUT" --output "$OUTPUT" \
         --repetitions "$REPS" --context "$CONTEXT" --json > "$rec" 2> "$rec.stderr"; then

@@ -146,6 +146,7 @@ pub fn dispatch(cmd: &Cmd, json: bool, data_dir: Option<&Path>) -> Result<ExitCo
             kernels,
             storage,
             kv_precision,
+            ignore_eos,
         } => bench(
             model,
             suite,
@@ -160,6 +161,7 @@ pub fn dispatch(cmd: &Cmd, json: bool, data_dir: Option<&Path>) -> Result<ExitCo
             kernels.as_deref(),
             storage.as_deref(),
             kv_precision.as_deref(),
+            *ignore_eos,
             json,
             data_dir,
         ),
@@ -945,6 +947,7 @@ fn run(
             stop: Vec::new(),
             seed: 0,
             sampling: tuckmill_backend::SamplingPolicy::default(),
+            ignore_eos: false,
         },
     )?;
 
@@ -1176,6 +1179,7 @@ fn bench(
     kernels: Option<&str>,
     storage: Option<&str>,
     kv_precision: Option<&str>,
+    ignore_eos: bool,
     json: bool,
     data_dir: Option<&Path>,
 ) -> Result<ExitCode> {
@@ -1207,6 +1211,7 @@ fn bench(
         output_tokens: output,
         repetitions,
         suite: suite.to_string(),
+        ignore_eos,
         ..Default::default()
     };
     let artifact_ref = tuckmill_backend::ArtifactRef::from_record(
@@ -1374,6 +1379,7 @@ fn stats(
             stop: Vec::new(),
             seed: 0,
             sampling: tuckmill_backend::SamplingPolicy::default(),
+            ignore_eos: false,
         },
     )?;
     let committed;

@@ -1,4 +1,4 @@
-# Worker control protocol (v7)
+# Worker control protocol (v8)
 
 Wire contract between the Tuckmill supervisor and an execution worker. The
 transport is a private Unix domain socket under the store's `tmp/` directory.
@@ -35,6 +35,9 @@ payload := UTF-8 JSON, one message object
   `first_token_ms`, `decode_ms`) measured inside the backend. Supervisors
   record it separately from their own wall time so queueing and transport
   are never confused with compute; older workers omit the field.
+- v8: `Generate` carries `ignore_eos` (benchmark workloads only; absent
+  means false): the model's end-of-sequence token does not end generation,
+  it is fed back like any token and its bytes stay invisible.
 - v7: `Generate` carries the typed `sampling` policy (`temperature`, `top_p`;
   absent means greedy). The worker validates it and refuses unsupported
   values before any compute — never clamps or ignores them. `Done` carries
@@ -71,7 +74,7 @@ Every message is a JSON object with `"t"` as the tag:
 | `HelloAck` | W→C | `protocol`, `abi`, `worker_build`, `engine`, `certified` | Protocol/ABI mismatch fails closed. |
 | `Load` | C→W | `plan` (full ExecutionPlan JSON), `artifact` (`ArtifactRef`: path + identity hashes), optional `options` | The backend must re-verify the artifact hashes before executing; options are validated and unknown keys rejected. |
 | `Loaded` | W→C | `note`, `footprint_bytes`, `resolved_kernels` (v5) | `note` must disclose synthetic engines and experimental kernels; `resolved_kernels` names the implementation actually selected. |
-| `Generate` | C→W | `request_id`, `prompt_tokens` (exact IDs), `max_output_tokens`, `stop`, `seed`, `sampling` (v7) | Prompt+output must fit the admitted context. `sampling.temperature <= 0` means greedy; unsupported values are a typed rejection. |
+| `Generate` | C→W | `request_id`, `prompt_tokens` (exact IDs), `max_output_tokens`, `stop`, `seed`, `sampling` (v7), `ignore_eos` (v8) | Prompt+output must fit the admitted context. `sampling.temperature <= 0` means greedy; unsupported values are a typed rejection. |
 | `State` | W→C | `state` ∈ warming/prefilling/generating/throttling/paused | Advisory progress. |
 | `Token` | W→C | `index`, `text` | Visible tokens only, stop/EOS-trimmed text excluded. Draft text is forbidden. |
 | `Heartbeat` | W→C | `uptime_ms` | Emitted at ≈500 ms while idle; liveness evidence. |

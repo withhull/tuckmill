@@ -961,7 +961,8 @@ fn run_session(
                 first_generated_at = Some(produced_at);
             }
             last_generated_at = Some(produced_at);
-            if Some(token) == spec.eos_token_id {
+            let is_eos = Some(token) == spec.eos_token_id;
+            if is_eos && !req.ignore_eos {
                 // The model-defined EOS token is never visible: its
                 // bytes are not pushed, and anything held is flushed
                 // because no stop sequence can complete after EOS.
@@ -970,9 +971,12 @@ fn run_session(
                 break 'decode GenOutcome::new(FinishReason::Eos, buffer.visible_tokens())
                     .with_generated(generated_ids);
             }
-            let piece = match spec.tokenizer.contains(token) {
-                true => decoder.push_token(spec.tokenizer.token_bytes(token), i),
-                false => {
+            // Benchmark workloads (`ignore_eos`): EOS stays invisible but
+            // does not end generation; it is fed back like any token.
+            let piece = match (is_eos, spec.tokenizer.contains(token)) {
+                (true, _) => Vec::new(),
+                (false, true) => decoder.push_token(spec.tokenizer.token_bytes(token), i),
+                (false, false) => {
                     let placeholder = format!("<tok {token}>");
                     decoder.push_token(placeholder.as_bytes(), i)
                 }
@@ -1699,6 +1703,7 @@ mod tests {
             stop,
             seed,
             sampling,
+            ignore_eos: false,
         };
         let outcome = engine.generate(&req, &mut ctl).unwrap();
         (outcome, texts)
@@ -1773,6 +1778,7 @@ mod tests {
                 stop: vec![],
                 seed: 0,
                 sampling: tuckmill_backend::SamplingPolicy::default(),
+                ignore_eos: false,
             };
             engine.generate(&req, &mut ctl).unwrap_err()
         };
@@ -2477,6 +2483,7 @@ mod tests {
                 stop: vec![],
                 seed: 0,
                 sampling: bad,
+                ignore_eos: false,
             };
             engine.generate(&req, &mut ctl).unwrap_err()
         };
@@ -2508,6 +2515,7 @@ mod tests {
             stop: vec![],
             seed: 0,
             sampling: tuckmill_backend::SamplingPolicy::default(),
+            ignore_eos: false,
         };
         let outcome = engine.generate(&req, &mut ctl).unwrap();
         assert_eq!(outcome.finish_reason, FinishReason::Cancelled);
@@ -2623,6 +2631,7 @@ mod tests {
             stop: vec![],
             seed: 0,
             sampling: tuckmill_backend::SamplingPolicy::default(),
+            ignore_eos: false,
         };
         let before = engine.stats().evictions;
         let outcome = engine.generate(&req, &mut ctl).unwrap();

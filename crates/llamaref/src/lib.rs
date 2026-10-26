@@ -1097,7 +1097,8 @@ impl InferenceBackend for LlamaRef {
                 first_generated_at = Some(produced_at);
             }
             last_generated_at = Some(produced_at);
-            if token == self.eos.max(0) as u32 {
+            let is_eos = token == self.eos.max(0) as u32;
+            if is_eos && !req.ignore_eos {
                 // The model-defined EOS marker is never visible.
                 let r = buffer.flush();
                 let _ = emit(&r.text, &mut release_index, ctl);
@@ -1105,7 +1106,13 @@ impl InferenceBackend for LlamaRef {
                     .with_generated(generated_ids)
                     .with_timing(production_timing(t0, first_generated_at, last_generated_at)));
             }
-            let piece = decoder.push_token(&self.piece_bytes(token)?, i);
+            // Benchmark workloads (`ignore_eos`): EOS stays invisible but
+            // does not end generation; it is fed back like any token.
+            let piece = if is_eos {
+                Vec::new()
+            } else {
+                decoder.push_token(&self.piece_bytes(token)?, i)
+            };
             let mut client_stop = false;
             let mut stop = false;
             for run in piece {
@@ -1438,6 +1445,7 @@ mod tests {
             stop: vec![],
             seed: 0,
             sampling: tuckmill_backend::SamplingPolicy::default(),
+            ignore_eos: false,
         };
         let outcome = backend.generate(&req, &mut ctl).unwrap();
         assert_eq!(outcome.finish_reason, FinishReason::Length);

@@ -63,6 +63,10 @@ pub struct BenchOptions {
     pub repetitions: u32,
     pub cache_state: CacheState,
     pub suite: String,
+    /// Generate every requested output token on every engine: the model's
+    /// EOS does not end generation (decode-throughput workloads for
+    /// instruct models that end early on the frozen prompts).
+    pub ignore_eos: bool,
 }
 
 impl Default for BenchOptions {
@@ -73,6 +77,7 @@ impl Default for BenchOptions {
             repetitions: 3,
             cache_state: CacheState::CacheUncontrolled,
             suite: STANDARD_SUITE.to_string(),
+            ignore_eos: false,
         }
     }
 }
@@ -171,6 +176,7 @@ pub fn run_standard_bench(
                 stop: Vec::new(),
                 seed: rep as u64,
                 sampling: tuckmill_backend::SamplingPolicy::default(),
+                ignore_eos: options.ignore_eos,
             },
         )?;
 
@@ -370,6 +376,7 @@ pub fn run_standard_bench(
         output_tokens: options.output_tokens,
         repetitions: options.repetitions,
         prompt_set: "frozen-synthetic-ids".into(),
+        ignore_eos: options.ignore_eos,
     };
     let synthetic = tuckmill_backend::is_synthetic_engine(&engine.engine);
     let mut caveats = vec![
@@ -399,6 +406,12 @@ pub fn run_standard_bench(
     }
     if performance_class == LatencyClass::BatchLocal {
         caveats.push("batch-local classification requires explicit slow-mode acceptance".into());
+    }
+    if options.ignore_eos {
+        caveats.push(
+            "ignore-EOS workload: the model's end-of-sequence token did not end generation, so every engine generated the full output count; decode throughput is comparable, output text past EOS is not meaningful"
+                .into(),
+        );
     }
 
     let run = BenchmarkRun {

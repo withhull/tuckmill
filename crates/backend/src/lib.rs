@@ -156,6 +156,12 @@ pub struct GenerateRequest {
     /// does not support must be rejected by the supervisor, never dropped
     /// silently here.
     pub sampling: SamplingPolicy,
+    /// Benchmark workloads only: the model's end-of-sequence token does not
+    /// end generation; it is generated and fed back like any other token
+    /// (its bytes stay invisible), so every engine produces exactly
+    /// `max_output_tokens` unless a stop sequence or cancellation ends it.
+    /// Never set from the API.
+    pub ignore_eos: bool,
 }
 
 /// Typed sampler settings carried by a generation request (ADR-005).
