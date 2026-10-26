@@ -17,7 +17,7 @@ use super::WeightSource;
 use crate::qwen35_gpu::{f32_bytes, GpuAllocPlan, Qwen35Gpu, STAGING_CHUNK_BYTES};
 
 /// Prompt tokens per batched prefill chunk (one command buffer each).
-pub const PREFILL_BATCH: usize = 16;
+pub const PREFILL_BATCH: usize = 32;
 
 /// Prefill chunks allowed in flight on the GPU at once. Each chunk is one
 /// command buffer of thousands of dispatches, and Metal backs its encoding
@@ -137,14 +137,14 @@ impl Matrix {
     }
 
     /// `Y[b] = W X[b]` for `b < batch`. F16 and batch 1 keep the GEMV's
-    /// per-row arithmetic; Q8_0 batches of 2..=16 use the SIMD-group
+    /// per-row arithmetic; Q8_0 batches of 2..=32 use the SIMD-group
     /// matrix units (tolerance-qualified, ADR-008 Addendum 16).
     fn gemm(&self, gpu: &Qwen35Gpu, x: &MetalBuffer, y: &MetalBuffer, batch: u32) -> Result<()> {
         let ctx = gpu.context();
         let (rows, cols) = (self.out_dim as u32, self.in_dim as u32);
         match self.type_id {
             1 => ctx.f16_gemm(&self.buf, x, y, rows, cols, batch, 0, 0),
-            8 if (2..=16).contains(&batch) => {
+            8 if (2..=32).contains(&batch) => {
                 ctx.q8_0_gemm_mma(&self.buf, x, y, rows, cols, batch, 0, 0)
             }
             8 => ctx.q8_0_gemm(&self.buf, x, y, rows, cols, batch, 0, 0),

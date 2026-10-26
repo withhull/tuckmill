@@ -183,3 +183,17 @@ never in a family-specific path.
 - Effect (pinned 0.8B, M3 8 GB, in-process): 512-token prefill 879 →
   646 ms; recurrence per decode token 1.25 → 0.47 ms; greedy decode
   ~73–77 tok/s in-process.
+
+## Engine note (2026-10-26): 32-token matrix-unit GEMM tile
+
+- `tm_q8_0_gemm_mma` now owns a 32-row x 32-token tile (4 accumulators per
+  SIMD group instead of 2), so each dequantized weight tile serves twice as
+  many tokens; prefill chunks are 32 tokens (`PREFILL_BATCH`). Per-token
+  summation order over K is unchanged.
+- Gate: GEMM tolerance test (adds batch 32 and a 27-token partial tile;
+  batch 33 refused); engine and chunk-core tests; 512-token batched vs
+  sequential logits 4.55e-4 / next step 3.98e-4, identical to the 16-token
+  tile, same top-1.
+- Effect (pinned 0.8B, M3 8 GB, in-process, alternating A/B x3 from two
+  prebuilt binaries): 512-token prefill 624-625 ms -> 516-518 ms (-17%),
+  locally-calibrated.

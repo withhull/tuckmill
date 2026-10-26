@@ -1403,13 +1403,13 @@ static int tm_gemm_dispatch_rows(tm_metal_ctx *ctx, id<MTLComputePipelineState> 
 int tm_metal_q8_0_gemm_mma(tm_metal_ctx *ctx, tm_metal_buffer *w, tm_metal_buffer *x,
                            tm_metal_buffer *y, uint32_t rows, uint32_t cols, uint32_t batch,
                            uint32_t x_off, uint32_t y_off, char *err, size_t err_cap) {
-    if (cols == 0 || (cols % 32u) != 0u || batch == 0 || batch > 16) {
+    if (cols == 0 || (cols % 32u) != 0u || batch == 0 || batch > 32) {
         return tm_fail(err, err_cap, TM_METAL_ERR_UNSUPPORTED,
-                       [NSString stringWithFormat:@"q8_0_gemm_mma: cols %u (positive multiple of 32), batch %u (1..=16)",
+                       [NSString stringWithFormat:@"q8_0_gemm_mma: cols %u (positive multiple of 32), batch %u (1..=32)",
                                                   cols, batch]);
     }
     size_t w_need = (size_t)rows * ((size_t)cols / 32u) * 34u;
-    /* 4 SIMD groups own a 32-row x 16-token tile (TM_MMA_* in kernels.metal). */
+    /* 4 SIMD groups own a 32-row x 32-token tile (TM_MMA_* in kernels.metal). */
     return tm_gemm_dispatch_rows(ctx, ctx->pso_q8gemm_mma, w, w_need, x, y, rows, cols, batch,
                                  x_off, y_off, 32, 128, err, err_cap, "q8_0_gemm_mma");
 }

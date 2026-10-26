@@ -2281,7 +2281,7 @@ impl MetalContext {
     /// Per-token accumulation matches the single-token GEMV, so batch=1 is
     /// bit-identical to it.
     #[allow(clippy::too_many_arguments)]
-    /// [`Self::q8_0_gemm`] for batch 1..=16 on the SIMD-group matrix units
+    /// [`Self::q8_0_gemm`] for batch 1..=32 on the SIMD-group matrix units
     /// (f32 tiles). Tolerance-qualified against the CPU reference; not
     /// bit-identical to the GEMV (different summation order).
     #[allow(clippy::too_many_arguments)]
