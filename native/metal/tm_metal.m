@@ -53,6 +53,7 @@ struct tm_metal_ctx {
     id<MTLComputePipelineState> pso_f16row;
     id<MTLComputePipelineState> pso_rmsnorm_f16w;
     id<MTLComputePipelineState> pso_q8gemm;
+    id<MTLComputePipelineState> pso_q8gemm_mma;
     id<MTLComputePipelineState> pso_f16gemm;
     id<MTLComputePipelineState> pso_rope_batch;
     id<MTLComputePipelineState> pso_kvstore_batch;
@@ -324,6 +325,7 @@ tm_metal_ctx *tm_metal_create(const char *msl_source, char *err, size_t err_cap)
         ctx->pso_f16row = tm_pipeline(ctx, @"tm_f16_row_f32", &error);
         ctx->pso_rmsnorm_f16w = tm_pipeline(ctx, @"tm_rmsnorm_f16w", &error);
         ctx->pso_q8gemm = tm_pipeline(ctx, @"tm_q8_0_gemm", &error);
+        ctx->pso_q8gemm_mma = tm_pipeline(ctx, @"tm_q8_0_gemm_mma", &error);
         ctx->pso_f16gemm = tm_pipeline(ctx, @"tm_f16_gemm", &error);
         ctx->pso_rope_batch = tm_pipeline(ctx, @"tm_rope_batch_f32", &error);
         ctx->pso_kvstore_batch = tm_pipeline(ctx, @"tm_kv_store_batch_f32", &error);
@@ -347,7 +349,7 @@ tm_metal_ctx *tm_metal_create(const char *msl_source, char *err, size_t err_cap)
             ctx->pso_q8row == nil || ctx->pso_rmsnorm == nil || ctx->pso_rope == nil ||
             ctx->pso_kvstore == nil || ctx->pso_attention == nil || ctx->pso_silu == nil ||
             ctx->pso_f16row == nil || ctx->pso_rmsnorm_f16w == nil ||
-            ctx->pso_q8gemm == nil || ctx->pso_f16gemm == nil ||
+            ctx->pso_q8gemm == nil || ctx->pso_q8gemm_mma == nil || ctx->pso_f16gemm == nil ||
             ctx->pso_rope_batch == nil || ctx->pso_kvstore_batch == nil ||
             ctx->pso_attention_batch == nil ||
             ctx->pso_q35_conv == nil || ctx->pso_q35_conv_shift == nil ||
@@ -407,6 +409,7 @@ void tm_metal_destroy(tm_metal_ctx *ctx) {
         [ctx->pso_rope_batch release];
         [ctx->pso_f16gemm release];
         [ctx->pso_q8gemm release];
+        [ctx->pso_q8gemm_mma release];
         [ctx->pso_rmsnorm_f16w release];
         [ctx->pso_f16row release];
         [ctx->pso_silu release];
@@ -1223,6 +1226,20 @@ static int tm_gemm_dispatch_rows(tm_metal_ctx *ctx, id<MTLComputePipelineState> 
             threadsPerThreadgroup:MTLSizeMake(threads, 1, 1)];
         return tm_frame_commit(ctx, &f, err, err_cap, what);
     }
+}
+
+int tm_metal_q8_0_gemm_mma(tm_metal_ctx *ctx, tm_metal_buffer *w, tm_metal_buffer *x,
+                           tm_metal_buffer *y, uint32_t rows, uint32_t cols, uint32_t batch,
+                           uint32_t x_off, uint32_t y_off, char *err, size_t err_cap) {
+    if (cols == 0 || (cols % 32u) != 0u || batch == 0 || batch > 16) {
+        return tm_fail(err, err_cap, TM_METAL_ERR_UNSUPPORTED,
+                       [NSString stringWithFormat:@"q8_0_gemm_mma: cols %u (positive multiple of 32), batch %u (1..=16)",
+                                                  cols, batch]);
+    }
+    size_t w_need = (size_t)rows * ((size_t)cols / 32u) * 34u;
+    /* 4 SIMD groups own a 32-row x 16-token tile (TM_MMA_* in kernels.metal). */
+    return tm_gemm_dispatch_rows(ctx, ctx->pso_q8gemm_mma, w, w_need, x, y, rows, cols, batch,
+                                 x_off, y_off, 32, 128, err, err_cap, "q8_0_gemm_mma");
 }
 
 int tm_metal_q8_0_gemm(tm_metal_ctx *ctx, tm_metal_buffer *w, tm_metal_buffer *x,

@@ -8,6 +8,7 @@
  * the CPU sequence, so comparisons are tolerance-registered, never exact.
  */
 #include <metal_stdlib>
+#include <metal_simdgroup_matrix>
 using namespace metal;
 
 /* y[i] = x[i] * factor; tail-safe for any n. */
@@ -478,6 +479,102 @@ kernel void tm_q8_0_gemm(device const uchar *w [[buffer(0)]],
         const float total = simd_sum(acc[b]);
         if (lane == 0u) {
             y[y_off + b * rows + row] = total;
+        }
+    }
+}
+
+/*
+ * Batched Q8_0 GEMM on the SIMD-group matrix units (Phase 1C prefill):
+ * Y[b, :] = W · X[b, :] for b < batch <= 16. One threadgroup (4 SIMD
+ * groups) owns a 32-row x 16-token output tile. Per 32-wide K block it
+ * dequantizes the W tile (d * q, exactly the CPU dequant) and loads the X
+ * tile into threadgroup memory as f32; each SIMD group then accumulates
+ * its 8 rows x 16 tokens with 8x8x8 f32 multiply-accumulates. Arithmetic
+ * is f32 throughout (oracle-f32 profile); summation order differs from the
+ * GEMV, so results are tolerance-registered, not bit-identical. Rows and
+ * tokens beyond the bounds are zero-padded in the tile and never stored.
+ */
+#define TM_MMA_ROWS 32u
+#define TM_MMA_TOK 16u
+
+kernel void tm_q8_0_gemm_mma(device const uchar *w [[buffer(0)]],
+                             device const float *x [[buffer(1)]],
+                             device float *y [[buffer(2)]],
+                             constant uint &rows [[buffer(3)]],
+                             constant uint &cols [[buffer(4)]],
+                             constant uint &batch [[buffer(5)]],
+                             constant uint &x_off [[buffer(6)]],
+                             constant uint &y_off [[buffer(7)]],
+                             uint tg [[threadgroup_position_in_grid]],
+                             uint tid [[thread_position_in_threadgroup]],
+                             uint sg [[simdgroup_index_in_threadgroup]]) {
+    threadgroup float wt[TM_MMA_ROWS * 32u];
+    threadgroup float xt[TM_MMA_TOK * 32u];
+    if (batch == 0u || batch > TM_MMA_TOK) {
+        return;
+    }
+    const uint blocks = cols / 32u;
+    const size_t row_bytes = (size_t)blocks * 34u;
+    const uint row0 = tg * TM_MMA_ROWS;
+
+    simdgroup_float8x8 c0 = simdgroup_float8x8(0.0f);
+    simdgroup_float8x8 c1 = simdgroup_float8x8(0.0f);
+
+    /* W tile: thread t dequantizes 8 quants of row t/4. */
+    const uint w_r = tid / 4u;
+    const uint w_k = (tid % 4u) * 8u;
+    /* X tile: thread t loads 4 values of token t/8. */
+    const uint x_b = tid / 8u;
+    const uint x_k = (tid % 8u) * 4u;
+
+    for (uint blk = 0; blk < blocks; ++blk) {
+        const uint row = row0 + w_r;
+        if (row < rows) {
+            const device uchar *block = w + (size_t)row * row_bytes + (size_t)blk * 34u;
+            const float d = (float)(*(const device half *)block);
+            const device char *qs = (const device char *)(block + 2u);
+            for (uint i = 0; i < 8u; ++i) {
+                wt[w_r * 32u + w_k + i] = d * (float)qs[w_k + i];
+            }
+        } else {
+            for (uint i = 0; i < 8u; ++i) {
+                wt[w_r * 32u + w_k + i] = 0.0f;
+            }
+        }
+        if (x_b < batch) {
+            const device float *xr = x + x_off + (size_t)x_b * cols + blk * 32u + x_k;
+            for (uint i = 0; i < 4u; ++i) {
+                xt[x_b * 32u + x_k + i] = xr[i];
+            }
+        } else {
+            for (uint i = 0; i < 4u; ++i) {
+                xt[x_b * 32u + x_k + i] = 0.0f;
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint kk = 0; kk < 32u; kk += 8u) {
+            simdgroup_float8x8 a;
+            simdgroup_float8x8 b0;
+            simdgroup_float8x8 b1;
+            simdgroup_load(a, wt + sg * 8u * 32u + kk, 32);
+            simdgroup_load(b0, xt + 0u * 32u + kk, 32, ulong2(0, 0), true);
+            simdgroup_load(b1, xt + 8u * 32u + kk, 32, ulong2(0, 0), true);
+            simdgroup_multiply_accumulate(c0, a, b0, c0);
+            simdgroup_multiply_accumulate(c1, a, b1, c1);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    /* Stage the [32 rows x 16 tokens] tile, then store in bounds only. */
+    threadgroup float *ot = wt;
+    simdgroup_store(c0, ot + sg * 8u * TM_MMA_TOK + 0u, TM_MMA_TOK);
+    simdgroup_store(c1, ot + sg * 8u * TM_MMA_TOK + 8u, TM_MMA_TOK);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint idx = tid; idx < TM_MMA_ROWS * TM_MMA_TOK; idx += 128u) {
+        const uint r = idx / TM_MMA_TOK;
+        const uint b = idx % TM_MMA_TOK;
+        if (row0 + r < rows && b < batch) {
+            y[y_off + b * rows + row0 + r] = ot[r * TM_MMA_TOK + b];
         }
     }
 }

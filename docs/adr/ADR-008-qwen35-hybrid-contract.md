@@ -430,3 +430,28 @@ never accepted by any real artifact.
 - **Tried and removed:** a multi-row variant of the batched GEMM
   (bit-identical, no measurable gain). The GEMM is compute-bound, not
   bound by activation loads; the next step is a `simdgroup_matrix` kernel.
+
+## Addendum 16 (prefill GEMM on the SIMD-group matrix units)
+
+- `tm_q8_0_gemm_mma`: a new ABI entry for Q8_0 batches of 1..=16. One
+  threadgroup (4 SIMD groups) owns a 32-row × 16-token tile; W is
+  dequantized (`d * q`, exactly the CPU dequant) and X is staged in
+  threadgroup memory as **f32**; 8×8×8 f32 multiply-accumulates. The
+  precision profile stays oracle-f32; only the summation order differs.
+- Scope: used only by Qwen3.5 prefill for Q8_0 batches of 2..=16. The
+  dense Qwen3 path keeps `tm_q8_0_gemm` and its recorded claim that
+  logits are bit-identical across batch sizes 1–8. F16 matrices and
+  batch 1 keep the GEMV-identical kernels.
+- Contract change: Qwen3.5 batched prefill is now **tolerance-qualified**
+  against sequential decode, no longer bit-identical. Registered: the
+  existing GPU-logits bound 2e-3. Observed on the pinned 0.8B at 512
+  tokens: last-token logits 3.2e-4, next decode step 3.6e-4, at logit
+  scale 11.1, with identical top-1. The fixture (F16) stays bit-identical.
+  Greedy output through the worker still equals the CPU oracle.
+- Evidence: kernel vs CPU reference within 1e-4 × scale (row tails,
+  partial token tiles, offsets, real shapes). Batch-16 time per shape:
+  3584×1024 523 → 191 µs, 6144×1024 581 → 134 µs (1.5 TFLOP/s),
+  1024×3584 366 → 124 µs. 512-token prefill 2.60 → 1.70–1.75 s.
+- Next: chunk-wide DeltaNet, attention and small ops. Per the
+  unified-engine decision (ADR-011), they are built as shared engine
+  blocks, not as more Qwen3.5-only code.

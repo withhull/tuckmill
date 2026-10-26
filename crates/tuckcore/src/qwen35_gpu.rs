@@ -1264,13 +1264,17 @@ impl DeviceTensor {
     }
 
     /// Device `Y[b] = W X[b]` for `b < batch` rows of `[batch, in_dim]`
-    /// input. Per-row arithmetic equals [`Self::gemv`] exactly (the batched
-    /// kernels share the single-token kernels' per-row order).
+    /// input. F16 (and batch 1) keep the GEMV's per-row arithmetic exactly;
+    /// Q8_0 batches of 2..=16 run on the SIMD-group matrix units (f32,
+    /// different summation order: tolerance-qualified, ADR-008 Add. 16).
     fn gemm(&self, gpu: &Qwen35Gpu, x: &MetalBuffer, y: &MetalBuffer, batch: u32) -> Result<()> {
         let ctx = gpu.context();
         let (rows, cols) = (self.out_dim as u32, self.in_dim as u32);
         match self.type_id {
             1 => ctx.f16_gemm(&self.buf, x, y, rows, cols, batch, 0, 0),
+            8 if (2..=16).contains(&batch) => {
+                ctx.q8_0_gemm_mma(&self.buf, x, y, rows, cols, batch, 0, 0)
+            }
             8 => ctx.q8_0_gemm(&self.buf, x, y, rows, cols, batch, 0, 0),
             other => Err(TuckmillError::new(
                 ErrorCode::UnsupportedQuantization,
@@ -2594,8 +2598,45 @@ mod layer_tests {
             512e3 / seq_ms,
             512e3 / batched_ms
         );
-        assert_eq!(bits(&batched), bits(&seq), "last-token logits");
-        assert_eq!(bits(&batched_next), bits(&seq_next), "next decode step");
+        let drift = |a: &[f32], b: &[f32]| {
+            a.iter()
+                .zip(b)
+                .map(|(x, y)| (x - y).abs())
+                .fold(0f32, f32::max)
+        };
+        let top1 = |v: &[f32]| {
+            v.iter()
+                .enumerate()
+                .fold((0usize, f32::NEG_INFINITY), |m, (i, x)| {
+                    if *x > m.1 {
+                        (i, *x)
+                    } else {
+                        m
+                    }
+                })
+                .0
+        };
+        let scale = seq.iter().fold(0f32, |m, v| m.max(v.abs()));
+        eprintln!(
+            "batched vs sequential: last-token logits max|diff| {:.3e}, next step {:.3e} (logit scale {scale:.2}); top-1 {} vs {}",
+            drift(&batched, &seq),
+            drift(&batched_next, &seq_next),
+            top1(&batched),
+            top1(&seq)
+        );
+        let _ = bits;
+        // Registered: the GPU-vs-oracle logits bound (2e-3, Q35-2C);
+        // observed 3.2e-4 / 3.6e-4 at logit scale 11.1 (ADR-008 Add. 16).
+        assert!(
+            drift(&batched, &seq) <= 2e-3,
+            "last-token logits within 2e-3"
+        );
+        assert!(
+            drift(&batched_next, &seq_next) <= 2e-3,
+            "next step within 2e-3"
+        );
+        assert_eq!(top1(&batched), top1(&seq), "last-token top-1");
+        assert_eq!(top1(&batched_next), top1(&seq_next), "next-step top-1");
 
         if std::env::var("TUCKMILL_PROFILE").ok().as_deref() == Some("1") {
             let ctx = model.context();

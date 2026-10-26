@@ -260,6 +260,19 @@ mod imp {
             err: *mut c_char,
             err_cap: usize,
         ) -> c_int;
+        pub fn tm_metal_q8_0_gemm_mma(
+            ctx: *mut TmMetalCtx,
+            w: *mut TmMetalBuffer,
+            x: *mut TmMetalBuffer,
+            y: *mut TmMetalBuffer,
+            rows: u32,
+            cols: u32,
+            batch: u32,
+            x_off: u32,
+            y_off: u32,
+            err: *mut c_char,
+            err_cap: usize,
+        ) -> c_int;
         pub fn tm_metal_f16_gemm(
             ctx: *mut TmMetalCtx,
             w: *mut TmMetalBuffer,
@@ -1719,6 +1732,48 @@ impl MetalContext {
     /// Batched packed Q8_0 GEMM: Y[b, :] = W . X[b, :] for b < batch.
     /// Per-token accumulation matches the single-token GEMV, so batch=1 is
     /// bit-identical to it.
+    #[allow(clippy::too_many_arguments)]
+    /// [`Self::q8_0_gemm`] for batch 1..=16 on the SIMD-group matrix units
+    /// (f32 tiles). Tolerance-qualified against the CPU reference; not
+    /// bit-identical to the GEMV (different summation order).
+    #[allow(clippy::too_many_arguments)]
+    pub fn q8_0_gemm_mma(
+        &self,
+        w: &MetalBuffer,
+        x: &MetalBuffer,
+        y: &MetalBuffer,
+        rows: u32,
+        cols: u32,
+        batch: u32,
+        x_off: u32,
+        y_off: u32,
+    ) -> Result<()> {
+        for (buffer, name) in [(w, "weights"), (x, "x"), (y, "y")] {
+            self.check_owned(buffer, name)?;
+        }
+        let (wc, xc, yc) = (w.raw, x.raw, y.raw);
+        self.operate("q8_0_gemm_mma", move |ctx| {
+            let mut err = [0 as c_char; ERR_CAP];
+            // SAFETY: raw handles were validated against this context.
+            let code = unsafe {
+                imp::tm_metal_q8_0_gemm_mma(
+                    ctx,
+                    wc,
+                    xc,
+                    yc,
+                    rows,
+                    cols,
+                    batch,
+                    x_off,
+                    y_off,
+                    err.as_mut_ptr(),
+                    ERR_CAP,
+                )
+            };
+            (code, err)
+        })
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn q8_0_gemm(
         &self,

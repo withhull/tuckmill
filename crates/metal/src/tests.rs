@@ -1558,13 +1558,19 @@ fn q8_0_gemm_batch_timing_when_requested() {
         let wb = ctx.buffer(w.len(), true).unwrap();
         wb.upload(0, &w).unwrap();
         for batch in [1usize, 4, 8, 16] {
+            let mma = std::env::var("TUCKMILL_GEMM_MMA").is_ok() && batch > 1;
             let x = boundary_input(cols * batch, 5);
             let xb = ctx.buffer(cols * batch * 4, true).unwrap();
             xb.upload(0, &f32_bytes(&x)).unwrap();
             let yb = ctx.buffer(rows * batch * 4, true).unwrap();
             let run = || {
-                ctx.q8_0_gemm(&wb, &xb, &yb, rows as u32, cols as u32, batch as u32, 0, 0)
-                    .unwrap()
+                if mma {
+                    ctx.q8_0_gemm_mma(&wb, &xb, &yb, rows as u32, cols as u32, batch as u32, 0, 0)
+                        .unwrap()
+                } else {
+                    ctx.q8_0_gemm(&wb, &xb, &yb, rows as u32, cols as u32, batch as u32, 0, 0)
+                        .unwrap()
+                }
             };
             run();
             ctx.fence().unwrap();
@@ -1582,4 +1588,80 @@ fn q8_0_gemm_batch_timing_when_requested() {
             );
         }
     }
+}
+
+#[test]
+fn q8_0_gemm_mma_matches_the_cpu_reference_within_tolerance() {
+    let Some(ctx) = metal_context() else {
+        return;
+    };
+    // Shapes cover row tails (rows not a multiple of the 32-row tile),
+    // partial token tiles, offsets, and the real 0.8B projection shapes.
+    for (rows, cols, batch) in [
+        (16usize, 1024usize, 16usize),
+        (40, 64, 3),
+        (3584, 1024, 16),
+        (1024, 3584, 7),
+        (6144, 1024, 1),
+    ] {
+        let w = boundary_weights(rows, cols, 11);
+        let x = boundary_input(cols * batch, 13);
+        let wb = ctx.buffer(w.len(), true).unwrap();
+        wb.upload(0, &w).unwrap();
+        let x_off = 32usize;
+        let xb = ctx.buffer((x_off + cols * batch) * 4, true).unwrap();
+        let mut xs = vec![0f32; x_off];
+        xs.extend_from_slice(&x);
+        xb.upload(0, &f32_bytes(&xs)).unwrap();
+        let y_off = 8usize;
+        let yb = ctx.buffer((y_off + rows * batch) * 4, true).unwrap();
+        ctx.q8_0_gemm_mma(
+            &wb,
+            &xb,
+            &yb,
+            rows as u32,
+            cols as u32,
+            batch as u32,
+            x_off as u32,
+            y_off as u32,
+        )
+        .unwrap();
+        ctx.fence().unwrap();
+        let mut out = vec![0u8; (y_off + rows * batch) * 4];
+        yb.download(0, &mut out).unwrap();
+        let got: Vec<f32> = out
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect();
+        assert!(
+            got[..y_off].iter().all(|v| *v == 0.0),
+            "nothing before y_off"
+        );
+        for b in 0..batch {
+            let cpu = cpu_q8_0_gemv(&w, &x[b * cols..(b + 1) * cols], rows, cols);
+            let scale = cpu.iter().fold(0f32, |m, v| m.max(v.abs())).max(1.0);
+            for r in 0..rows {
+                let g = got[y_off + b * rows + r];
+                assert!(
+                    (g - cpu[r]).abs() <= 1e-4 * scale,
+                    "({rows},{cols},{batch}) b {b} r {r}: {g} vs {}",
+                    cpu[r]
+                );
+            }
+        }
+    }
+    assert!(
+        ctx.q8_0_gemm_mma(
+            &ctx.buffer(64, true).unwrap(),
+            &ctx.buffer(64, true).unwrap(),
+            &ctx.buffer(64, true).unwrap(),
+            1,
+            32,
+            17,
+            0,
+            0
+        )
+        .is_err(),
+        "batch above 16 refused"
+    );
 }
