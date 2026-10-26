@@ -44,8 +44,10 @@ prompt tokens, 512 tokens in and 256 out, ABBA rounds. Two idle runs at
 | Time to first token | 0.272 s (both runs) | 0.269-0.300 s | 94-106% of llama.cpp per pair |
 | Decode | 84.2-84.3 tok/s | 66.8-84.7 tok/s | 0.99-1.26× per pair |
 
+- **Qwen3.5-2B Q8_0** (one run, 3 GiB budget): time to first token
+  0.625 s vs 0.587 s (94%), decode 39.3 vs 40.5 tok/s (97%).
 - **Phase 1 bar** (≥ 90% of llama.cpp for decode and prefill): met in both
-  runs, in every pair, on this model and Mac. Prefill is at parity, not a
+  0.8B runs, in every pair, and in the first 2B run, on this Mac. Prefill is at parity, not a
   lead, because llama.cpp's own spread covers the difference.
 - **Decode** is at parity or ahead. llama.cpp's own decode in this harness
   varies between runs (about 66-85 tok/s), so this is not stated as a
