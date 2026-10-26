@@ -411,6 +411,10 @@ pub struct LlamaRef {
     ctx_tokens: u32,
     kv_precision: String,
     threads: u32,
+    /// GPU offload layers in effect for the loaded model (0 = CPU only);
+    /// reported in the resolved identity so a Metal baseline is never
+    /// recorded as a CPU run.
+    gpu_layers: i32,
     note: String,
 }
 
@@ -452,6 +456,7 @@ impl LlamaRef {
             ctx_tokens: 0,
             kv_precision: "f16".to_string(),
             threads: 0,
+            gpu_layers: 0,
             note: String::new(),
         }
     }
@@ -829,14 +834,18 @@ impl InferenceBackend for LlamaRef {
             ternary: false,
             requires_gpu: false,
             notes: vec![
-                format!("pinned llama.cpp {LLAMA_REVISION} via tm shim v{SHIM_VERSION}; CPU execution (n_gpu_layers=0)"),
+                format!("pinned llama.cpp {LLAMA_REVISION} via tm shim v{SHIM_VERSION}; CPU execution by default (n_gpu_layers=0); --gpu-layers enables Metal as a performance baseline only"),
                 "compatibility backend and numerical oracle; wrapper uncertified until comparisons are recorded".to_string(),
             ],
         }
     }
 
     fn identity(&self) -> EngineIdentity {
-        identity()
+        let mut id = identity();
+        if self.gpu_layers > 0 {
+            id.kernels = vec![format!("llama.cpp:ngl={}:metal", self.gpu_layers)];
+        }
+        id
     }
 
     fn load(
@@ -949,6 +958,7 @@ impl InferenceBackend for LlamaRef {
         } else {
             "unreported".to_string()
         };
+        self.gpu_layers = gpu_layers;
         self.threads = actual_threads.max(1) as u32;
         self.handle = handle;
         self.vocab = vocab;
@@ -1195,6 +1205,7 @@ impl InferenceBackend for LlamaRef {
             unsafe { (self.shim.free)(self.handle) };
             self.handle = std::ptr::null_mut();
         }
+        self.gpu_layers = 0;
     }
 }
 
@@ -1495,5 +1506,26 @@ mod tests {
         let id = identity();
         assert!(!id.certified);
         assert_eq!(id.engine, "llama.cpp");
+    }
+
+    #[test]
+    fn resolved_identity_names_gpu_offload() {
+        // Regression: Metal baselines (gpu_layers > 0) were recorded with
+        // the CPU identity.
+        let mut backend = LlamaRef::new();
+        assert_eq!(
+            InferenceBackend::identity(&backend).kernels,
+            vec!["llama.cpp-cpu".to_string()]
+        );
+        backend.gpu_layers = 99;
+        assert_eq!(
+            InferenceBackend::identity(&backend).kernels,
+            vec!["llama.cpp:ngl=99:metal".to_string()]
+        );
+        backend.shutdown();
+        assert_eq!(
+            InferenceBackend::identity(&backend).kernels,
+            vec!["llama.cpp-cpu".to_string()]
+        );
     }
 }

@@ -8,7 +8,7 @@ in `docs/claims.md` only after the controlled protocol in
 
 | Tier (unified memory) | Directory | State |
 | --- | --- | --- |
-| 8 GB | `8gb/` | recorded on MacBook Air M3 8 GB (see dated runs) |
+| 8 GB | `8gb/` | recorded: Qwen3.5-0.8B Q8_0 on MacBook Air M3 8 GB (`20261026T092923Z-…`, with `notes.md`) |
 | 16–24 GB | `16-24gb/` | ⛔ pending: no machine available; run the script unchanged |
 | 36–48 GB | `36-48gb/` | ⛔ pending: no machine available; run the script unchanged |
 | 64 GB+ | `64gb-plus/` | ⛔ pending: no machine available; run the script unchanged |
