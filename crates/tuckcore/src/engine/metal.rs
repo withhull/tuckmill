@@ -10,14 +10,17 @@
 //! per-operator profiling.
 
 use tuckmill_manifest::error::{ErrorCode, Result, TuckmillError};
-use tuckmill_metal::{MetalBuffer, MetalContext, ARGMAX_NONE, ARGMAX_PARTIAL_BYTES};
+use tuckmill_metal::{
+    MetalBuffer, MetalContext, ARGMAX_NONE, ARGMAX_PARTIAL_BYTES, GEMM_MAX_BATCH,
+    GEMM_MMA_MAX_BATCH,
+};
 
 use super::graph::{AttentionSpec, FfnSpec, GatedDeltaNetSpec, MixerSpec, ModelGraph, Tensor};
 use super::WeightSource;
 use crate::qwen35_gpu::{f32_bytes, GpuAllocPlan, Qwen35Gpu, STAGING_CHUNK_BYTES};
 
 /// Prompt tokens per batched prefill chunk (one command buffer each).
-pub const PREFILL_BATCH: usize = 32;
+pub const PREFILL_BATCH: usize = 128;
 
 /// Prefill chunks allowed in flight on the GPU at once. Each chunk is one
 /// command buffer of thousands of dispatches, and Metal backs its encoding
@@ -137,19 +140,27 @@ impl Matrix {
     }
 
     /// `Y[b] = W X[b]` for `b < batch`. F16 and batch 1 keep the GEMV's
-    /// per-row arithmetic; Q8_0 batches of 2..=32 use the SIMD-group
-    /// matrix units (tolerance-qualified, ADR-008 Addendum 16).
+    /// per-row arithmetic (in slices of at most `GEMM_MAX_BATCH` tokens);
+    /// Q8_0 batches of 2 or more use the SIMD-group matrix units in one
+    /// launch (tolerance-qualified, ADR-008 Addendum 16).
     fn gemm(&self, gpu: &Qwen35Gpu, x: &MetalBuffer, y: &MetalBuffer, batch: u32) -> Result<()> {
         let ctx = gpu.context();
         let (rows, cols) = (self.out_dim as u32, self.in_dim as u32);
-        match self.type_id {
-            1 => ctx.f16_gemm(&self.buf, x, y, rows, cols, batch, 0, 0),
-            8 if (2..=32).contains(&batch) => {
-                ctx.q8_0_gemm_mma(&self.buf, x, y, rows, cols, batch, 0, 0)
-            }
-            8 => ctx.q8_0_gemm(&self.buf, x, y, rows, cols, batch, 0, 0),
-            other => Err(unsupported_type(other)),
+        if self.type_id == 8 && (2..=GEMM_MMA_MAX_BATCH).contains(&batch) {
+            return ctx.q8_0_gemm_mma(&self.buf, x, y, rows, cols, batch, 0, 0);
         }
+        let mut t0 = 0u32;
+        while t0 < batch {
+            let n = (batch - t0).min(GEMM_MAX_BATCH);
+            let (x_off, y_off) = (t0 * cols, t0 * rows);
+            match self.type_id {
+                1 => ctx.f16_gemm(&self.buf, x, y, rows, cols, n, x_off, y_off)?,
+                8 => ctx.q8_0_gemm(&self.buf, x, y, rows, cols, n, x_off, y_off)?,
+                other => return Err(unsupported_type(other)),
+            }
+            t0 += n;
+        }
+        Ok(())
     }
 
     /// Embedding lookup of a token id chosen on the device (`ids[slot]`).
@@ -1831,7 +1842,8 @@ mod oracle_tests {
         let path = dir.path().join("q35.gguf");
         std::fs::write(&path, &bytes).unwrap();
         let cpu = Qwen35Model::open(&path, 64, KvPrecision::F16).unwrap();
-        let capacity = 48usize;
+        // Room for the longest prompt below (two chunks) plus its next step.
+        let capacity = PREFILL_BATCH + 8;
         let plan = alloc_plan(&qwen35_graph(&cpu), &cpu, capacity).unwrap();
         let model = EngineModel::load(
             Qwen35Gpu::open().unwrap(),
@@ -1949,9 +1961,10 @@ mod oracle_tests {
         model.forward_token(9707, &mut batched_next).unwrap();
 
         eprintln!(
-            "512-token prefill: sequential {seq_ms:.0} ms ({:.0} tok/s), batched x{PREFILL_BATCH} {batched_ms:.0} ms ({:.0} tok/s)",
+            "512-token prefill: sequential {seq_ms:.0} ms ({:.0} tok/s), batched x{PREFILL_BATCH} {batched_ms:.0} ms ({:.0} tok/s); scratch {:.1} MiB at capacity {capacity}",
             512e3 / seq_ms,
-            512e3 / batched_ms
+            512e3 / batched_ms,
+            plan.scratch as f64 / 1048576.0
         );
         let drift = |a: &[f32], b: &[f32]| {
             a.iter()

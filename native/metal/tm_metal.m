@@ -1340,7 +1340,8 @@ static int tm_gemm_dispatch_rows(tm_metal_ctx *ctx, id<MTLComputePipelineState> 
                                  tm_metal_buffer *w, size_t w_need, tm_metal_buffer *x,
                                  tm_metal_buffer *y, uint32_t rows, uint32_t cols,
                                  uint32_t batch, uint32_t x_off, uint32_t y_off,
-                                 NSUInteger rows_per_tg, NSUInteger threads, char *err,
+                                 NSUInteger rows_per_tg, NSUInteger threads,
+                                 uint32_t max_batch, NSUInteger tokens_per_tg, char *err,
                                  size_t err_cap, const char *what);
 
 static int tm_gemm_dispatch(tm_metal_ctx *ctx, id<MTLComputePipelineState> pso,
@@ -1349,23 +1350,26 @@ static int tm_gemm_dispatch(tm_metal_ctx *ctx, id<MTLComputePipelineState> pso,
                             uint32_t x_off, uint32_t y_off, char *err, size_t err_cap,
                             const char *what) {
     return tm_gemm_dispatch_rows(ctx, pso, w, w_need, x, y, rows, cols, batch, x_off, y_off, 1,
-                                 32, err, err_cap, what);
+                                 32, 32, 0, err, err_cap, what);
 }
 
-/* One threadgroup of `threads` lanes per `rows_per_tg` output rows. */
+/* One threadgroup of `threads` lanes per `rows_per_tg` output rows and,
+ * when `tokens_per_tg` is nonzero, per `tokens_per_tg` tokens (a 1-D grid
+ * of row tiles x token tiles; the kernel decodes the pair). */
 static int tm_gemm_dispatch_rows(tm_metal_ctx *ctx, id<MTLComputePipelineState> pso,
                                  tm_metal_buffer *w, size_t w_need, tm_metal_buffer *x,
                                  tm_metal_buffer *y, uint32_t rows, uint32_t cols,
                                  uint32_t batch, uint32_t x_off, uint32_t y_off,
-                                 NSUInteger rows_per_tg, NSUInteger threads, char *err,
+                                 NSUInteger rows_per_tg, NSUInteger threads,
+                                 uint32_t max_batch, NSUInteger tokens_per_tg, char *err,
                                  size_t err_cap, const char *what) {
     if (tm_check_ctx(ctx, err, err_cap, what) != TM_METAL_OK) {
         return TM_METAL_ERR_UNSUPPORTED;
     }
-    if (rows == 0 || cols == 0 || batch == 0 || batch > 32) {
+    if (rows == 0 || cols == 0 || batch == 0 || batch > max_batch) {
         return tm_fail(err, err_cap, TM_METAL_ERR_UNSUPPORTED,
-                       [NSString stringWithFormat:@"%s: rows %u, cols %u, batch %u (1..=32)",
-                                                  what, rows, cols, batch]);
+                       [NSString stringWithFormat:@"%s: rows %u, cols %u, batch %u (1..=%u)",
+                                                  what, rows, cols, batch, max_batch]);
     }
     size_t x_need = ((size_t)x_off + (size_t)batch * (size_t)cols) * 4u;
     size_t y_need = ((size_t)y_off + (size_t)batch * (size_t)rows) * 4u;
@@ -1394,7 +1398,9 @@ static int tm_gemm_dispatch_rows(tm_metal_ctx *ctx, id<MTLComputePipelineState> 
         [enc setBytes:&x_off length:sizeof(x_off) atIndex:6];
         [enc setBytes:&y_off length:sizeof(y_off) atIndex:7];
         NSUInteger groups = ((NSUInteger)rows + rows_per_tg - 1) / rows_per_tg;
-        [enc dispatchThreadgroups:MTLSizeMake(groups, 1, 1)
+        NSUInteger token_groups =
+            tokens_per_tg == 0 ? 1 : ((NSUInteger)batch + tokens_per_tg - 1) / tokens_per_tg;
+        [enc dispatchThreadgroups:MTLSizeMake(groups * token_groups, 1, 1)
             threadsPerThreadgroup:MTLSizeMake(threads, 1, 1)];
         return tm_frame_commit(ctx, &f, err, err_cap, what);
     }
@@ -1403,15 +1409,16 @@ static int tm_gemm_dispatch_rows(tm_metal_ctx *ctx, id<MTLComputePipelineState> 
 int tm_metal_q8_0_gemm_mma(tm_metal_ctx *ctx, tm_metal_buffer *w, tm_metal_buffer *x,
                            tm_metal_buffer *y, uint32_t rows, uint32_t cols, uint32_t batch,
                            uint32_t x_off, uint32_t y_off, char *err, size_t err_cap) {
-    if (cols == 0 || (cols % 32u) != 0u || batch == 0 || batch > 32) {
+    if (cols == 0 || (cols % 32u) != 0u || batch == 0 || batch > TM_METAL_GEMM_MMA_MAX_BATCH) {
         return tm_fail(err, err_cap, TM_METAL_ERR_UNSUPPORTED,
-                       [NSString stringWithFormat:@"q8_0_gemm_mma: cols %u (positive multiple of 32), batch %u (1..=32)",
-                                                  cols, batch]);
+                       [NSString stringWithFormat:@"q8_0_gemm_mma: cols %u (positive multiple of 32), batch %u (1..=%u)",
+                                                  cols, batch, TM_METAL_GEMM_MMA_MAX_BATCH]);
     }
     size_t w_need = (size_t)rows * ((size_t)cols / 32u) * 34u;
     /* 4 SIMD groups own a 32-row x 32-token tile (TM_MMA_* in kernels.metal). */
     return tm_gemm_dispatch_rows(ctx, ctx->pso_q8gemm_mma, w, w_need, x, y, rows, cols, batch,
-                                 x_off, y_off, 32, 128, err, err_cap, "q8_0_gemm_mma");
+                                 x_off, y_off, 32, 128, TM_METAL_GEMM_MMA_MAX_BATCH, 32, err,
+                                 err_cap, "q8_0_gemm_mma");
 }
 
 int tm_metal_q8_0_gemm(tm_metal_ctx *ctx, tm_metal_buffer *w, tm_metal_buffer *x,

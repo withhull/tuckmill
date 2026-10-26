@@ -621,8 +621,10 @@ kernel void tm_q8_0_gemm(device const uchar *w [[buffer(0)]],
 
 /*
  * Batched Q8_0 GEMM on the SIMD-group matrix units (Phase 1C prefill):
- * Y[b, :] = W · X[b, :] for b < batch <= 32. One threadgroup (4 SIMD
- * groups) owns a 32-row x 32-token output tile. Per 32-wide K block it
+ * Y[b, :] = W · X[b, :] for b < batch. One threadgroup (4 SIMD groups)
+ * owns a 32-row x 32-token output tile. Threadgroup tg covers row tile
+ * tg / token_tiles and token tile tg % token_tiles, so neighbors share a
+ * weight tile and one launch covers a whole prefill chunk. Per 32-wide K block it
  * dequantizes the W tile (d * q, exactly the CPU dequant) and loads the X
  * tile into threadgroup memory as f32; each SIMD group then accumulates
  * its 8 rows x 32 tokens with 8x8x8 f32 multiply-accumulates. Arithmetic
@@ -646,12 +648,15 @@ kernel void tm_q8_0_gemm_mma(device const uchar *w [[buffer(0)]],
                              uint sg [[simdgroup_index_in_threadgroup]]) {
     threadgroup float wt[TM_MMA_ROWS * 32u];
     threadgroup float xt[TM_MMA_TOK * 32u];
-    if (batch == 0u || batch > TM_MMA_TOK) {
+    const uint token_tiles = (batch + TM_MMA_TOK - 1u) / TM_MMA_TOK;
+    const uint tok0 = (tg % token_tiles) * TM_MMA_TOK;
+    if (tok0 >= batch) {
         return;
     }
+    const uint tile_batch = min(batch - tok0, TM_MMA_TOK);
     const uint blocks = cols / 32u;
     const size_t row_bytes = (size_t)blocks * 34u;
-    const uint row0 = tg * TM_MMA_ROWS;
+    const uint row0 = (tg / token_tiles) * TM_MMA_ROWS;
 
     simdgroup_float8x8 c0 = simdgroup_float8x8(0.0f);
     simdgroup_float8x8 c1 = simdgroup_float8x8(0.0f);
@@ -679,8 +684,8 @@ kernel void tm_q8_0_gemm_mma(device const uchar *w [[buffer(0)]],
                 wt[w_r * 32u + w_k + i] = 0.0f;
             }
         }
-        if (x_b < batch) {
-            const device float *xr = x + x_off + (size_t)x_b * cols + blk * 32u + x_k;
+        if (x_b < tile_batch) {
+            const device float *xr = x + x_off + (size_t)(tok0 + x_b) * cols + blk * 32u + x_k;
             for (uint i = 0; i < 8u; ++i) {
                 xt[x_b * 32u + x_k + i] = xr[i];
             }
@@ -719,8 +724,8 @@ kernel void tm_q8_0_gemm_mma(device const uchar *w [[buffer(0)]],
     for (uint idx = tid; idx < TM_MMA_ROWS * TM_MMA_TOK; idx += 128u) {
         const uint r = idx / TM_MMA_TOK;
         const uint b = idx % TM_MMA_TOK;
-        if (row0 + r < rows && b < batch) {
-            y[y_off + b * rows + row0 + r] = ot[r * TM_MMA_TOK + b];
+        if (row0 + r < rows && b < tile_batch) {
+            y[y_off + (size_t)(tok0 + b) * rows + row0 + r] = ot[r * TM_MMA_TOK + b];
         }
     }
 }

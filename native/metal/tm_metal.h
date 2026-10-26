@@ -186,8 +186,12 @@ int tm_metal_rmsnorm_f16w(tm_metal_ctx *ctx, tm_metal_buffer *x, tm_metal_buffer
 int tm_metal_q8_0_gemm(tm_metal_ctx *ctx, tm_metal_buffer *w, tm_metal_buffer *x,
                        tm_metal_buffer *y, uint32_t rows, uint32_t cols, uint32_t batch,
                        uint32_t x_off, uint32_t y_off, char *err, size_t err_cap);
-/* Same contract as tm_metal_q8_0_gemm for batch 1..=32, on the SIMD-group
- * matrix units (f32 tiles). Summation order differs from the GEMV, so it
+/* Largest batch tm_metal_q8_0_gemm_mma accepts (one launch, a 2-D grid of
+ * 32-row x 32-token tiles). */
+#define TM_METAL_GEMM_MMA_MAX_BATCH 512u
+
+/* Same contract as tm_metal_q8_0_gemm for batch 1..=TM_METAL_GEMM_MMA_MAX_BATCH,
+ * on the SIMD-group matrix units (f32 tiles). Summation order differs from the GEMV, so it
  * is tolerance-qualified, not bit-identical; dense paths that claim
  * batch-size bit-identity keep tm_metal_q8_0_gemm. */
 int tm_metal_q8_0_gemm_mma(tm_metal_ctx *ctx, tm_metal_buffer *w, tm_metal_buffer *x,

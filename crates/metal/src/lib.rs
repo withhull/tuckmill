@@ -22,6 +22,13 @@ use tuckmill_manifest::error::{ErrorCode, Result, TuckmillError};
 /// The MSL source shipped with this revision, compiled at context creation.
 pub const KERNELS_MSL: &str = include_str!("../../../native/metal/kernels.metal");
 
+/// Largest batch [`MetalContext::q8_0_gemm_mma`] accepts
+/// (`TM_METAL_GEMM_MMA_MAX_BATCH`); the other GEMMs accept up to
+/// [`GEMM_MAX_BATCH`].
+pub const GEMM_MMA_MAX_BATCH: u32 = 512;
+/// Largest batch of the per-row GEMMs (`q8_0_gemm`, `f16_gemm`).
+pub const GEMM_MAX_BATCH: u32 = 32;
+
 const ERR_CAP: usize = 512;
 
 #[cfg(target_os = "macos")]
@@ -2277,13 +2284,10 @@ impl MetalContext {
         })
     }
 
-    /// Batched packed Q8_0 GEMM: Y[b, :] = W . X[b, :] for b < batch.
-    /// Per-token accumulation matches the single-token GEMV, so batch=1 is
-    /// bit-identical to it.
-    #[allow(clippy::too_many_arguments)]
-    /// [`Self::q8_0_gemm`] for batch 1..=32 on the SIMD-group matrix units
-    /// (f32 tiles). Tolerance-qualified against the CPU reference; not
-    /// bit-identical to the GEMV (different summation order).
+    /// [`Self::q8_0_gemm`] for batch 1..=[`GEMM_MMA_MAX_BATCH`] on the
+    /// SIMD-group matrix units (f32 tiles), one launch for the whole batch.
+    /// Tolerance-qualified against the CPU reference; not bit-identical to
+    /// the GEMV (different summation order).
     #[allow(clippy::too_many_arguments)]
     pub fn q8_0_gemm_mma(
         &self,
@@ -2322,6 +2326,9 @@ impl MetalContext {
         })
     }
 
+    /// Batched packed Q8_0 GEMM: Y[b, :] = W . X[b, :] for b < batch.
+    /// Per-token accumulation matches the single-token GEMV, so batch=1 is
+    /// bit-identical to it.
     #[allow(clippy::too_many_arguments)]
     pub fn q8_0_gemm(
         &self,

@@ -1603,6 +1603,9 @@ fn q8_0_gemm_mma_matches_the_cpu_reference_within_tolerance() {
         (3584, 1024, 16),
         (3584, 1024, 32),
         (40, 64, 27),
+        (1024, 3584, 64),
+        (100, 96, 77),
+        (40, 64, 512),
         (1024, 3584, 7),
         (6144, 1024, 1),
     ] {
@@ -1659,12 +1662,12 @@ fn q8_0_gemm_mma_matches_the_cpu_reference_within_tolerance() {
             &ctx.buffer(64, true).unwrap(),
             1,
             32,
-            33,
+            GEMM_MMA_MAX_BATCH + 1,
             0,
             0
         )
         .is_err(),
-        "batch above 32 refused"
+        "batch above the MMA maximum refused"
     );
 }
 

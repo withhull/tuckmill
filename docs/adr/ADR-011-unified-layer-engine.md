@@ -197,3 +197,38 @@ never in a family-specific path.
 - Effect (pinned 0.8B, M3 8 GB, in-process, alternating A/B x3 from two
   prebuilt binaries): 512-token prefill 624-625 ms -> 516-518 ms (-17%),
   locally-calibrated.
+
+## Engine note (2026-10-26): one GEMM launch per 128-token prefill chunk
+
+- Profile at `45b8386` (512 tokens, ungrouped): matrix-unit GEMM 69%,
+  DeltaNet recurrence 10%, attention 9%. A 64-row tile (16 rows x 32
+  tokens per SIMD group) was slower (520 -> 568 ms, A/B x3) and was not
+  kept: the GEMM was short of threadgroups, not of math per tile. With a
+  32-token chunk a 1,024-row matrix gets 32 threadgroups, and each chunk
+  re-reads every weight.
+- `tm_q8_0_gemm_mma` now covers a whole batch in one launch: a 1-D grid
+  of 32-row x 32-token tiles, with neighbouring threadgroups sharing a
+  weight tile (batch up to `TM_METAL_GEMM_MMA_MAX_BATCH` = 512). Per-tile
+  arithmetic is unchanged. `Matrix::gemm` slices F16 and batch-1 GEMMs
+  into <= 32-token pieces through the existing offsets. Prefill chunks
+  are 128 tokens.
+- Chunk size measured, not assumed (pinned 0.8B, M3 8 GB, in-process,
+  alternating prebuilt binaries, two passes; planned scratch at capacity
+  640):
+
+  | chunk | 512-token prefill | scratch |
+  | --- | --- | --- |
+  | 32 | 493-522 ms | 9.7 MiB |
+  | 64 | 413-438 ms | 15.4 MiB |
+  | 128 | 393-414 ms | 26.8 MiB |
+  | 256 | 401-409 ms | 49.6 MiB |
+
+  128 is kept: the gains flatten after it while scratch keeps doubling.
+  The attention-score scratch is chunk x heads x context, so long
+  admitted contexts pay more. The planner prices it, so admission stays
+  exact; a tiled attention without the score buffer is the follow-up.
+- Gate: GEMM tolerance at batches 64, 77, 512 (513 refused); fixture
+  batched prefill still bit-identical to sequential decode (1, 3, 128,
+  132 tokens); 512-token logits 4.55e-4 / next step 3.98e-4, the same as
+  before, top-1 equal. Profile after: GEMM 338 ms (was 422 ms ungrouped),
+  still 68%.
