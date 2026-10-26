@@ -232,3 +232,34 @@ never in a family-specific path.
   132 tokens); 512-token logits 4.55e-4 / next step 3.98e-4, the same as
   before, top-1 equal. Profile after: GEMM 338 ms (was 422 ms ungrouped),
   still 68%.
+
+## Engine note (2026-10-26): GEMM kernel variants measured, none kept
+
+Isolated timing (`q8_0_gemm_batch_timing` with `TUCKMILL_PROFILE=1
+TUCKMILL_GEMM_MMA=1`, now batches 32 and 128 after a warm-up, 100
+iterations; M3 8 GB, alternating prebuilt binaries, two passes). Baseline
+at 128 tokens: 3584x1024 470-500 us, 6144x1024 787-830 us, 1024x3584
+500-556 us, about 2 TFLOP/s f32. Variants, all tolerance-passing:
+
+| variant | 3584x1024 | 6144x1024 | 1024x3584 | verdict |
+| --- | --- | --- | --- | --- |
+| 2x2 SIMD-group layout, vector loads, 32x32 | 461-467 | 756-780 | 480-521 | noise |
+| same, 64x32 / 32x64 | 441-483 | 745-803 | 543-595 | no gain |
+| same, 64x64 (16 accumulators) | 2294-2416 | 3728-3746 | 2377-2484 | register spill |
+| double-buffered stages, one barrier per block | 496-598 | 832-990 | 524-744 | slower |
+| K = 64 per stage (two Q8_0 blocks) | 521-599 | 876-991 | 540-687 | slower |
+| f16 operand tiles (prototype, not a profile change) | 476-492 | 784-822 | 534-553 | no gain |
+
+- The pinned llama.cpp on this M3 does not use the Metal tensor API
+  ("disabled for pre-M5"). Its `kernel_mul_mm` stages dequantized
+  weights and activations as half. The f16 prototype shows that operand
+  precision is not what separates the two engines, so the oracle-f32
+  profile stays.
+- From the isolated rates, the GEMMs are about 265 ms of the ~400 ms
+  512-token prefill; the rest (DeltaNet recurrence, attention, norms and
+  small operators) is about 135 ms. llama.cpp's whole pp512 is about
+  258 ms, so closing the gap needs both less non-GEMM time and a faster
+  GEMM. Why llama.cpp's GEMM is faster is not yet identified: it reads
+  the same 34-byte Q8_0 blocks, a 64x32 tile and K = 32 stages, all of
+  which were tried above. It is not timed in isolation here (the pinned
+  tools have no matmul benchmark).

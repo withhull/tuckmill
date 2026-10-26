@@ -1553,12 +1553,16 @@ fn q8_0_gemm_batch_timing_when_requested() {
     let Some(ctx) = metal_context() else {
         return;
     };
+    // `TUCKMILL_GEMM_MMA=1` times the matrix-unit kernel at prefill chunk
+    // sizes instead of the per-row GEMM.
+    let mma = std::env::var("TUCKMILL_GEMM_MMA").is_ok();
+    let batches: &[usize] = if mma { &[32, 128] } else { &[1, 4, 8, 16] };
     for (rows, cols) in [(3584usize, 1024usize), (6144, 1024), (1024, 3584)] {
         let w = boundary_weights(rows, cols, 3);
         let wb = ctx.buffer(w.len(), true).unwrap();
         wb.upload(0, &w).unwrap();
-        for batch in [1usize, 4, 8, 16] {
-            let mma = std::env::var("TUCKMILL_GEMM_MMA").is_ok() && batch > 1;
+        for &batch in batches {
+            let mma = mma && batch > 1;
             let x = boundary_input(cols * batch, 5);
             let xb = ctx.buffer(cols * batch * 4, true).unwrap();
             xb.upload(0, &f32_bytes(&x)).unwrap();
@@ -1572,9 +1576,11 @@ fn q8_0_gemm_batch_timing_when_requested() {
                         .unwrap()
                 }
             };
-            run();
+            for _ in 0..20 {
+                run();
+            }
             ctx.fence().unwrap();
-            let iters = 20u32;
+            let iters = 100u32;
             let g0 = ctx.gpu_nanos_total();
             for _ in 0..iters {
                 run();
