@@ -1,0 +1,69 @@
+ggml_metal_device_init: tensor API disabled for pre-M5 and pre-A19 devices
+ggml_metal_library_init: using embedded metal library
+ggml_metal_library_compile_all: compiled 'fa_aux' library in 0.003 sec
+ggml_metal_library_compile_all: compiled 'fa_f16' library in 0.005 sec
+ggml_metal_library_compile_all: compiled 'fa_f32' library in 0.007 sec
+ggml_metal_library_compile_all: compiled 'fa_q4_0' library in 0.002 sec
+ggml_metal_library_compile_all: compiled 'fa_q4_1' library in 0.006 sec
+ggml_metal_library_compile_all: compiled 'fa_q5_0' library in 0.055 sec
+ggml_metal_library_compile_all: compiled 'fa_q5_1' library in 0.054 sec
+ggml_metal_library_compile_all: compiled 'fa_q8_0' library in 0.052 sec
+ggml_metal_library_compile_all: compiled 'fa_tensor' library in 0.051 sec
+ggml_metal_library_compile_all: compiled 'fa_vec_f16' library in 0.042 sec
+ggml_metal_library_compile_all: compiled 'fa_vec_f32' library in 0.032 sec
+ggml_metal_library_compile_all: compiled 'fa_vec_q4_0' library in 0.031 sec
+ggml_metal_library_compile_all: compiled 'fa_vec_q4_1' library in 0.036 sec
+ggml_metal_library_compile_all: compiled 'fa_vec_q5_0' library in 0.049 sec
+ggml_metal_library_compile_all: compiled 'fa_vec_q5_1' library in 0.046 sec
+ggml_metal_library_compile_all: compiled 'fa_vec_q8_0' library in 0.026 sec
+ggml_metal_library_compile_all: compiled 'mul_mv' library in 0.022 sec
+ggml_metal_library_compile_all: compiled 'mul_mv_mma' library in 0.014 sec
+ggml_metal_library_compile_all: compiled 'mul_mm' library in 0.018 sec
+ggml_metal_library_compile_all: compiled 'quantize' library in 0.009 sec
+ggml_metal_library_compile_all: compiled 'softmax' library in 0.050 sec
+ggml_metal_library_compile_all: compiled 'norm' library in 0.041 sec
+ggml_metal_library_compile_all: compiled 'unary' library in 0.048 sec
+ggml_metal_library_compile_all: compiled 'binbcast' library in 0.035 sec
+ggml_metal_library_compile_all: compiled 'reduce' library in 0.035 sec
+ggml_metal_library_compile_all: compiled 'tri' library in 0.034 sec
+ggml_metal_library_compile_all: compiled 'ssm' library in 0.052 sec
+ggml_metal_library_compile_all: compiled 'wkv' library in 0.053 sec
+ggml_metal_library_compile_all: compiled 'gated_delta_net' library in 0.025 sec
+ggml_metal_library_compile_all: compiled 'solve_tri' library in 0.025 sec
+ggml_metal_library_compile_all: compiled 'rope' library in 0.049 sec
+ggml_metal_library_compile_all: compiled 'conv' library in 0.049 sec
+ggml_metal_library_compile_all: compiled 'upscale' library in 0.050 sec
+ggml_metal_library_compile_all: compiled 'argsort' library in 0.048 sec
+ggml_metal_library_compile_all: compiled 'pool' library in 0.021 sec
+ggml_metal_library_compile_all: compiled 'misc' library in 0.021 sec
+ggml_metal_library_compile_all: loaded 36 libraries from embedded data in 0.056 sec (max single = 0.055 sec)
+ggml_metal_rsets_init: creating a residency set collection (keep_alive = 180 s)
+ggml_metal_device_init: GPU name:   MTL0 (Apple M3)
+ggml_metal_device_init: GPU family: MTLGPUFamilyApple9  (1009)
+ggml_metal_device_init: GPU family: MTLGPUFamilyMetal4  (5002)
+ggml_metal_device_init: simdgroup reduction   = true
+ggml_metal_device_init: simdgroup matrix mul. = true
+ggml_metal_device_init: has unified memory    = true
+ggml_metal_device_init: has bfloat            = true
+ggml_metal_device_init: has tensor            = false
+ggml_metal_device_init: use residency sets    = true
+ggml_metal_device_init: use shared buffers    = true
+ggml_metal_device_init: recommendedMaxWorkingSetSize  =  5726.63 MB
+       10.70 real        13.25 user         0.29 sys
+          1028718592  maximum resident set size
+                   0  average shared memory size
+                   0  average unshared data size
+                   0  average unshared stack size
+               27648  page reclaims
+               40567  page faults
+                   0  swaps
+                   0  block input operations
+                   0  block output operations
+                   0  messages sent
+                   0  messages received
+                   0  signals received
+                  11  voluntary context switches
+               14496  involuntary context switches
+        269635722023  instructions retired
+         42116389521  cycles elapsed
+           239175240  peak memory footprint
