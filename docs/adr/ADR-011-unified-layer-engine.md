@@ -329,3 +329,29 @@ at 128 tokens: 3584x1024 470-500 us, 6144x1024 787-830 us, 1024x3584
     8x2x256);
   - real-artifact GPU vs CPU oracle: hidden 6.5e-5, logits 2.78e-4;
   - 512-token batched vs sequential: 3.36e-4 / 3.36e-4, top-1 equal.
+
+## Engine note (2026-10-27): where 512-token prefill time goes now
+
+Measured on the pinned 0.8B (M3 8 GB) at `171e53c`, in the grouped run,
+by skipping operators in a throwaway build (outputs wrong, timing only;
+three passes each; full prefill ~330 ms):
+
+| skipped | prefill | implied cost |
+| --- | --- | --- |
+| nothing | ~330 ms | - |
+| matrix-unit GEMMs | 71-84 ms | GEMMs ~255-265 ms |
+| GEMMs + all small operators | 42-45 ms | small operators ~35 ms together |
+| GEMMs + DeltaNet recurrence | 51-64 ms | ~20 ms |
+| GEMMs + attention | 59-68 ms | ~14 ms |
+| everything | 8-10 ms | host encode, embedding, head |
+
+- No small operator costs more than about 3-10 ms on its own (conv and
+  shift, `silu_mul`, `f32_axpy`, RMS norm, L2 norm, gated norm, SiLU,
+  embedding rows); there is no single kernel left to fix.
+- Tried and not kept: fusing the mixer residual add with the post-norm
+  (`add_rmsnorm`, both decode and prefill). It passed its gates, but
+  prefill was 326-332 vs 322-336 ms and decode 12.59 vs 12.50 ms per
+  token, i.e. no measurable gain.
+- The GEMMs are about 80% of prefill. Prefill parity therefore depends
+  on the GEMM, where the f32 kernel variants measured earlier all
+  plateau at ~2 TFLOP/s.
