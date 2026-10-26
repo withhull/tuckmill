@@ -89,6 +89,22 @@ int tm_metal_f32_scale(tm_metal_ctx *ctx, tm_metal_buffer *x, tm_metal_buffer *y
                        float factor, uint32_t n, char *err, size_t err_cap);
 
 /* y[i] = y[i] + alpha * a[i], i < n. */
+/* Greedy argmax of x[0..n) into out[0] (u32), exactly the CPU rule: NaN
+ * skipped, largest value wins, ties to the lowest index; 0xFFFFFFFF when
+ * every entry is NaN, written to out[out_index]. `partial` is 512 bytes of
+ * scratch. Encodable inside a dispatch group. */
+int tm_metal_argmax_f32(tm_metal_ctx *ctx, tm_metal_buffer *x, uint32_t n,
+                        tm_metal_buffer *partial, tm_metal_buffer *out, uint32_t out_index,
+                        char *err, size_t err_cap);
+
+/* out[i] = row ids[slot] of matrix `w` (type 8 = Q8_0, 1 = F16; `rows` x
+ * `cols`), dequantized to f32: an embedding lookup whose token id was
+ * produced on the device. An id >= rows (the argmax all-NaN marker) writes
+ * zeros. Encodable inside a dispatch group. */
+int tm_metal_row_indirect_f32(tm_metal_ctx *ctx, tm_metal_buffer *w, uint32_t type_id,
+                              uint32_t rows, uint32_t cols, tm_metal_buffer *ids, uint32_t slot,
+                              tm_metal_buffer *out, char *err, size_t err_cap);
+
 /* dst[dst_off + i] = src[src_off + i] for i < n (f32 elements, bit-exact),
  * encodable inside a dispatch group. Offsets and n are checked against
  * both buffers. */
@@ -307,6 +323,12 @@ int tm_metal_fence(tm_metal_ctx *ctx, char *err, size_t err_cap);
 
 /* Measurement surface. */
 uint64_t tm_metal_committed_dispatches(const tm_metal_ctx *ctx);
+/* Copy a shared buffer range once the first `completed_target` committed
+ * command buffers have completed, without waiting for later work (which
+ * must not touch the range). Used to read a pipelined decode step's token
+ * while the next step runs. */
+int tm_metal_download_after(tm_metal_ctx *ctx, tm_metal_buffer *src, size_t off, void *dst,
+                            size_t len, uint64_t completed_target, char *err, size_t err_cap);
 uint64_t tm_metal_completed_dispatches(const tm_metal_ctx *ctx);
 /* GPU time of the most recently completed command buffer, milliseconds
  * (0.0 before the first completion). */

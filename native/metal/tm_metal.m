@@ -17,6 +17,9 @@
 
 #include "tm_metal.h"
 
+/* 64 partial (f32 value, u32 index) pairs for tm_metal_argmax_f32. */
+#define TM_ARGMAX_PARTIAL_BYTES 512u
+
 #define TM_PROFILE_SLOTS 64
 #define TM_PROFILE_NAME 40
 
@@ -40,6 +43,10 @@ struct tm_metal_ctx {
     id<MTLComputePipelineState> pso_scale;
     id<MTLComputePipelineState> pso_axpy;
     id<MTLComputePipelineState> pso_copy;
+    id<MTLComputePipelineState> pso_argmax_partial;
+    id<MTLComputePipelineState> pso_argmax_final;
+    id<MTLComputePipelineState> pso_q8row_indirect;
+    id<MTLComputePipelineState> pso_f16row_indirect;
     id<MTLComputePipelineState> pso_f16f32;
     id<MTLComputePipelineState> pso_f32f16;
     id<MTLComputePipelineState> pso_q8gemv;
@@ -195,7 +202,7 @@ static int tm_commit(tm_metal_ctx *ctx, id<MTLCommandBuffer> cb, NSArray *in_fli
             }
             os_unfair_lock_unlock(&c->profile_lock);
         }
-        atomic_fetch_add_explicit(&c->completed, 1, memory_order_relaxed);
+        atomic_fetch_add_explicit(&c->completed, 1, memory_order_release);
     }];
     [cb commit];
     return TM_METAL_OK;
@@ -312,6 +319,10 @@ tm_metal_ctx *tm_metal_create(const char *msl_source, char *err, size_t err_cap)
         ctx->pso_scale = tm_pipeline(ctx, @"tm_scale_f32", &error);
         ctx->pso_axpy = tm_pipeline(ctx, @"tm_axpy_f32", &error);
         ctx->pso_copy = tm_pipeline(ctx, @"tm_copy_f32", &error);
+        ctx->pso_argmax_partial = tm_pipeline(ctx, @"tm_argmax_partial", &error);
+        ctx->pso_argmax_final = tm_pipeline(ctx, @"tm_argmax_final", &error);
+        ctx->pso_q8row_indirect = tm_pipeline(ctx, @"tm_q8_0_row_indirect_f32", &error);
+        ctx->pso_f16row_indirect = tm_pipeline(ctx, @"tm_f16_row_indirect_f32", &error);
         ctx->pso_f16f32 = tm_pipeline(ctx, @"tm_cast_f16_f32", &error);
         ctx->pso_f32f16 = tm_pipeline(ctx, @"tm_cast_f32_f16", &error);
         ctx->pso_q8gemv = tm_pipeline(ctx, @"tm_q8_0_gemv", &error);
@@ -344,6 +355,8 @@ tm_metal_ctx *tm_metal_create(const char *msl_source, char *err, size_t err_cap)
         ctx->pso_q35_silu = tm_pipeline(ctx, @"tm_qwen35_silu", &error);
         ctx->pso_q35_split_qkv = tm_pipeline(ctx, @"tm_qwen35_split_qkv", &error);
         if (ctx->pso_scale == nil || ctx->pso_axpy == nil || ctx->pso_copy == nil ||
+            ctx->pso_argmax_partial == nil || ctx->pso_argmax_final == nil ||
+            ctx->pso_q8row_indirect == nil || ctx->pso_f16row_indirect == nil ||
             ctx->pso_f16f32 == nil ||
             ctx->pso_f32f16 == nil || ctx->pso_q8gemv == nil || ctx->pso_f16gemv == nil ||
             ctx->pso_q8row == nil || ctx->pso_rmsnorm == nil || ctx->pso_rope == nil ||
@@ -424,6 +437,10 @@ void tm_metal_destroy(tm_metal_ctx *ctx) {
         [ctx->pso_f16f32 release];
         [ctx->pso_axpy release];
         [ctx->pso_copy release];
+        [ctx->pso_argmax_partial release];
+        [ctx->pso_argmax_final release];
+        [ctx->pso_q8row_indirect release];
+        [ctx->pso_f16row_indirect release];
         [ctx->pso_scale release];
         [ctx->library release];
         [ctx->queue release];
@@ -545,6 +562,37 @@ int tm_metal_upload(tm_metal_ctx *ctx, tm_metal_buffer *dst, size_t off,
 int tm_metal_download(tm_metal_ctx *ctx, tm_metal_buffer *src, size_t off,
                       void *dst, size_t len, char *err, size_t err_cap) {
     return tm_copy(ctx, src, off, dst, len, 0, err, err_cap, "download");
+}
+
+int tm_metal_download_after(tm_metal_ctx *ctx, tm_metal_buffer *src, size_t off, void *dst,
+                            size_t len, uint64_t completed_target, char *err, size_t err_cap) {
+    if (tm_check_ctx(ctx, err, err_cap, "download_after") != TM_METAL_OK) {
+        return TM_METAL_ERR_UNSUPPORTED;
+    }
+    if (src == NULL || src->owner != ctx) {
+        return tm_fail(err, err_cap, TM_METAL_ERR_UNSUPPORTED,
+                       @"download_after: buffer does not belong to this context");
+    }
+    if (len == 0 || off > src->len || len > src->len - off) {
+        return tm_fail(err, err_cap, TM_METAL_ERR_BOUNDS,
+                       [NSString stringWithFormat:@"download_after: range %zu..%zu outside buffer", off, off + len]);
+    }
+    if (!src->shared) {
+        return tm_fail(err, err_cap, TM_METAL_ERR_UNSUPPORTED,
+                       @"download_after: private buffers have no host copy");
+    }
+    if (completed_target > atomic_load_explicit(&ctx->committed, memory_order_relaxed)) {
+        return tm_fail(err, err_cap, TM_METAL_ERR_UNSUPPORTED,
+                       @"download_after: target is beyond the committed command buffers");
+    }
+    /* Command buffers complete in queue order; wait for the target only,
+     * not for later work (the caller guarantees later work does not touch
+     * this range). */
+    while (atomic_load_explicit(&ctx->completed, memory_order_acquire) < completed_target) {
+        usleep(50);
+    }
+    memcpy(dst, (const uint8_t *)[src->buffer contents] + off, len);
+    return TM_METAL_OK;
 }
 
 /* ---------------------------------------------------------------- ops -- */
@@ -717,6 +765,95 @@ int tm_metal_f32_axpy(tm_metal_ctx *ctx, tm_metal_buffer *a, tm_metal_buffer *y,
                       float alpha, uint32_t n, char *err, size_t err_cap) {
     return tm_dispatch_1d(ctx, ctx->pso_axpy, a, y, alpha, 1, n, 0, 0, err, err_cap,
                           "f32_axpy");
+}
+
+int tm_metal_argmax_f32(tm_metal_ctx *ctx, tm_metal_buffer *x, uint32_t n,
+                        tm_metal_buffer *partial, tm_metal_buffer *out, uint32_t out_index,
+                        char *err, size_t err_cap) {
+    if (tm_check_ctx(ctx, err, err_cap, "argmax_f32") != TM_METAL_OK) {
+        return TM_METAL_ERR_UNSUPPORTED;
+    }
+    if (n == 0) {
+        return tm_fail(err, err_cap, TM_METAL_ERR_BOUNDS, @"argmax_f32: empty input");
+    }
+    /* partial holds 64 (value, index) pairs: 64 f32 then 64 u32. */
+    if (tm_check_buffer(ctx, x, (size_t)n * 4u, err, err_cap, "argmax_f32.x") != TM_METAL_OK ||
+        tm_check_buffer(ctx, partial, TM_ARGMAX_PARTIAL_BYTES, err, err_cap,
+                        "argmax_f32.partial") != TM_METAL_OK ||
+        tm_check_buffer(ctx, out, ((size_t)out_index + 1u) * 4u, err, err_cap,
+                        "argmax_f32.out") != TM_METAL_OK) {
+        return TM_METAL_ERR_BOUNDS;
+    }
+    @autoreleasepool {
+        tm_frame f;
+        id<MTLComputeCommandEncoder> enc = tm_frame_open(ctx, &f);
+        if (enc == nil) {
+            return tm_fail(err, err_cap, TM_METAL_ERR_INTERNAL, @"argmax_f32: no encoder");
+        }
+        [enc setComputePipelineState:ctx->pso_argmax_partial];
+        [enc setBuffer:x->buffer offset:0 atIndex:0];
+        [enc setBuffer:partial->buffer offset:0 atIndex:1];
+        [enc setBuffer:partial->buffer offset:256 atIndex:2];
+        [enc setBytes:&n length:sizeof(n) atIndex:3];
+        [enc dispatchThreadgroups:MTLSizeMake(64, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+        [enc setComputePipelineState:ctx->pso_argmax_final];
+        [enc setBuffer:partial->buffer offset:0 atIndex:0];
+        [enc setBuffer:partial->buffer offset:256 atIndex:1];
+        [enc setBuffer:out->buffer offset:0 atIndex:2];
+        [enc setBytes:&out_index length:sizeof(out_index) atIndex:3];
+        [enc dispatchThreadgroups:MTLSizeMake(1, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+        [f.keep addObject:x->buffer];
+        [f.keep addObject:partial->buffer];
+        [f.keep addObject:out->buffer];
+        return tm_frame_commit(ctx, &f, err, err_cap, "argmax_f32");
+    }
+}
+
+int tm_metal_row_indirect_f32(tm_metal_ctx *ctx, tm_metal_buffer *w, uint32_t type_id,
+                              uint32_t rows, uint32_t cols, tm_metal_buffer *ids, uint32_t slot,
+                              tm_metal_buffer *out, char *err, size_t err_cap) {
+    if (tm_check_ctx(ctx, err, err_cap, "row_indirect") != TM_METAL_OK) {
+        return TM_METAL_ERR_UNSUPPORTED;
+    }
+    id<MTLComputePipelineState> pso = nil;
+    size_t w_need = 0;
+    if (type_id == 8u && cols > 0 && (cols % 32u) == 0u) {
+        pso = ctx->pso_q8row_indirect;
+        w_need = (size_t)rows * ((size_t)cols / 32u) * 34u;
+    } else if (type_id == 1u && cols > 0) {
+        pso = ctx->pso_f16row_indirect;
+        w_need = (size_t)rows * (size_t)cols * 2u;
+    } else {
+        return tm_fail(err, err_cap, TM_METAL_ERR_UNSUPPORTED,
+                       [NSString stringWithFormat:@"row_indirect: type %u with cols %u is unsupported",
+                                                  type_id, cols]);
+    }
+    if (rows == 0 ||
+        tm_check_buffer(ctx, w, w_need, err, err_cap, "row_indirect.weights") != TM_METAL_OK ||
+        tm_check_buffer(ctx, ids, ((size_t)slot + 1u) * 4u, err, err_cap, "row_indirect.ids") != TM_METAL_OK ||
+        tm_check_buffer(ctx, out, (size_t)cols * 4u, err, err_cap, "row_indirect.out") != TM_METAL_OK) {
+        return TM_METAL_ERR_BOUNDS;
+    }
+    @autoreleasepool {
+        tm_frame f;
+        id<MTLComputeCommandEncoder> enc = tm_frame_open(ctx, &f);
+        if (enc == nil) {
+            return tm_fail(err, err_cap, TM_METAL_ERR_INTERNAL, @"row_indirect: no encoder");
+        }
+        [enc setComputePipelineState:pso];
+        [enc setBuffer:w->buffer offset:0 atIndex:0];
+        [enc setBuffer:out->buffer offset:0 atIndex:1];
+        [enc setBuffer:ids->buffer offset:0 atIndex:2];
+        [enc setBytes:&slot length:sizeof(slot) atIndex:3];
+        [enc setBytes:&rows length:sizeof(rows) atIndex:4];
+        [enc setBytes:&cols length:sizeof(cols) atIndex:5];
+        [f.keep addObject:w->buffer];
+        [f.keep addObject:out->buffer];
+        [f.keep addObject:ids->buffer];
+        [enc dispatchThreads:MTLSizeMake((NSUInteger)cols, 1, 1)
+            threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+        return tm_frame_commit(ctx, &f, err, err_cap, "row_indirect");
+    }
 }
 
 int tm_metal_copy_f32(tm_metal_ctx *ctx, tm_metal_buffer *src, uint32_t src_off,

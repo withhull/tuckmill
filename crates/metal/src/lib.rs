@@ -88,6 +88,16 @@ mod imp {
             err: *mut c_char,
             err_cap: usize,
         ) -> c_int;
+        pub fn tm_metal_download_after(
+            ctx: *mut TmMetalCtx,
+            src: *mut TmMetalBuffer,
+            off: usize,
+            dst: *mut c_void,
+            len: usize,
+            completed_target: u64,
+            err: *mut c_char,
+            err_cap: usize,
+        ) -> c_int;
         pub fn tm_metal_f32_scale(
             ctx: *mut TmMetalCtx,
             x: *mut TmMetalBuffer,
@@ -488,6 +498,28 @@ mod imp {
         pub fn tm_metal_committed_dispatches(ctx: *const TmMetalCtx) -> u64;
         pub fn tm_metal_completed_dispatches(ctx: *const TmMetalCtx) -> u64;
         pub fn tm_metal_last_gpu_ms(ctx: *const TmMetalCtx) -> f64;
+        pub fn tm_metal_argmax_f32(
+            ctx: *mut TmMetalCtx,
+            x: *mut TmMetalBuffer,
+            n: u32,
+            partial: *mut TmMetalBuffer,
+            out: *mut TmMetalBuffer,
+            out_index: u32,
+            err: *mut c_char,
+            err_cap: usize,
+        ) -> c_int;
+        pub fn tm_metal_row_indirect_f32(
+            ctx: *mut TmMetalCtx,
+            w: *mut TmMetalBuffer,
+            type_id: u32,
+            rows: u32,
+            cols: u32,
+            ids: *mut TmMetalBuffer,
+            slot: u32,
+            out: *mut TmMetalBuffer,
+            err: *mut c_char,
+            err_cap: usize,
+        ) -> c_int;
         pub fn tm_metal_copy_f32(
             ctx: *mut TmMetalCtx,
             src: *mut TmMetalBuffer,
@@ -591,6 +623,12 @@ fn metal_error(code: c_int, text: String, context: &str) -> TuckmillError {
     let (mapped, _) = (ErrorCode::Unavailable, code);
     TuckmillError::new(mapped, format!("Metal {context}: {text}"))
 }
+
+/// Bytes of scratch [`MetalContext::argmax_f32`] needs (64 value/index
+/// pairs).
+pub const ARGMAX_PARTIAL_BYTES: usize = 512;
+/// [`MetalContext::argmax_f32`]'s result when every input was NaN.
+pub const ARGMAX_NONE: u32 = u32::MAX;
 
 /// One device, one command queue, and the compiled pipeline states.
 #[derive(Clone)]
@@ -862,6 +900,71 @@ impl MetalContext {
     }
 
     /// y = y + alpha * a over `n` elements.
+    /// Greedy argmax of `x[..n]` into `out[out_index]` (u32), exactly the
+    /// CPU rule (`sampling::argmax`): NaN skipped, largest wins, ties to the
+    /// lowest index; [`ARGMAX_NONE`] when every entry is NaN. `partial`
+    /// needs [`ARGMAX_PARTIAL_BYTES`]. Encodable inside a dispatch group.
+    pub fn argmax_f32(
+        &self,
+        x: &MetalBuffer,
+        n: u32,
+        partial: &MetalBuffer,
+        out: &MetalBuffer,
+        out_index: u32,
+    ) -> Result<()> {
+        for (buffer, name) in [(x, "x"), (partial, "partial"), (out, "out")] {
+            self.check_owned(buffer, name)?;
+        }
+        let (xc, pc, oc) = (x.raw, partial.raw, out.raw);
+        self.operate("argmax_f32", move |ctx| {
+            let mut err = [0 as c_char; ERR_CAP];
+            // SAFETY: raw handles were validated against this context.
+            let code = unsafe {
+                imp::tm_metal_argmax_f32(ctx, xc, n, pc, oc, out_index, err.as_mut_ptr(), ERR_CAP)
+            };
+            (code, err)
+        })
+    }
+
+    /// `out = row ids[slot]` of `w` (`type_id` 8 = Q8_0, 1 = F16; `rows` x
+    /// `cols`) as f32: an embedding lookup of a token chosen on the device.
+    /// An id `>= rows` (the [`ARGMAX_NONE`] marker) writes zeros.
+    #[allow(clippy::too_many_arguments)]
+    pub fn row_indirect_f32(
+        &self,
+        w: &MetalBuffer,
+        type_id: u32,
+        rows: u32,
+        cols: u32,
+        ids: &MetalBuffer,
+        slot: u32,
+        out: &MetalBuffer,
+    ) -> Result<()> {
+        for (buffer, name) in [(w, "weights"), (ids, "ids"), (out, "out")] {
+            self.check_owned(buffer, name)?;
+        }
+        let (wc, ic, oc) = (w.raw, ids.raw, out.raw);
+        self.operate("row_indirect", move |ctx| {
+            let mut err = [0 as c_char; ERR_CAP];
+            // SAFETY: raw handles were validated against this context.
+            let code = unsafe {
+                imp::tm_metal_row_indirect_f32(
+                    ctx,
+                    wc,
+                    type_id,
+                    rows,
+                    cols,
+                    ic,
+                    slot,
+                    oc,
+                    err.as_mut_ptr(),
+                    ERR_CAP,
+                )
+            };
+            (code, err)
+        })
+    }
+
     /// `dst[dst_off + i] = src[src_off + i]` for `i < n` f32 elements
     /// (bit-exact; encodable inside a dispatch group).
     pub fn copy_f32(
@@ -2143,6 +2246,47 @@ impl MetalBuffer {
             };
             if code != 0 {
                 return Err(metal_error(code, err_text(&err), "download"));
+            }
+            Ok(())
+        }
+    }
+
+    /// Copy `dst.len()` bytes from `offset` once the first
+    /// `completed_target` committed command buffers have completed, without
+    /// waiting for later work. The caller guarantees no later in-flight work
+    /// touches this range (pipelined decode reads the token slot of a step
+    /// while the next step, writing the other slot, runs).
+    pub fn download_after(
+        &self,
+        offset: usize,
+        dst: &mut [u8],
+        completed_target: u64,
+    ) -> Result<()> {
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = (offset, dst, completed_target);
+            return Err(TuckmillError::new(ErrorCode::Unavailable, "no Metal"));
+        }
+        #[cfg(target_os = "macos")]
+        {
+            let mut err = [0 as c_char; ERR_CAP];
+            // SAFETY: handles valid; dst slice pointer/len valid for write.
+            // No lock: the wait must not block encoding of later work, and
+            // the call only reads atomics and the shared contents.
+            let code = unsafe {
+                imp::tm_metal_download_after(
+                    self.ctx.raw,
+                    self.raw,
+                    offset,
+                    dst.as_mut_ptr() as *mut c_void,
+                    dst.len(),
+                    completed_target,
+                    err.as_mut_ptr(),
+                    ERR_CAP,
+                )
+            };
+            if code != 0 {
+                return Err(metal_error(code, err_text(&err), "download_after"));
             }
             Ok(())
         }

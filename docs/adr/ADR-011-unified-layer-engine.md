@@ -111,3 +111,26 @@ never in a family-specific path.
   is".
 - Next: step 2 (dense Qwen3 on the same blocks), and the graph-driven CPU
   oracle.
+
+## Engine note (2026-10-26): greedy decoding on the device, pipelined
+
+- `tm_metal_argmax_f32` chooses the greedy token on the GPU with exactly
+  the CPU rule (`sampling::argmax`: NaN skipped, ties to the lowest index;
+  the order is associative, so the two-pass reduction gives the
+  sequential answer). It writes one of two alternating token slots.
+  `tm_metal_row_indirect_f32` embeds a token id read from such a slot; the
+  all-NaN marker writes zeros and the host fails the request when it
+  reads the marker.
+- `EngineModel::submit_greedy` / `collect_greedy`: the executor queues step
+  i+1 (reading step i's choice on the device) before waiting for step i,
+  and reads each token with `download_after`, which waits only for that
+  step's command buffer. The worker's per-token work (output frames,
+  stop/EOS handling) now overlaps the GPU. Temperature > 0 keeps the CPU
+  sampler. `reset()` drains first, so a step left in flight at EOS or a
+  stop sequence never races the next request's state reset.
+- Evidence (pinned 0.8B, M3 8 GB): device greedy and pipelined greedy
+  produce the CPU rule's tokens at every step (fixture and pinned, 40
+  steps). In-process the step is GPU-bound (14.2–15.0 ms for all three
+  paths: the logits download was not the cost). Served decode via
+  `tuckmill bench` (128 in / 256 out, ABAB): 56.5 → 64.0 and 51.0 → 59.0
+  tok/s (+13–16%), locally-calibrated.

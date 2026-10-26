@@ -23,7 +23,7 @@ use tuckmill_manifest::units::Bytes;
 use tuckmill_manifest::{BACKEND_ABI_VERSION, WORKER_PROTOCOL_VERSION};
 
 use crate::completion::CompletionTracker;
-use crate::engine::metal::{self as engine_metal, EngineModel};
+use crate::engine::metal::{self as engine_metal, EngineModel, GreedyInput, PendingToken};
 use crate::forward::{
     self, Forward, KvPrecision, KvState, ModelWeights, NumericalProfile, ProfileCounters,
 };
@@ -981,13 +981,34 @@ fn run_session(
     // steps. Vocabulary logits are computed for the final chunk only.
     let prefill_batch = spec.prefill_batch;
     let mut logits: Vec<f32> = Vec::new();
+    // Greedy requests on an engine that can choose on the device never
+    // download logits: the step returns the token the CPU greedy rule
+    // would pick (`sampling::argmax`, verified equal).
+    let device_greedy = engine.device_greedy() && req.sampling.temperature <= 0.0;
+    let mut next: Option<Option<u32>> = None;
+    // The pipelined step already queued (it computes the token after the
+    // one being collected).
+    let mut in_flight: Option<PendingToken> = None;
     let prompt_tokens = &req.prompt_tokens;
     let mut pos = 0usize;
     while pos < prompt_tokens.len() {
         let take = prefill_batch.min(prompt_tokens.len() - pos);
         let want = pos + take == prompt_tokens.len();
         pause_loop(ctl, Duration::ZERO)?;
-        match engine.prefill_chunk(&prompt_tokens[pos..pos + take], pos, want, &cancelled) {
+        let chunk = &prompt_tokens[pos..pos + take];
+        let result = if device_greedy {
+            engine
+                .prefill_chunk_greedy(chunk, pos, want, &cancelled)
+                .map(|choice| {
+                    if choice.is_some() {
+                        next = choice;
+                    }
+                    None
+                })
+        } else {
+            engine.prefill_chunk(chunk, pos, want, &cancelled)
+        };
+        match result {
             Ok(Some(l)) => logits = l,
             Ok(None) => {}
             Err(e) if e.code() == ErrorCode::Cancelled => {
@@ -1047,7 +1068,12 @@ fn run_session(
             }
             pause_loop(ctl, spec.per_token_delay)?;
 
-            let Some(token) = sampling::sample(&logits, &sampling_cfg, &mut rng) else {
+            let choice = if device_greedy {
+                next.take().flatten()
+            } else {
+                sampling::sample(&logits, &sampling_cfg, &mut rng)
+            };
+            let Some(token) = choice else {
                 return Err(TuckmillError::new(
                     ErrorCode::WorkerFailed,
                     "sampling produced no token: every logit was non-finite",
@@ -1101,7 +1127,30 @@ fn run_session(
             if i + 1 < req.max_output_tokens {
                 // The generated token i occupies position prompt_len + i.
                 let pos = (prompt_len + i) as usize;
-                match engine.step(token, pos, &cancelled, &mut logits) {
+                let result = match (device_greedy, engine.engine_model()) {
+                    // Pipelined: queue step i+1 (reading step i's choice on
+                    // the device) before waiting for step i, so the host's
+                    // encoding overlaps the GPU's work.
+                    (true, Some(model)) => (|| -> Result<()> {
+                        if cancelled() {
+                            return Err(TuckmillError::new(
+                                ErrorCode::Cancelled,
+                                "generation cancelled at a token boundary",
+                            ));
+                        }
+                        let current = match in_flight.take() {
+                            Some(p) => p,
+                            None => model.submit_greedy(GreedyInput::Token(token))?,
+                        };
+                        if i + 2 < req.max_output_tokens {
+                            in_flight = Some(model.submit_greedy(GreedyInput::Previous(current))?);
+                        }
+                        next = Some(model.collect_greedy(current)?);
+                        Ok(())
+                    })(),
+                    _ => engine.step(token, pos, &cancelled, &mut logits),
+                };
+                match result {
                     Ok(()) => {}
                     Err(e) if e.code() == ErrorCode::Cancelled => {
                         let r = buffer.flush();
@@ -1155,7 +1204,7 @@ enum StepEngine<'a> {
     },
 }
 
-impl StepEngine<'_> {
+impl<'a> StepEngine<'a> {
     /// One decode step into `logits` (reused across steps: the hybrid
     /// engine fills it in place instead of allocating per token).
     fn step(
@@ -1175,6 +1224,42 @@ impl StepEngine<'_> {
             StepEngine::Hybrid { model } => hybrid_step(model, token, pos, cancelled, logits)?,
         }
         Ok(())
+    }
+
+    /// Whether greedy choices can be made on the device (only the 4-byte
+    /// token crosses to the host); identical to the CPU greedy rule.
+    fn device_greedy(&self) -> bool {
+        matches!(self, StepEngine::Hybrid { .. })
+    }
+
+    /// Device-greedy prefill chunk: `Some(choice)` for the final chunk
+    /// (`choice` is `None` when every logit was NaN), `None` otherwise.
+    fn prefill_chunk_greedy(
+        &mut self,
+        tokens: &[u32],
+        start: usize,
+        last: bool,
+        cancelled: &dyn Fn() -> bool,
+    ) -> Result<Option<Option<u32>>> {
+        let StepEngine::Hybrid { model } = self else {
+            return Err(device_greedy_unsupported());
+        };
+        hybrid_chunk_preamble(model, start, cancelled)?;
+        if last {
+            Ok(Some(model.prefill_chunk_greedy(tokens)?))
+        } else {
+            model.prefill_chunk(tokens, false, &mut Vec::new())?;
+            Ok(None)
+        }
+    }
+
+    /// The engine model, when this session runs on the unified engine
+    /// (pipelined greedy decoding talks to it directly).
+    fn engine_model(&self) -> Option<&'a EngineModel> {
+        match self {
+            StepEngine::Hybrid { model } => Some(*model),
+            _ => None,
+        }
     }
 
     /// Process a prefix chunk; logits are produced only when requested
@@ -1202,21 +1287,7 @@ impl StepEngine<'_> {
             // most PREFILL_BATCH tokens; cancellation is honored between
             // chunks.
             StepEngine::Hybrid { model } => {
-                if cancelled() {
-                    return Err(TuckmillError::new(
-                        ErrorCode::Cancelled,
-                        "prefill cancelled at a chunk boundary",
-                    ));
-                }
-                if model.positions() != start {
-                    return Err(TuckmillError::new(
-                        ErrorCode::Internal,
-                        format!(
-                            "qwen35 prefill at position {start} but the session holds {} positions",
-                            model.positions()
-                        ),
-                    ));
-                }
+                hybrid_chunk_preamble(model, start, cancelled)?;
                 let mut logits = Vec::new();
                 model.prefill_chunk(tokens, want_logits, &mut logits)?;
                 Ok(if want_logits { Some(logits) } else { None })
@@ -1228,13 +1299,39 @@ impl StepEngine<'_> {
 /// One in-order hybrid step. Cancellation is honored at every token
 /// boundary; a position that disagrees with the model's own counter is an
 /// internal fault, never silently re-aligned.
-fn hybrid_step(
+fn device_greedy_unsupported() -> TuckmillError {
+    TuckmillError::new(
+        ErrorCode::Internal,
+        "device greedy selection requested on an engine without it",
+    )
+}
+
+/// Chunk-boundary checks shared by the hybrid prefill paths.
+fn hybrid_chunk_preamble(
     model: &EngineModel,
-    token: u32,
-    pos: usize,
+    start: usize,
     cancelled: &dyn Fn() -> bool,
-    logits: &mut Vec<f32>,
 ) -> Result<()> {
+    if cancelled() {
+        return Err(TuckmillError::new(
+            ErrorCode::Cancelled,
+            "prefill cancelled at a chunk boundary",
+        ));
+    }
+    if model.positions() != start {
+        return Err(TuckmillError::new(
+            ErrorCode::Internal,
+            format!(
+                "engine prefill at position {start} but the session holds {} positions",
+                model.positions()
+            ),
+        ));
+    }
+    Ok(())
+}
+
+/// Token-boundary checks shared by the hybrid decode paths.
+fn hybrid_preamble(model: &EngineModel, pos: usize, cancelled: &dyn Fn() -> bool) -> Result<()> {
     if cancelled() {
         return Err(TuckmillError::new(
             ErrorCode::Cancelled,
@@ -1245,11 +1342,22 @@ fn hybrid_step(
         return Err(TuckmillError::new(
             ErrorCode::Internal,
             format!(
-                "qwen35 step at position {pos} but the session holds {} positions",
+                "engine step at position {pos} but the session holds {} positions",
                 model.positions()
             ),
         ));
     }
+    Ok(())
+}
+
+fn hybrid_step(
+    model: &EngineModel,
+    token: u32,
+    pos: usize,
+    cancelled: &dyn Fn() -> bool,
+    logits: &mut Vec<f32>,
+) -> Result<()> {
+    hybrid_preamble(model, pos, cancelled)?;
     model.forward_token(token, logits)
 }
 

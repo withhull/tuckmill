@@ -10,7 +10,7 @@
 //! per-operator profiling.
 
 use tuckmill_manifest::error::{ErrorCode, Result, TuckmillError};
-use tuckmill_metal::{MetalBuffer, MetalContext};
+use tuckmill_metal::{MetalBuffer, MetalContext, ARGMAX_NONE, ARGMAX_PARTIAL_BYTES};
 
 use super::graph::{AttentionSpec, FfnSpec, GatedDeltaNetSpec, MixerSpec, ModelGraph, Tensor};
 use super::WeightSource;
@@ -25,6 +25,41 @@ pub const PREFILL_BATCH: usize = 16;
 /// pooled. Committing a long prompt's chunks unbounded held ~100 MB of it
 /// at once; two keeps the next chunk queued behind the running one.
 const MAX_PREFILL_IN_FLIGHT: usize = 2;
+
+/// A decode step committed without waiting (pipelined greedy decoding):
+/// its chosen token is in `slot` of the token buffer once the first
+/// `commit` command buffers have completed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PendingToken {
+    commit: u64,
+    slot: u32,
+}
+
+/// The input token of a pipelined greedy step.
+#[derive(Debug, Clone, Copy)]
+pub enum GreedyInput {
+    /// A token the host already knows.
+    Token(u32),
+    /// The token a previous step chose, read on the device.
+    Previous(PendingToken),
+}
+
+/// Token-buffer slot a step at `pos` writes; consecutive steps alternate,
+/// so a step never overwrites the slot of the step before it.
+fn token_slot(pos: usize) -> u32 {
+    (pos % 2) as u32
+}
+
+/// What a step or prefill chunk returns for its last position.
+enum Out<'a> {
+    /// Nothing (a non-final prefill chunk).
+    None,
+    /// Full-vocabulary logits, downloaded.
+    Logits(&'a mut Vec<f32>),
+    /// The greedy token chosen on the device (`None`: every logit NaN);
+    /// only 4 bytes cross to the host.
+    Greedy(&'a mut Option<u32>),
+}
 
 /// Stage reported to a traced decode step.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -115,6 +150,25 @@ impl Matrix {
             8 => ctx.q8_0_gemm(&self.buf, x, y, rows, cols, batch, 0, 0),
             other => Err(unsupported_type(other)),
         }
+    }
+
+    /// Embedding lookup of a token id chosen on the device (`ids[slot]`).
+    fn row_indirect(
+        &self,
+        gpu: &Qwen35Gpu,
+        ids: &MetalBuffer,
+        slot: u32,
+        out: &MetalBuffer,
+    ) -> Result<()> {
+        gpu.context().row_indirect_f32(
+            &self.buf,
+            self.type_id,
+            self.out_dim as u32,
+            self.in_dim as u32,
+            ids,
+            slot,
+            out,
+        )
     }
 
     /// Dequantize one row into `out` at `out_off` (embedding lookup).
@@ -919,6 +973,8 @@ pub fn alloc_plan(
     p.scratch_f32(graph.hidden); // x
     p.scratch_f32(graph.hidden); // h
     p.scratch_f32(graph.vocab); // logits
+    p.scratch_f32(ARGMAX_PARTIAL_BYTES / 4); // argmax partials
+    p.scratch_f32(2); // token slots (pipelined greedy)
     PrefillScratch::plan(graph, &mut p);
     Ok(GpuAllocPlan {
         weights: p.weights,
@@ -939,6 +995,9 @@ pub struct EngineModel {
     x: MetalBuffer,
     h: MetalBuffer,
     logits_buf: MetalBuffer,
+    argmax_partial: MetalBuffer,
+    /// Greedy token ids, two alternating slots (see [`token_slot`]).
+    token_ids: MetalBuffer,
     prefill: PrefillScratch,
     capacity: usize,
     positions: std::cell::Cell<usize>,
@@ -990,6 +1049,8 @@ impl EngineModel {
         let x = zeros(&gpu, graph.hidden)?;
         let h = zeros(&gpu, graph.hidden)?;
         let logits_buf = zeros(&gpu, graph.vocab)?;
+        let argmax_partial = zeros(&gpu, ARGMAX_PARTIAL_BYTES / 4)?;
+        let token_ids = zeros(&gpu, 2)?;
         let prefill = PrefillScratch::load(&gpu, &graph)?;
         Ok(Self {
             gpu,
@@ -1000,6 +1061,8 @@ impl EngineModel {
             x,
             h,
             logits_buf,
+            argmax_partial,
+            token_ids,
             prefill,
             capacity,
             graph,
@@ -1051,8 +1114,12 @@ impl EngineModel {
         self.grouped.set(grouped);
     }
 
-    /// Zero every session state and the position counter.
+    /// Zero every session state and the position counter. Waits for any
+    /// in-flight step first (a pipelined step may still be running when a
+    /// request ends at EOS or a stop sequence).
     pub fn reset(&self) -> Result<()> {
+        self.drain()?;
+        self.prefill_in_flight.borrow_mut().clear();
         for layer in &self.layers {
             layer.reset()?;
         }
@@ -1123,7 +1190,23 @@ impl EngineModel {
 
     /// One decode step; full-vocabulary logits for the caller.
     pub fn forward_token(&self, token: u32, logits: &mut Vec<f32>) -> Result<()> {
-        self.step(token, logits, self.grouped.get(), |_, _| Ok(()))
+        self.step(
+            token,
+            Out::Logits(logits),
+            self.grouped.get(),
+            |_, _| Ok(()),
+        )
+    }
+
+    /// One decode step whose next token is chosen on the device with the
+    /// CPU greedy rule (`sampling::argmax`); 4 bytes return instead of the
+    /// logits. `None` means every logit was NaN.
+    pub fn forward_token_greedy(&self, token: u32) -> Result<Option<u32>> {
+        let mut next = None;
+        self.step(token, Out::Greedy(&mut next), self.grouped.get(), |_, _| {
+            Ok(())
+        })?;
+        Ok(next)
     }
 
     /// A decode step with a per-stage callback (verification). Callbacks
@@ -1134,13 +1217,135 @@ impl EngineModel {
         logits: &mut Vec<f32>,
         on_stage: impl FnMut(Stage, &MetalBuffer) -> Result<()>,
     ) -> Result<()> {
-        self.step(token, logits, false, on_stage)
+        self.step(token, Out::Logits(logits), false, on_stage)
+    }
+
+    /// Encode the greedy choice over `logits_buf` into token `slot`
+    /// (inside the open group).
+    fn encode_argmax(&self, slot: u32) -> Result<()> {
+        self.gpu.context().argmax_f32(
+            &self.logits_buf,
+            self.graph.vocab as u32,
+            &self.argmax_partial,
+            &self.token_ids,
+            slot,
+        )
+    }
+
+    fn read_token(&self, slot: u32, completed_target: Option<u64>) -> Result<Option<u32>> {
+        let mut b = [0u8; 4];
+        match completed_target {
+            Some(target) => self
+                .token_ids
+                .download_after(slot as usize * 4, &mut b, target)?,
+            None => self.token_ids.download(slot as usize * 4, &mut b)?,
+        }
+        let id = u32::from_le_bytes(b);
+        Ok((id != ARGMAX_NONE).then_some(id))
+    }
+
+    /// Deliver the output of the step whose last position is `pos`, after
+    /// its command buffer was committed.
+    fn deliver(&self, out: Out<'_>, pos: usize) -> Result<()> {
+        match out {
+            Out::None => Ok(()),
+            Out::Logits(logits) => self.download_logits(logits),
+            Out::Greedy(next) => {
+                *next = self.read_token(token_slot(pos), None)?;
+                Ok(())
+            }
+        }
+    }
+
+    /// Commit one greedy decode step without waiting for it, so the host
+    /// can encode the next step while this one runs. With
+    /// [`GreedyInput::Previous`] the step embeds the token the previous
+    /// step chose on the device; the host learns it later through
+    /// [`Self::collect_greedy`]. Arithmetic is exactly that of
+    /// [`Self::forward_token_greedy`].
+    pub fn submit_greedy(&self, input: GreedyInput) -> Result<PendingToken> {
+        self.ensure_valid()?;
+        let result = (|| {
+            let pos = match input {
+                GreedyInput::Token(t) => self.check_tokens(&[t])?,
+                GreedyInput::Previous(prev) => {
+                    let pos = self.check_tokens(&[])?;
+                    if pos == 0 || prev.slot != token_slot(pos - 1) {
+                        return Err(TuckmillError::new(
+                            ErrorCode::Internal,
+                            "pipelined step does not follow the step it reads",
+                        ));
+                    }
+                    if pos + 1 > self.capacity {
+                        return Err(TuckmillError::new(
+                            ErrorCode::InvalidPlan,
+                            format!(
+                                "token {pos} exceeds the admitted {}-position context",
+                                self.capacity
+                            ),
+                        ));
+                    }
+                    pos
+                }
+            };
+            let (hidden, eps) = (self.graph.hidden, self.graph.eps);
+            let slot = token_slot(pos);
+            let encode = || -> Result<()> {
+                match input {
+                    GreedyInput::Token(t) => self.embedding.row_into(&self.gpu, t, &self.x, 0)?,
+                    GreedyInput::Previous(prev) => self.embedding.row_indirect(
+                        &self.gpu,
+                        &self.token_ids,
+                        prev.slot,
+                        &self.x,
+                    )?,
+                }
+                for layer in &self.layers {
+                    layer.decode(&self.gpu, &self.x, pos as u32, hidden, eps)?;
+                }
+                self.gpu.context().rmsnorm(
+                    &self.x,
+                    &self.final_norm,
+                    &self.h,
+                    1,
+                    hidden as u32,
+                    eps,
+                )?;
+                self.head().gemv(&self.gpu, &self.h, &self.logits_buf)?;
+                self.encode_argmax(slot)
+            };
+            if self.grouped.get() {
+                self.gpu.grouped(encode)?;
+            } else {
+                encode()?;
+            }
+            self.positions.set(pos + 1);
+            Ok(PendingToken {
+                commit: self.gpu.context().committed_dispatches(),
+                slot,
+            })
+        })();
+        if result.is_err() {
+            self.session_valid.set(false);
+        }
+        result
+    }
+
+    /// Wait for a submitted step only (not for later ones) and read its
+    /// greedy token; `None` means every logit was NaN.
+    pub fn collect_greedy(&self, pending: PendingToken) -> Result<Option<u32>> {
+        self.read_token(pending.slot, Some(pending.commit))
+    }
+
+    /// Wait for all submitted work (before a reset or the next session).
+    pub fn drain(&self) -> Result<()> {
+        self.gpu.context().fence()
     }
 
     fn step(
         &self,
         token: u32,
-        logits: &mut Vec<f32>,
+        out: Out<'_>,
         grouped: bool,
         mut on_stage: impl FnMut(Stage, &MetalBuffer) -> Result<()>,
     ) -> Result<()> {
@@ -1148,6 +1353,7 @@ impl EngineModel {
         let result = (|| {
             let pos = self.check_tokens(&[token])?;
             let (hidden, eps) = (self.graph.hidden, self.graph.eps);
+            let greedy = matches!(out, Out::Greedy(_));
             let mut encode = || -> Result<()> {
                 self.embedding.row_into(&self.gpu, token, &self.x, 0)?;
                 on_stage(Stage::Embedding, &self.x)?;
@@ -1163,14 +1369,18 @@ impl EngineModel {
                     hidden as u32,
                     eps,
                 )?;
-                self.head().gemv(&self.gpu, &self.h, &self.logits_buf)
+                self.head().gemv(&self.gpu, &self.h, &self.logits_buf)?;
+                if greedy {
+                    self.encode_argmax(token_slot(pos))?;
+                }
+                Ok(())
             };
             if grouped {
                 self.gpu.grouped(encode)?;
             } else {
                 encode()?;
             }
-            self.download_logits(logits)?;
+            self.deliver(out, pos)?;
             self.positions.set(pos + 1);
             Ok(())
         })();
@@ -1185,6 +1395,23 @@ impl EngineModel {
         want_logits: bool,
         logits: &mut Vec<f32>,
     ) -> Result<()> {
+        let out = if want_logits {
+            Out::Logits(logits)
+        } else {
+            Out::None
+        };
+        self.prefill(tokens, out)
+    }
+
+    /// The final prefill chunk with the first generated token chosen on
+    /// the device (the CPU greedy rule); `None` means every logit was NaN.
+    pub fn prefill_chunk_greedy(&self, tokens: &[u32]) -> Result<Option<u32>> {
+        let mut next = None;
+        self.prefill(tokens, Out::Greedy(&mut next))?;
+        Ok(next)
+    }
+
+    fn prefill(&self, tokens: &[u32], out: Out<'_>) -> Result<()> {
         self.ensure_valid()?;
         let result = (|| {
             let n = tokens.len();
@@ -1196,6 +1423,8 @@ impl EngineModel {
             }
             let pos = self.check_tokens(tokens)?;
             let (hidden, eps) = (self.graph.hidden, self.graph.eps);
+            let want_logits = !matches!(out, Out::None);
+            let greedy = matches!(out, Out::Greedy(_));
             self.bound_prefill_in_flight();
             let s = &self.prefill;
             let encode = || -> Result<()> {
@@ -1211,6 +1440,9 @@ impl EngineModel {
                     ctx.copy_f32(&s.x, ((n - 1) * hidden) as u32, &self.x, 0, hidden as u32)?;
                     ctx.rmsnorm(&self.x, &self.final_norm, &self.h, 1, hidden as u32, eps)?;
                     self.head().gemv(&self.gpu, &self.h, &self.logits_buf)?;
+                    if greedy {
+                        self.encode_argmax(token_slot(pos + n - 1))?;
+                    }
                 }
                 Ok(())
             };
@@ -1221,7 +1453,7 @@ impl EngineModel {
             }
             if want_logits {
                 // The download waits for all committed work.
-                self.download_logits(logits)?;
+                self.deliver(out, pos + n - 1)?;
                 self.prefill_in_flight.borrow_mut().clear();
             } else {
                 // Without logits nothing waits here: the queue orders the
@@ -1921,6 +2153,169 @@ mod oracle_tests {
         assert!(
             worst <= LOGITS_TOL,
             "registered logits tolerance ({worst:.3e})"
+        );
+    }
+}
+
+#[cfg(test)]
+mod greedy_tests {
+    use super::*;
+    use crate::qwen35_forward::{ArtifactTensorSource, TensorSource};
+    use crate::sampling::argmax;
+    use tuckmill_manifest::testing::{synthetic_qwen3_bytes, SyntheticConfig};
+
+    fn gpu_or_skip() -> bool {
+        if tuckmill_metal::probe().available {
+            return true;
+        }
+        assert!(
+            std::env::var("TUCKMILL_REQUIRE_METAL").is_err(),
+            "TUCKMILL_REQUIRE_METAL is set but no Metal device is available"
+        );
+        eprintln!("skipping: no Metal device");
+        false
+    }
+
+    /// Greedy decoding on the device picks exactly what the CPU greedy
+    /// rule picks from the downloaded logits, at the prompt's last chunk
+    /// and at every decode step (each run feeds back its own choice).
+    /// Returns ms/token for (logits path, device greedy, pipelined).
+    fn device_greedy_equals_cpu_greedy(
+        src: &(impl TensorSource + WeightSource),
+        steps: usize,
+    ) -> (f64, f64, f64) {
+        let graph = crate::engine::adapters::qwen35(src.config(), src.layout());
+        let capacity = 64usize;
+        let plan = alloc_plan(&graph, src, capacity).unwrap();
+        let model = EngineModel::load(
+            Qwen35Gpu::open().unwrap(),
+            graph,
+            src,
+            capacity,
+            plan.total(),
+        )
+        .unwrap();
+        assert_eq!(
+            model.allocated_bytes(),
+            plan.total(),
+            "ledger == plan incl. argmax buffers"
+        );
+        let prompt: Vec<u32> = (0..20u32).map(|i| (i * 37 + 5) % 400).collect();
+
+        // CPU rule over downloaded logits.
+        let mut cpu_tokens = Vec::new();
+        let mut logits = Vec::new();
+        for (c, chunk) in prompt.chunks(PREFILL_BATCH).enumerate() {
+            let last = (c + 1) * PREFILL_BATCH >= prompt.len();
+            model.prefill_chunk(chunk, last, &mut logits).unwrap();
+        }
+        let t0 = std::time::Instant::now();
+        for _ in 0..steps {
+            let next = argmax(&logits).expect("finite logits");
+            cpu_tokens.push(next);
+            model.forward_token(next, &mut logits).unwrap();
+        }
+        let cpu_ms = t0.elapsed().as_secs_f64() * 1e3 / steps as f64;
+
+        // Device choice.
+        model.reset().unwrap();
+        let mut dev_tokens = Vec::new();
+        let mut first = None;
+        for (c, chunk) in prompt.chunks(PREFILL_BATCH).enumerate() {
+            let last = (c + 1) * PREFILL_BATCH >= prompt.len();
+            if last {
+                first = model.prefill_chunk_greedy(chunk).unwrap();
+            } else {
+                model.prefill_chunk(chunk, false, &mut Vec::new()).unwrap();
+            }
+        }
+        let mut next = first.expect("finite logits");
+        let t1 = std::time::Instant::now();
+        for _ in 0..steps {
+            dev_tokens.push(next);
+            next = model
+                .forward_token_greedy(next)
+                .unwrap()
+                .expect("finite logits");
+        }
+        let dev_ms = t1.elapsed().as_secs_f64() * 1e3 / steps as f64;
+        assert_eq!(
+            dev_tokens, cpu_tokens,
+            "device greedy == CPU greedy, token for token"
+        );
+
+        // Pipelined: step k+1 is queued (reading step k's choice on the
+        // device) before step k is collected.
+        model.reset().unwrap();
+        let mut first = None;
+        for (c, chunk) in prompt.chunks(PREFILL_BATCH).enumerate() {
+            let last = (c + 1) * PREFILL_BATCH >= prompt.len();
+            if last {
+                first = model.prefill_chunk_greedy(chunk).unwrap();
+            } else {
+                model.prefill_chunk(chunk, false, &mut Vec::new()).unwrap();
+            }
+        }
+        let mut pipe_tokens = vec![first.expect("finite logits")];
+        let t2 = std::time::Instant::now();
+        let mut current = model
+            .submit_greedy(GreedyInput::Token(pipe_tokens[0]))
+            .unwrap();
+        while pipe_tokens.len() < steps {
+            let following = if pipe_tokens.len() + 1 < steps {
+                Some(model.submit_greedy(GreedyInput::Previous(current)).unwrap())
+            } else {
+                None
+            };
+            pipe_tokens.push(model.collect_greedy(current).unwrap().expect("finite"));
+            match following {
+                Some(f) => current = f,
+                None => break,
+            }
+        }
+        let pipe_ms = t2.elapsed().as_secs_f64() * 1e3 / (steps - 1) as f64;
+        assert_eq!(
+            pipe_tokens, cpu_tokens,
+            "pipelined greedy == CPU greedy, token for token"
+        );
+        model.reset().unwrap();
+        (cpu_ms, dev_ms, pipe_ms)
+    }
+
+    #[test]
+    fn device_greedy_equals_cpu_greedy_on_the_fixture() {
+        if !gpu_or_skip() {
+            return;
+        }
+        let bytes = synthetic_qwen3_bytes(&SyntheticConfig::tiny_qwen35());
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("q35.gguf");
+        std::fs::write(&path, &bytes).unwrap();
+        device_greedy_equals_cpu_greedy(&ArtifactTensorSource::open(&path).unwrap(), 24);
+    }
+
+    /// Machine-local (TUCKMILL_QWEN35_GGUF): the same equality on the
+    /// pinned artifact, with per-token time for both paths.
+    #[test]
+    fn device_greedy_equals_cpu_greedy_on_the_pinned_artifact() {
+        let Some(path) = std::env::var("TUCKMILL_QWEN35_GGUF")
+            .ok()
+            .map(std::path::PathBuf::from)
+            .filter(|p| p.exists())
+        else {
+            eprintln!("skipping: TUCKMILL_QWEN35_GGUF not set");
+            return;
+        };
+        if !gpu_or_skip() {
+            return;
+        }
+        let (cpu_ms, dev_ms, pipe_ms) =
+            device_greedy_equals_cpu_greedy(&ArtifactTensorSource::open(&path).unwrap(), 40);
+        eprintln!(
+            "greedy decode: logits + CPU argmax {cpu_ms:.2} ms/token ({:.1} tok/s), device argmax {dev_ms:.2} ({:.1} tok/s), pipelined {pipe_ms:.2} ({:.1} tok/s)",
+            1e3 / cpu_ms,
+            1e3 / dev_ms,
+            1e3 / pipe_ms
         );
     }
 }

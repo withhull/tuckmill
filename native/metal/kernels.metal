@@ -132,6 +132,142 @@ kernel void tm_copy_f32(device const float *src [[buffer(0)]],
     dst[dst_off + gid] = src[src_off + gid];
 }
 
+/*
+ * Greedy argmax over f32 logits, exactly the CPU rule
+ * (`tuckmill_backend::sampling::argmax`): NaN entries are skipped, the
+ * largest value wins, and ties go to the lowest index. That order is
+ * associative, so the two-pass parallel reduction returns the sequential
+ * answer. TM_ARGMAX_NONE means every entry was NaN.
+ */
+#define TM_ARGMAX_NONE 0xFFFFFFFFu
+#define TM_ARGMAX_GROUPS 64u
+#define TM_ARGMAX_THREADS 256u
+
+inline bool tm_argmax_better(float av, uint ai, float bv, uint bi) {
+    if (ai == TM_ARGMAX_NONE) {
+        return false;
+    }
+    if (bi == TM_ARGMAX_NONE) {
+        return true;
+    }
+    return av > bv || (av == bv && ai < bi);
+}
+
+inline void tm_argmax_simd(thread float &v, thread uint &i) {
+    for (ushort off = 16; off > 0; off >>= 1) {
+        const float ov = simd_shuffle_down(v, off);
+        const uint oi = simd_shuffle_down(i, off);
+        if (tm_argmax_better(ov, oi, v, i)) {
+            v = ov;
+            i = oi;
+        }
+    }
+}
+
+inline void tm_argmax_threadgroup(thread float &v, thread uint &i,
+                                  threadgroup float *tv, threadgroup uint *ti,
+                                  uint lane, uint sg) {
+    tm_argmax_simd(v, i);
+    if (lane == 0u) {
+        tv[sg] = v;
+        ti[sg] = i;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (sg == 0u) {
+        v = lane < TM_ARGMAX_THREADS / 32u ? tv[lane] : -INFINITY;
+        i = lane < TM_ARGMAX_THREADS / 32u ? ti[lane] : TM_ARGMAX_NONE;
+        tm_argmax_simd(v, i);
+    }
+}
+
+/* Pass 1: each of TM_ARGMAX_GROUPS threadgroups reduces a strided slice. */
+kernel void tm_argmax_partial(device const float *x [[buffer(0)]],
+                              device float *part_v [[buffer(1)]],
+                              device uint *part_i [[buffer(2)]],
+                              constant uint &n [[buffer(3)]],
+                              uint tg [[threadgroup_position_in_grid]],
+                              uint tid [[thread_position_in_threadgroup]],
+                              uint lane [[thread_index_in_simdgroup]],
+                              uint sg [[simdgroup_index_in_threadgroup]]) {
+    threadgroup float tv[TM_ARGMAX_THREADS / 32u];
+    threadgroup uint ti[TM_ARGMAX_THREADS / 32u];
+    float v = -INFINITY;
+    uint i = TM_ARGMAX_NONE;
+    for (uint k = tg * TM_ARGMAX_THREADS + tid; k < n; k += TM_ARGMAX_GROUPS * TM_ARGMAX_THREADS) {
+        const float xv = x[k];
+        if (!isnan(xv) && tm_argmax_better(xv, k, v, i)) {
+            v = xv;
+            i = k;
+        }
+    }
+    tm_argmax_threadgroup(v, i, tv, ti, lane, sg);
+    if (tid == 0u) {
+        part_v[tg] = v;
+        part_i[tg] = i;
+    }
+}
+
+/* Pass 2: one threadgroup reduces the partials into out[out_index]. */
+kernel void tm_argmax_final(device const float *part_v [[buffer(0)]],
+                            device const uint *part_i [[buffer(1)]],
+                            device uint *out [[buffer(2)]],
+                            constant uint &out_index [[buffer(3)]],
+                            uint tid [[thread_position_in_threadgroup]],
+                            uint lane [[thread_index_in_simdgroup]],
+                            uint sg [[simdgroup_index_in_threadgroup]]) {
+    threadgroup float tv[TM_ARGMAX_THREADS / 32u];
+    threadgroup uint ti[TM_ARGMAX_THREADS / 32u];
+    float v = tid < TM_ARGMAX_GROUPS ? part_v[tid] : -INFINITY;
+    uint i = tid < TM_ARGMAX_GROUPS ? part_i[tid] : TM_ARGMAX_NONE;
+    tm_argmax_threadgroup(v, i, tv, ti, lane, sg);
+    if (tid == 0u) {
+        out[out_index] = i;
+    }
+}
+
+/*
+ * Embedding lookup whose row is a token id produced on the device
+ * (ids[slot], written by tm_argmax_final), so the host can encode the next
+ * decode step before it has read the token. An id outside the table (the
+ * all-NaN marker) writes zeros; the host fails that request when it reads
+ * the marker, so the row is never used.
+ */
+kernel void tm_q8_0_row_indirect_f32(device const uchar *w [[buffer(0)]],
+                                     device float *out [[buffer(1)]],
+                                     device const uint *ids [[buffer(2)]],
+                                     constant uint &slot [[buffer(3)]],
+                                     constant uint &rows [[buffer(4)]],
+                                     constant uint &cols [[buffer(5)]],
+                                     uint gid [[thread_position_in_grid]]) {
+    if (gid >= cols) {
+        return;
+    }
+    const uint row = ids[slot];
+    if (row >= rows) {
+        out[gid] = 0.0f;
+        return;
+    }
+    const uint blocks = cols / 32u;
+    const device uchar *blk = w + ((size_t)row * (size_t)blocks + gid / 32u) * 34u;
+    const float d = (float)(*(const device half *)blk);
+    const float q = (float)((const device char *)(blk + 2))[gid % 32u];
+    out[gid] = d * q;
+}
+
+kernel void tm_f16_row_indirect_f32(device const half *w [[buffer(0)]],
+                                    device float *out [[buffer(1)]],
+                                    device const uint *ids [[buffer(2)]],
+                                    constant uint &slot [[buffer(3)]],
+                                    constant uint &rows [[buffer(4)]],
+                                    constant uint &cols [[buffer(5)]],
+                                    uint gid [[thread_position_in_grid]]) {
+    if (gid >= cols) {
+        return;
+    }
+    const uint row = ids[slot];
+    out[gid] = row < rows ? (float)w[(size_t)row * (size_t)cols + gid] : 0.0f;
+}
+
 /* ---------------- C2: transformer operation kernels ---------------- */
 
 /* Dequantize one Q8_0 matrix row (or embedding row) to f32:

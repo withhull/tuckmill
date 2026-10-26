@@ -1665,3 +1665,111 @@ fn q8_0_gemm_mma_matches_the_cpu_reference_within_tolerance() {
         "batch above 16 refused"
     );
 }
+
+#[test]
+fn argmax_matches_the_cpu_greedy_rule_exactly() {
+    let Some(ctx) = metal_context() else {
+        return;
+    };
+    // The CPU rule (tuckmill_backend::sampling::argmax), restated here so
+    // the metal crate keeps no backend dependency: NaN skipped, strict >,
+    // so ties go to the lowest index.
+    fn cpu(x: &[f32]) -> u32 {
+        let mut best: Option<(usize, f32)> = None;
+        for (i, v) in x.iter().enumerate() {
+            if v.is_nan() {
+                continue;
+            }
+            match best {
+                None => best = Some((i, *v)),
+                Some((_, bv)) if *v > bv => best = Some((i, *v)),
+                _ => {}
+            }
+        }
+        best.map(|(i, _)| i as u32).unwrap_or(ARGMAX_NONE)
+    }
+    let mut rng = Rng(0xA11CE);
+    let mut cases: Vec<Vec<f32>> = vec![
+        vec![1.0, 3.0, 2.0],
+        vec![3.0, 3.0],
+        vec![f32::NAN, 1.0],
+        vec![f32::NAN, f32::INFINITY],
+        vec![f32::NAN, f32::NAN, f32::NAN],
+        vec![f32::NEG_INFINITY, f32::NEG_INFINITY],
+        vec![-0.0, 0.0],
+        vec![0.0, -0.0],
+        vec![7.5],
+    ];
+    // Vocabulary-sized random logits with the maximum planted several
+    // times across different threadgroup slices (ties resolve low).
+    let n = 248_320usize;
+    let mut big: Vec<f32> = (0..n)
+        .map(|_| ((rng.next() >> 40) as f32 / (1u64 << 24) as f32) * 20.0 - 10.0)
+        .collect();
+    for k in [200_000usize, 77_777, 131_071, 77_776] {
+        big[k] = 42.0;
+    }
+    big[5] = f32::NAN;
+    cases.push(big);
+    // Sizes around the partial/thread geometry, ties at the far end.
+    for len in [255usize, 256, 16_384, 16_385, 70_001] {
+        let mut v = vec![1.0f32; len];
+        v[len - 1] = 2.0;
+        v[len / 2] = 2.0;
+        cases.push(v);
+    }
+    let partial = ctx.buffer(ARGMAX_PARTIAL_BYTES, true).unwrap();
+    let out = ctx.buffer(4, true).unwrap();
+    for (c, x) in cases.iter().enumerate() {
+        let xb = ctx.buffer(x.len() * 4, true).unwrap();
+        xb.upload(0, &f32_bytes(x)).unwrap();
+        ctx.argmax_f32(&xb, x.len() as u32, &partial, &out, 0)
+            .unwrap();
+        ctx.fence().unwrap();
+        let mut b = [0u8; 4];
+        out.download(0, &mut b).unwrap();
+        assert_eq!(u32::from_le_bytes(b), cpu(x), "case {c} (len {})", x.len());
+    }
+    let empty = ctx.buffer(4, true).unwrap();
+    assert!(
+        ctx.argmax_f32(&empty, 0, &partial, &out, 0).is_err(),
+        "empty input refused"
+    );
+    assert!(
+        ctx.argmax_f32(&empty, 1, &partial, &out, 1).is_err(),
+        "out_index past the buffer refused"
+    );
+
+    // The indirect embedding lookup reads the row id the argmax wrote.
+    let (rows, cols) = (7usize, 64usize);
+    let w = boundary_weights(rows, cols, 21);
+    let wb = ctx.buffer(w.len(), true).unwrap();
+    wb.upload(0, &w).unwrap();
+    let ids = ctx.buffer(8, true).unwrap();
+    let row_out = ctx.buffer(cols * 4, true).unwrap();
+    for (slot, id) in [(0u32, 3u32), (1, 6), (1, ARGMAX_NONE)] {
+        ids.upload(slot as usize * 4, &id.to_le_bytes()).unwrap();
+        ctx.row_indirect_f32(&wb, 8, rows as u32, cols as u32, &ids, slot, &row_out)
+            .unwrap();
+        ctx.fence().unwrap();
+        let mut b = vec![0u8; cols * 4];
+        row_out.download(0, &mut b).unwrap();
+        let got: Vec<f32> = b
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect();
+        let want: Vec<f32> = if id == ARGMAX_NONE {
+            vec![0.0; cols]
+        } else {
+            let blocks = cols / 32;
+            (0..cols)
+                .map(|c| {
+                    let blk = &w[(id as usize * blocks + c / 32) * 34..];
+                    let d = f16_bits_to_f32(u16::from_le_bytes([blk[0], blk[1]]));
+                    d * blk[2 + c % 32] as i8 as f32
+                })
+                .collect()
+        };
+        assert_eq!(got, want, "slot {slot} id {id}");
+    }
+}
