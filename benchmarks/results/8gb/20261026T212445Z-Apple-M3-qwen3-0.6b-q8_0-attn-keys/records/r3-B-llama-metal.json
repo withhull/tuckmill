@@ -1,0 +1,95 @@
+{
+  "schema_version": 5,
+  "run_id": "f6853b59a4f1cb9bccd02721b0cd800c8ebccc11b894fab15c6bb57bb37bd221",
+  "started_unix_ms": 1793049905899,
+  "device_id": "1cfd5641918ec8d210df96e13c6865e985a88048db7f7caed756df36531dab4b",
+  "artifact_id": "1d34ec7c7c72eadd79d69994a74ace42cb36025c539925a70ab3515b23d756f9",
+  "plan_id": "b327595d52913ffb3350beca4c6cfb2bb86cc46f1e318d7debcb1ee2a1ea262b",
+  "engine": {
+    "engine": "llama.cpp",
+    "certified": false,
+    "backend_abi_version": 1,
+    "worker_protocol_version": 7,
+    "kernels": [
+      "llama.cpp:ngl=99:metal"
+    ],
+    "build_id": "tuckmill 0.2.0 (release)"
+  },
+  "workload": {
+    "suite": "standard-v1",
+    "input_tokens": 512,
+    "output_tokens": 256,
+    "repetitions": 3,
+    "prompt_set": "frozen-synthetic-ids"
+  },
+  "cache_state": "cache-uncontrolled",
+  "samples": [
+    {
+      "prompt_id": "std-512-256-r0",
+      "ttft_ms": 449.273459,
+      "committed_tokens": 1,
+      "generated_tokens": 2,
+      "visible_chunks": 1,
+      "total_ms": 459.957875,
+      "gap_p95_ms": 0.0,
+      "gap_max_ms": 0.0,
+      "footprint_peak_bytes": 389613128,
+      "logical_read_bytes": 0,
+      "throughput_decode_tps": 96.63859090110945,
+      "worker_total_ms": 114.423333,
+      "worker_decode_ms": 10.347833,
+      "notes": []
+    },
+    {
+      "prompt_id": "std-512-256-r1",
+      "ttft_ms": 207.527,
+      "committed_tokens": 1,
+      "generated_tokens": 2,
+      "visible_chunks": 1,
+      "total_ms": 217.89429199999998,
+      "gap_p95_ms": 0.0,
+      "gap_max_ms": 0.0,
+      "footprint_peak_bytes": 391497288,
+      "logical_read_bytes": 0,
+      "throughput_decode_tps": 99.73570039395601,
+      "worker_total_ms": 113.940209,
+      "worker_decode_ms": 10.0265,
+      "notes": []
+    },
+    {
+      "prompt_id": "std-512-256-r2",
+      "ttft_ms": 207.361083,
+      "committed_tokens": 0,
+      "generated_tokens": 1,
+      "visible_chunks": 0,
+      "total_ms": 207.361083,
+      "gap_p95_ms": 0.0,
+      "gap_max_ms": 0.0,
+      "footprint_peak_bytes": 391530056,
+      "logical_read_bytes": 0,
+      "worker_total_ms": 104.160667,
+      "notes": []
+    }
+  ],
+  "summary": {
+    "ttft_median_ms": 207.527,
+    "ttft_p95_ms": 449.273459,
+    "throughput_median_tps": 4.8225056772104145,
+    "throughput_decode_median_tps": 99.73570039395601,
+    "gap_p95_ms": 0.0,
+    "completion_rate": 1.0,
+    "footprint_peak_bytes": 391530056
+  },
+  "performance_class": "patient_local",
+  "confidence": "estimated",
+  "slow_mode_accepted": false,
+  "caveats": [
+    "suite standard-v1 frozen: frozen workload definition; prompts are synthetic token-id sets derived deterministically from prompt ids, so no private user prompts are collected; standard measurement shape: 512 input / 256 output tokens with exact recorded prompt ids and cache conditions; cache labels are explicit: cold-declared, warm, prefix-hit, or cache-uncontrolled; a first run is not automatically a cold-storage run; reference inputs are compared only through the four-way identity in PRD section 20.1 (R0/R1/T0/T1); draft tokens are never reported as final throughput",
+    "all throughput figures count model tokens from the worker's Done frame: throughput_median_tps is end-to-end (generated tokens / total request time, including TTFT) and throughput_decode_median_tps is (generated - 1) over the worker's first-to-last sampled-token span; ttft_ms, visible_chunks, and the gap percentiles describe the visible stream (user experience), not token production",
+    "experimental backend llama.cpp: uncertified kernels; real weights executed, performance and quality unmeasured",
+    "logical read traffic is measured weight bytes read via positioned reads; not physical SSD counters",
+    "footprint sampled from proc_pid_rusage at ~50ms cadence",
+    "cold-start and warm-cache are separate labels; this run's cache state is declared explicitly",
+    "cache state was not controlled or established; treated as uncontrolled"
+  ]
+}

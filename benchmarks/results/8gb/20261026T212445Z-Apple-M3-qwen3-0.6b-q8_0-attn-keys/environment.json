@@ -1,0 +1,18 @@
+{
+  "schema": "tuckmill-baseline-env-v1",
+  "started_utc": "20261026T212445Z",
+  "tier": "8gb",
+  "chip": "Apple M3",
+  "memory_bytes": 8589934592,
+  "macos": "27.0.1 (26A434)",
+  "power_source": "AC Power",
+  "tuckmill_commit": "4b7d2ae2702ed2e689dffd74b89af2aa1d090ddf",
+  "tuckmill_tree_dirty": false,
+  "llama_cpp": "b11695 (pinned, scripts/fetch-llama.sh)",
+  "artifact": "Qwen3-0.6B-Q8_0.gguf",
+  "artifact_bytes": 639446688,
+  "artifact_sha256": "9465e63a22add5354d9bb4b99e90117043c7124007664907259bd16d043bb031",
+  "memory_budget": "planner default",
+  "kv_precision": "f16",
+  "shape": {"input": 512, "output": 256, "repetitions": 3, "context": 2048, "rounds": 3}
+}
