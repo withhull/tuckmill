@@ -46,6 +46,14 @@ struct tm_metal_ctx {
     id<MTLComputePipelineState> pso_argmax_partial;
     id<MTLComputePipelineState> pso_argmax_final;
     id<MTLComputePipelineState> pso_q8row_indirect;
+    id<MTLComputePipelineState> pso_q35_conv_chunk;
+    id<MTLComputePipelineState> pso_q35_conv_chunk_shift;
+    id<MTLComputePipelineState> pso_q35_split_qkv_chunk;
+    id<MTLComputePipelineState> pso_q35_beta_decay_chunk;
+    id<MTLComputePipelineState> pso_q35_gdn_chunk;
+    id<MTLComputePipelineState> pso_q35_rope_chunk;
+    id<MTLComputePipelineState> pso_q35_kv_store_chunk;
+    id<MTLComputePipelineState> pso_q35_attention_chunk;
     id<MTLComputePipelineState> pso_f16row_indirect;
     id<MTLComputePipelineState> pso_f16f32;
     id<MTLComputePipelineState> pso_f32f16;
@@ -322,6 +330,14 @@ tm_metal_ctx *tm_metal_create(const char *msl_source, char *err, size_t err_cap)
         ctx->pso_argmax_partial = tm_pipeline(ctx, @"tm_argmax_partial", &error);
         ctx->pso_argmax_final = tm_pipeline(ctx, @"tm_argmax_final", &error);
         ctx->pso_q8row_indirect = tm_pipeline(ctx, @"tm_q8_0_row_indirect_f32", &error);
+        ctx->pso_q35_conv_chunk = tm_pipeline(ctx, @"tm_qwen35_conv_chunk", &error);
+        ctx->pso_q35_conv_chunk_shift = tm_pipeline(ctx, @"tm_qwen35_conv_chunk_shift", &error);
+        ctx->pso_q35_split_qkv_chunk = tm_pipeline(ctx, @"tm_qwen35_split_qkv_chunk", &error);
+        ctx->pso_q35_beta_decay_chunk = tm_pipeline(ctx, @"tm_qwen35_beta_decay_chunk", &error);
+        ctx->pso_q35_gdn_chunk = tm_pipeline(ctx, @"tm_qwen35_gdn_chunk", &error);
+        ctx->pso_q35_rope_chunk = tm_pipeline(ctx, @"tm_qwen35_rope_partial_chunk", &error);
+        ctx->pso_q35_kv_store_chunk = tm_pipeline(ctx, @"tm_qwen35_kv_store_f16_chunk", &error);
+        ctx->pso_q35_attention_chunk = tm_pipeline(ctx, @"tm_qwen35_attention_f16_chunk", &error);
         ctx->pso_f16row_indirect = tm_pipeline(ctx, @"tm_f16_row_indirect_f32", &error);
         ctx->pso_f16f32 = tm_pipeline(ctx, @"tm_cast_f16_f32", &error);
         ctx->pso_f32f16 = tm_pipeline(ctx, @"tm_cast_f32_f16", &error);
@@ -357,6 +373,10 @@ tm_metal_ctx *tm_metal_create(const char *msl_source, char *err, size_t err_cap)
         if (ctx->pso_scale == nil || ctx->pso_axpy == nil || ctx->pso_copy == nil ||
             ctx->pso_argmax_partial == nil || ctx->pso_argmax_final == nil ||
             ctx->pso_q8row_indirect == nil || ctx->pso_f16row_indirect == nil ||
+            ctx->pso_q35_conv_chunk == nil || ctx->pso_q35_conv_chunk_shift == nil ||
+            ctx->pso_q35_split_qkv_chunk == nil || ctx->pso_q35_beta_decay_chunk == nil ||
+            ctx->pso_q35_gdn_chunk == nil || ctx->pso_q35_rope_chunk == nil ||
+            ctx->pso_q35_kv_store_chunk == nil || ctx->pso_q35_attention_chunk == nil ||
             ctx->pso_f16f32 == nil ||
             ctx->pso_f32f16 == nil || ctx->pso_q8gemv == nil || ctx->pso_f16gemv == nil ||
             ctx->pso_q8row == nil || ctx->pso_rmsnorm == nil || ctx->pso_rope == nil ||
@@ -440,6 +460,14 @@ void tm_metal_destroy(tm_metal_ctx *ctx) {
         [ctx->pso_argmax_partial release];
         [ctx->pso_argmax_final release];
         [ctx->pso_q8row_indirect release];
+        [ctx->pso_q35_conv_chunk release];
+        [ctx->pso_q35_conv_chunk_shift release];
+        [ctx->pso_q35_split_qkv_chunk release];
+        [ctx->pso_q35_beta_decay_chunk release];
+        [ctx->pso_q35_gdn_chunk release];
+        [ctx->pso_q35_rope_chunk release];
+        [ctx->pso_q35_kv_store_chunk release];
+        [ctx->pso_q35_attention_chunk release];
         [ctx->pso_f16row_indirect release];
         [ctx->pso_scale release];
         [ctx->library release];
@@ -2188,3 +2216,222 @@ int tm_metal_buffer_zero(tm_metal_ctx *ctx, tm_metal_buffer *buffer, size_t off,
         return TM_METAL_OK;
     }
 }
+
+/* ---- chunk-wide Gated DeltaNet core (engine prefill) ---- */
+
+typedef struct {
+    tm_metal_buffer *buf;
+    size_t need; /* bytes the kernel may touch */
+    const char *name;
+} tm_arg_buffer;
+
+/* Encode one compute dispatch over checked buffers and 32-bit constants. */
+static int tm_dispatch_args(tm_metal_ctx *ctx, id<MTLComputePipelineState> pso,
+                            const tm_arg_buffer *bufs, int nbufs, const uint32_t *consts,
+                            int nconsts, MTLSize grid, MTLSize group, char *err,
+                            size_t err_cap, const char *what) {
+    if (tm_check_ctx(ctx, err, err_cap, what) != TM_METAL_OK) {
+        return TM_METAL_ERR_UNSUPPORTED;
+    }
+    for (int i = 0; i < nbufs; ++i) {
+        if (tm_check_buffer(ctx, bufs[i].buf, bufs[i].need, err, err_cap, bufs[i].name) !=
+            TM_METAL_OK) {
+            return TM_METAL_ERR_BOUNDS;
+        }
+    }
+    @autoreleasepool {
+        tm_frame f;
+        id<MTLComputeCommandEncoder> enc = tm_frame_open(ctx, &f);
+        if (enc == nil) {
+            return tm_fail(err, err_cap, TM_METAL_ERR_INTERNAL,
+                           [NSString stringWithFormat:@"%s: no encoder", what]);
+        }
+        [enc setComputePipelineState:pso];
+        for (int i = 0; i < nbufs; ++i) {
+            [enc setBuffer:bufs[i].buf->buffer offset:0 atIndex:(NSUInteger)i];
+            [f.keep addObject:bufs[i].buf->buffer];
+        }
+        for (int i = 0; i < nconsts; ++i) {
+            [enc setBytes:&consts[i] length:sizeof(uint32_t) atIndex:(NSUInteger)(nbufs + i)];
+        }
+        [enc dispatchThreads:grid threadsPerThreadgroup:group];
+        return tm_frame_commit(ctx, &f, err, err_cap, what);
+    }
+}
+
+int tm_metal_qwen35_conv_chunk(tm_metal_ctx *ctx, tm_metal_buffer *hist, tm_metal_buffer *x,
+                               tm_metal_buffer *w, tm_metal_buffer *y, uint32_t channels,
+                               uint32_t kern, uint32_t n, char *err, size_t err_cap) {
+    if (channels == 0 || kern < 2 || n == 0) {
+        return tm_fail(err, err_cap, TM_METAL_ERR_UNSUPPORTED,
+                       @"qwen35_conv_chunk: channels, n must be positive and kernel >= 2");
+    }
+    size_t row = (size_t)channels * 4u;
+    tm_arg_buffer bufs[4] = {
+        {hist, (size_t)(kern - 1u) * row, "conv_chunk.hist"},
+        {x, (size_t)n * row, "conv_chunk.x"},
+        {w, (size_t)channels * kern * 4u, "conv_chunk.w"},
+        {y, (size_t)n * row, "conv_chunk.y"},
+    };
+    uint32_t consts[3] = {channels, kern, n};
+    int rc = tm_dispatch_args(ctx, ctx->pso_q35_conv_chunk, bufs, 4, consts, 3,
+                              MTLSizeMake(channels, n, 1), MTLSizeMake(64, 1, 1), err, err_cap,
+                              "qwen35_conv_chunk");
+    if (rc != TM_METAL_OK) {
+        return rc;
+    }
+    /* History refresh after every output of the chunk was computed (the
+     * queue/encoder orders the two dispatches). */
+    tm_arg_buffer sbufs[2] = {
+        {hist, (size_t)(kern - 1u) * row, "conv_chunk.hist"},
+        {x, (size_t)n * row, "conv_chunk.x"},
+    };
+    return tm_dispatch_args(ctx, ctx->pso_q35_conv_chunk_shift, sbufs, 2, consts, 3,
+                            MTLSizeMake(channels, 1, 1), MTLSizeMake(64, 1, 1), err, err_cap,
+                            "qwen35_conv_chunk_shift");
+}
+
+int tm_metal_qwen35_split_qkv_chunk(tm_metal_ctx *ctx, tm_metal_buffer *y, tm_metal_buffer *q,
+                                    tm_metal_buffer *k, tm_metal_buffer *v, uint32_t width,
+                                    uint32_t n, char *err, size_t err_cap) {
+    if (width == 0 || n == 0) {
+        return tm_fail(err, err_cap, TM_METAL_ERR_UNSUPPORTED,
+                       @"qwen35_split_qkv_chunk: width and n must be positive");
+    }
+    size_t out = (size_t)n * width * 4u;
+    tm_arg_buffer bufs[4] = {
+        {y, 3u * out, "split_chunk.y"},
+        {q, out, "split_chunk.q"},
+        {k, out, "split_chunk.k"},
+        {v, out, "split_chunk.v"},
+    };
+    uint32_t consts[2] = {width, n};
+    return tm_dispatch_args(ctx, ctx->pso_q35_split_qkv_chunk, bufs, 4, consts, 2,
+                            MTLSizeMake(width, n, 1), MTLSizeMake(64, 1, 1), err, err_cap,
+                            "qwen35_split_qkv_chunk");
+}
+
+int tm_metal_qwen35_beta_decay_chunk(tm_metal_ctx *ctx, tm_metal_buffer *raw_beta,
+                                     tm_metal_buffer *alpha, tm_metal_buffer *dt_bias,
+                                     tm_metal_buffer *ssm_a, tm_metal_buffer *beta_out,
+                                     tm_metal_buffer *gate_out, uint32_t per, uint32_t n,
+                                     char *err, size_t err_cap) {
+    if (per == 0 || n == 0) {
+        return tm_fail(err, err_cap, TM_METAL_ERR_UNSUPPORTED,
+                       @"qwen35_beta_decay_chunk: per and n must be positive");
+    }
+    uint32_t total = per * n;
+    size_t rows = (size_t)total * 4u;
+    tm_arg_buffer bufs[6] = {
+        {raw_beta, rows, "beta_chunk.raw_beta"}, {alpha, rows, "beta_chunk.alpha"},
+        {dt_bias, (size_t)per * 4u, "beta_chunk.dt_bias"}, {ssm_a, (size_t)per * 4u, "beta_chunk.ssm_a"},
+        {beta_out, rows, "beta_chunk.beta_out"}, {gate_out, rows, "beta_chunk.gate_out"},
+    };
+    uint32_t consts[2] = {total, per};
+    return tm_dispatch_args(ctx, ctx->pso_q35_beta_decay_chunk, bufs, 6, consts, 2,
+                            MTLSizeMake(total, 1, 1), MTLSizeMake(64, 1, 1), err, err_cap,
+                            "qwen35_beta_decay_chunk");
+}
+
+int tm_metal_qwen35_gdn_chunk(tm_metal_ctx *ctx, tm_metal_buffer *q, tm_metal_buffer *k,
+                              tm_metal_buffer *v, tm_metal_buffer *gate, tm_metal_buffer *beta,
+                              tm_metal_buffer *state, tm_metal_buffer *out, uint32_t heads,
+                              uint32_t k_dim, uint32_t v_dim, float q_scale, uint32_t n,
+                              uint32_t qk_stride, uint32_t v_stride, uint32_t g_stride,
+                              char *err, size_t err_cap) {
+    if (heads == 0 || k_dim == 0 || v_dim == 0 || n == 0 || qk_stride < heads * k_dim ||
+        v_stride < heads * v_dim || g_stride < heads) {
+        return tm_fail(err, err_cap, TM_METAL_ERR_UNSUPPORTED,
+                       @"qwen35_gdn_chunk: invalid geometry or strides");
+    }
+    tm_arg_buffer bufs[7] = {
+        {q, (size_t)n * qk_stride * 4u, "gdn_chunk.q"},
+        {k, (size_t)n * qk_stride * 4u, "gdn_chunk.k"},
+        {v, (size_t)n * v_stride * 4u, "gdn_chunk.v"},
+        {gate, (size_t)n * g_stride * 4u, "gdn_chunk.gate"},
+        {beta, (size_t)n * g_stride * 4u, "gdn_chunk.beta"},
+        {state, (size_t)heads * k_dim * v_dim * 4u, "gdn_chunk.state"},
+        {out, (size_t)n * v_stride * 4u, "gdn_chunk.out"},
+    };
+    /* Constants by buffer index: 7 k_dim, 8 v_dim, 9 q_scale (f32 bits),
+     * 10 heads, 11 n, 12-14 strides. */
+    uint32_t scale_bits;
+    memcpy(&scale_bits, &q_scale, sizeof scale_bits);
+    uint32_t consts[8] = {k_dim, v_dim, scale_bits, heads, n, qk_stride, v_stride, g_stride};
+    NSUInteger tg = v_dim < 32u ? v_dim : 32u;
+    return tm_dispatch_args(ctx, ctx->pso_q35_gdn_chunk, bufs, 7, consts, 8,
+                            MTLSizeMake(v_dim, heads, 1), MTLSizeMake(tg, 1, 1), err, err_cap,
+                            "qwen35_gdn_chunk");
+}
+
+/* ---- chunk-wide gated attention core (engine prefill) ---- */
+
+int tm_metal_qwen35_rope_partial_chunk(tm_metal_ctx *ctx, tm_metal_buffer *q, tm_metal_buffer *k,
+                                       tm_metal_buffer *inv_freq, uint32_t pos0,
+                                       uint32_t n_q_heads, uint32_t n_kv_heads,
+                                       uint32_t head_dim, uint32_t n_rot, uint32_t n, char *err,
+                                       size_t err_cap) {
+    if (n == 0 || head_dim == 0 || n_rot == 0 || n_rot > head_dim || (n_rot % 2u) != 0u ||
+        n_rot / 2u > 128u) {
+        return tm_fail(err, err_cap, TM_METAL_ERR_UNSUPPORTED,
+                       @"qwen35_rope_partial_chunk: invalid geometry");
+    }
+    tm_arg_buffer bufs[3] = {
+        {q, (size_t)n * n_q_heads * head_dim * 4u, "rope_chunk.q"},
+        {k, (size_t)n * n_kv_heads * head_dim * 4u, "rope_chunk.k"},
+        {inv_freq, (size_t)(n_rot / 2u) * 4u, "rope_chunk.inv_freq"},
+    };
+    uint32_t consts[5] = {pos0, n_q_heads, n_kv_heads, head_dim, n_rot};
+    return tm_dispatch_args(ctx, ctx->pso_q35_rope_chunk, bufs, 3, consts, 5,
+                            MTLSizeMake((NSUInteger)(n_q_heads + n_kv_heads) * 128u, n, 1),
+                            MTLSizeMake(128, 1, 1), err, err_cap, "qwen35_rope_partial_chunk");
+}
+
+int tm_metal_qwen35_kv_store_f16_chunk(tm_metal_ctx *ctx, tm_metal_buffer *k_src,
+                                       tm_metal_buffer *v_src, tm_metal_buffer *k_cache,
+                                       tm_metal_buffer *v_cache, uint32_t pos0, uint32_t cap,
+                                       uint32_t head_dim, uint32_t kv_heads, uint32_t n, char *err,
+                                       size_t err_cap) {
+    if (n == 0 || head_dim == 0 || kv_heads == 0 || (uint64_t)pos0 + n > cap) {
+        return tm_fail(err, err_cap, TM_METAL_ERR_BOUNDS,
+                       @"qwen35_kv_store_f16_chunk: positions beyond the cache capacity");
+    }
+    size_t rows = (size_t)n * kv_heads * head_dim * 4u;
+    size_t plane = (size_t)kv_heads * cap * head_dim * 2u;
+    tm_arg_buffer bufs[4] = {
+        {k_src, rows, "kv_chunk.k"}, {v_src, rows, "kv_chunk.v"},
+        {k_cache, plane, "kv_chunk.k_cache"}, {v_cache, plane, "kv_chunk.v_cache"},
+    };
+    uint32_t consts[5] = {pos0, cap, head_dim, kv_heads, n};
+    return tm_dispatch_args(ctx, ctx->pso_q35_kv_store_chunk, bufs, 4, consts, 5,
+                            MTLSizeMake((NSUInteger)n * kv_heads * head_dim, 1, 1),
+                            MTLSizeMake(128, 1, 1), err, err_cap, "qwen35_kv_store_f16_chunk");
+}
+
+int tm_metal_qwen35_attention_f16_chunk(tm_metal_ctx *ctx, tm_metal_buffer *q,
+                                        tm_metal_buffer *k_cache, tm_metal_buffer *v_cache,
+                                        tm_metal_buffer *out, tm_metal_buffer *scratch,
+                                        uint32_t heads, uint32_t pos0, uint32_t cap,
+                                        uint32_t head_dim, uint32_t group, float scale, uint32_t n,
+                                        char *err, size_t err_cap) {
+    if (n == 0 || heads == 0 || head_dim == 0 || group == 0 || (heads % group) != 0u ||
+        (uint64_t)pos0 + n > cap) {
+        return tm_fail(err, err_cap, TM_METAL_ERR_UNSUPPORTED,
+                       @"qwen35_attention_f16_chunk: invalid geometry or positions");
+    }
+    uint32_t kv_heads = heads / group;
+    size_t rows = (size_t)n * heads * head_dim * 4u;
+    size_t plane = (size_t)kv_heads * cap * head_dim * 2u;
+    tm_arg_buffer bufs[5] = {
+        {q, rows, "attn_chunk.q"}, {k_cache, plane, "attn_chunk.k_cache"},
+        {v_cache, plane, "attn_chunk.v_cache"}, {out, rows, "attn_chunk.out"},
+        {scratch, (size_t)n * heads * cap * 4u, "attn_chunk.scratch"},
+    };
+    uint32_t scale_bits;
+    memcpy(&scale_bits, &scale, sizeof scale_bits);
+    uint32_t consts[6] = {pos0, cap, head_dim, group, scale_bits, heads};
+    return tm_dispatch_args(ctx, ctx->pso_q35_attention_chunk, bufs, 5, consts, 6,
+                            MTLSizeMake((NSUInteger)heads * 128u, n, 1), MTLSizeMake(128, 1, 1),
+                            err, err_cap, "qwen35_attention_f16_chunk");
+}
+

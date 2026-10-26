@@ -508,6 +508,107 @@ mod imp {
             err: *mut c_char,
             err_cap: usize,
         ) -> c_int;
+        pub fn tm_metal_qwen35_conv_chunk(
+            ctx: *mut TmMetalCtx,
+            hist: *mut TmMetalBuffer,
+            x: *mut TmMetalBuffer,
+            w: *mut TmMetalBuffer,
+            y: *mut TmMetalBuffer,
+            channels: u32,
+            kern: u32,
+            n: u32,
+            err: *mut c_char,
+            err_cap: usize,
+        ) -> c_int;
+        pub fn tm_metal_qwen35_split_qkv_chunk(
+            ctx: *mut TmMetalCtx,
+            y: *mut TmMetalBuffer,
+            q: *mut TmMetalBuffer,
+            k: *mut TmMetalBuffer,
+            v: *mut TmMetalBuffer,
+            width: u32,
+            n: u32,
+            err: *mut c_char,
+            err_cap: usize,
+        ) -> c_int;
+        pub fn tm_metal_qwen35_beta_decay_chunk(
+            ctx: *mut TmMetalCtx,
+            raw_beta: *mut TmMetalBuffer,
+            alpha: *mut TmMetalBuffer,
+            dt_bias: *mut TmMetalBuffer,
+            ssm_a: *mut TmMetalBuffer,
+            beta_out: *mut TmMetalBuffer,
+            gate_out: *mut TmMetalBuffer,
+            per: u32,
+            n: u32,
+            err: *mut c_char,
+            err_cap: usize,
+        ) -> c_int;
+        pub fn tm_metal_qwen35_gdn_chunk(
+            ctx: *mut TmMetalCtx,
+            q: *mut TmMetalBuffer,
+            k: *mut TmMetalBuffer,
+            v: *mut TmMetalBuffer,
+            gate: *mut TmMetalBuffer,
+            beta: *mut TmMetalBuffer,
+            state: *mut TmMetalBuffer,
+            out: *mut TmMetalBuffer,
+            heads: u32,
+            k_dim: u32,
+            v_dim: u32,
+            q_scale: f32,
+            n: u32,
+            qk_stride: u32,
+            v_stride: u32,
+            g_stride: u32,
+            err: *mut c_char,
+            err_cap: usize,
+        ) -> c_int;
+        pub fn tm_metal_qwen35_rope_partial_chunk(
+            ctx: *mut TmMetalCtx,
+            q: *mut TmMetalBuffer,
+            k: *mut TmMetalBuffer,
+            inv_freq: *mut TmMetalBuffer,
+            pos0: u32,
+            n_q_heads: u32,
+            n_kv_heads: u32,
+            head_dim: u32,
+            n_rot: u32,
+            n: u32,
+            err: *mut c_char,
+            err_cap: usize,
+        ) -> c_int;
+        pub fn tm_metal_qwen35_kv_store_f16_chunk(
+            ctx: *mut TmMetalCtx,
+            k_src: *mut TmMetalBuffer,
+            v_src: *mut TmMetalBuffer,
+            k_cache: *mut TmMetalBuffer,
+            v_cache: *mut TmMetalBuffer,
+            pos0: u32,
+            cap: u32,
+            head_dim: u32,
+            kv_heads: u32,
+            n: u32,
+            err: *mut c_char,
+            err_cap: usize,
+        ) -> c_int;
+        pub fn tm_metal_qwen35_attention_f16_chunk(
+            ctx: *mut TmMetalCtx,
+            q: *mut TmMetalBuffer,
+            k_cache: *mut TmMetalBuffer,
+            v_cache: *mut TmMetalBuffer,
+            out: *mut TmMetalBuffer,
+            scratch: *mut TmMetalBuffer,
+            heads: u32,
+            pos0: u32,
+            cap: u32,
+            head_dim: u32,
+            group: u32,
+            scale: f32,
+            n: u32,
+            err: *mut c_char,
+            err_cap: usize,
+        ) -> c_int;
         pub fn tm_metal_row_indirect_f32(
             ctx: *mut TmMetalCtx,
             w: *mut TmMetalBuffer,
@@ -921,6 +1022,336 @@ impl MetalContext {
             // SAFETY: raw handles were validated against this context.
             let code = unsafe {
                 imp::tm_metal_argmax_f32(ctx, xc, n, pc, oc, out_index, err.as_mut_ptr(), ERR_CAP)
+            };
+            (code, err)
+        })
+    }
+
+    /// Causal convolution over `n` token rows `[n, channels]` with the
+    /// carried history, then the history refresh (exactly
+    /// `qwen35_conv_step` + `qwen35_conv_shift` applied n times).
+    #[allow(clippy::too_many_arguments)]
+    pub fn qwen35_conv_chunk(
+        &self,
+        hist: &MetalBuffer,
+        x: &MetalBuffer,
+        w: &MetalBuffer,
+        y: &MetalBuffer,
+        channels: u32,
+        kern: u32,
+        n: u32,
+    ) -> Result<()> {
+        for (b, name) in [(hist, "hist"), (x, "x"), (w, "w"), (y, "y")] {
+            self.check_owned(b, name)?;
+        }
+        let (hc, xc, wc, yc) = (hist.raw, x.raw, w.raw, y.raw);
+        self.operate("qwen35_conv_chunk", move |ctx| {
+            let mut err = [0 as c_char; ERR_CAP];
+            // SAFETY: raw handles were validated against this context.
+            let code = unsafe {
+                imp::tm_metal_qwen35_conv_chunk(
+                    ctx,
+                    hc,
+                    xc,
+                    wc,
+                    yc,
+                    channels,
+                    kern,
+                    n,
+                    err.as_mut_ptr(),
+                    ERR_CAP,
+                )
+            };
+            (code, err)
+        })
+    }
+
+    /// Per-token q/k/v split of `[n, 3*width]` rows.
+    #[allow(clippy::too_many_arguments)]
+    pub fn qwen35_split_qkv_chunk(
+        &self,
+        y: &MetalBuffer,
+        q: &MetalBuffer,
+        k: &MetalBuffer,
+        v: &MetalBuffer,
+        width: u32,
+        n: u32,
+    ) -> Result<()> {
+        for (b, name) in [(y, "y"), (q, "q"), (k, "k"), (v, "v")] {
+            self.check_owned(b, name)?;
+        }
+        let (yc, qc, kc, vc) = (y.raw, q.raw, k.raw, v.raw);
+        self.operate("qwen35_split_qkv_chunk", move |ctx| {
+            let mut err = [0 as c_char; ERR_CAP];
+            // SAFETY: raw handles were validated against this context.
+            let code = unsafe {
+                imp::tm_metal_qwen35_split_qkv_chunk(
+                    ctx,
+                    yc,
+                    qc,
+                    kc,
+                    vc,
+                    width,
+                    n,
+                    err.as_mut_ptr(),
+                    ERR_CAP,
+                )
+            };
+            (code, err)
+        })
+    }
+
+    /// `qwen35_beta_decay` over `[n, per]` rows (per-head biases by
+    /// column).
+    #[allow(clippy::too_many_arguments)]
+    pub fn qwen35_beta_decay_chunk(
+        &self,
+        raw_beta: &MetalBuffer,
+        alpha: &MetalBuffer,
+        dt_bias: &MetalBuffer,
+        ssm_a: &MetalBuffer,
+        beta_out: &MetalBuffer,
+        gate_out: &MetalBuffer,
+        per: u32,
+        n: u32,
+    ) -> Result<()> {
+        for (b, name) in [
+            (raw_beta, "raw_beta"),
+            (alpha, "alpha"),
+            (dt_bias, "dt_bias"),
+            (ssm_a, "ssm_a"),
+            (beta_out, "beta_out"),
+            (gate_out, "gate_out"),
+        ] {
+            self.check_owned(b, name)?;
+        }
+        let r = (
+            raw_beta.raw,
+            alpha.raw,
+            dt_bias.raw,
+            ssm_a.raw,
+            beta_out.raw,
+            gate_out.raw,
+        );
+        self.operate("qwen35_beta_decay_chunk", move |ctx| {
+            let mut err = [0 as c_char; ERR_CAP];
+            // SAFETY: raw handles were validated against this context.
+            let code = unsafe {
+                imp::tm_metal_qwen35_beta_decay_chunk(
+                    ctx,
+                    r.0,
+                    r.1,
+                    r.2,
+                    r.3,
+                    r.4,
+                    r.5,
+                    per,
+                    n,
+                    err.as_mut_ptr(),
+                    ERR_CAP,
+                )
+            };
+            (code, err)
+        })
+    }
+
+    /// The delta rule over `n` tokens (exactly `qwen35_gdn_step` n times),
+    /// with explicit per-token row strides.
+    #[allow(clippy::too_many_arguments)]
+    pub fn qwen35_gdn_chunk(
+        &self,
+        q: &MetalBuffer,
+        k: &MetalBuffer,
+        v: &MetalBuffer,
+        gate: &MetalBuffer,
+        beta: &MetalBuffer,
+        state: &MetalBuffer,
+        out: &MetalBuffer,
+        heads: u32,
+        k_dim: u32,
+        v_dim: u32,
+        q_scale: f32,
+        n: u32,
+        strides: (u32, u32, u32),
+    ) -> Result<()> {
+        for (b, name) in [
+            (q, "q"),
+            (k, "k"),
+            (v, "v"),
+            (gate, "gate"),
+            (beta, "beta"),
+            (state, "state"),
+            (out, "out"),
+        ] {
+            self.check_owned(b, name)?;
+        }
+        let r = (q.raw, k.raw, v.raw, gate.raw, beta.raw, state.raw, out.raw);
+        self.operate("qwen35_gdn_chunk", move |ctx| {
+            let mut err = [0 as c_char; ERR_CAP];
+            // SAFETY: raw handles were validated against this context.
+            let code = unsafe {
+                imp::tm_metal_qwen35_gdn_chunk(
+                    ctx,
+                    r.0,
+                    r.1,
+                    r.2,
+                    r.3,
+                    r.4,
+                    r.5,
+                    r.6,
+                    heads,
+                    k_dim,
+                    v_dim,
+                    q_scale,
+                    n,
+                    strides.0,
+                    strides.1,
+                    strides.2,
+                    err.as_mut_ptr(),
+                    ERR_CAP,
+                )
+            };
+            (code, err)
+        })
+    }
+
+    /// Partial split-half RoPE over `n` chunk rows at positions `pos0+t`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn qwen35_rope_partial_chunk(
+        &self,
+        q: &MetalBuffer,
+        k: &MetalBuffer,
+        inv_freq: &MetalBuffer,
+        pos0: u32,
+        n_q_heads: u32,
+        n_kv_heads: u32,
+        head_dim: u32,
+        n_rot: u32,
+        n: u32,
+    ) -> Result<()> {
+        for (b, name) in [(q, "q"), (k, "k"), (inv_freq, "inv_freq")] {
+            self.check_owned(b, name)?;
+        }
+        let (qc, kc, fc) = (q.raw, k.raw, inv_freq.raw);
+        self.operate("qwen35_rope_partial_chunk", move |ctx| {
+            let mut err = [0 as c_char; ERR_CAP];
+            // SAFETY: raw handles were validated against this context.
+            let code = unsafe {
+                imp::tm_metal_qwen35_rope_partial_chunk(
+                    ctx,
+                    qc,
+                    kc,
+                    fc,
+                    pos0,
+                    n_q_heads,
+                    n_kv_heads,
+                    head_dim,
+                    n_rot,
+                    n,
+                    err.as_mut_ptr(),
+                    ERR_CAP,
+                )
+            };
+            (code, err)
+        })
+    }
+
+    /// Packed f16 KV store of `n` chunk rows at positions `pos0+t`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn qwen35_kv_store_f16_chunk(
+        &self,
+        k_src: &MetalBuffer,
+        v_src: &MetalBuffer,
+        k_cache: &MetalBuffer,
+        v_cache: &MetalBuffer,
+        pos0: u32,
+        cap: u32,
+        head_dim: u32,
+        kv_heads: u32,
+        n: u32,
+    ) -> Result<()> {
+        for (b, name) in [
+            (k_src, "k_src"),
+            (v_src, "v_src"),
+            (k_cache, "k_cache"),
+            (v_cache, "v_cache"),
+        ] {
+            self.check_owned(b, name)?;
+        }
+        let r = (k_src.raw, v_src.raw, k_cache.raw, v_cache.raw);
+        self.operate("qwen35_kv_store_f16_chunk", move |ctx| {
+            let mut err = [0 as c_char; ERR_CAP];
+            // SAFETY: raw handles were validated against this context.
+            let code = unsafe {
+                imp::tm_metal_qwen35_kv_store_f16_chunk(
+                    ctx,
+                    r.0,
+                    r.1,
+                    r.2,
+                    r.3,
+                    pos0,
+                    cap,
+                    head_dim,
+                    kv_heads,
+                    n,
+                    err.as_mut_ptr(),
+                    ERR_CAP,
+                )
+            };
+            (code, err)
+        })
+    }
+
+    /// Causal attention for `n` chunk queries (query t at position
+    /// `pos0+t`), with the per-token kernel's code; all chunk K/V must be
+    /// stored first.
+    #[allow(clippy::too_many_arguments)]
+    pub fn qwen35_attention_f16_chunk(
+        &self,
+        q: &MetalBuffer,
+        k_cache: &MetalBuffer,
+        v_cache: &MetalBuffer,
+        out: &MetalBuffer,
+        scratch: &MetalBuffer,
+        heads: u32,
+        pos0: u32,
+        cap: u32,
+        head_dim: u32,
+        group: u32,
+        scale: f32,
+        n: u32,
+    ) -> Result<()> {
+        for (b, name) in [
+            (q, "q"),
+            (k_cache, "k_cache"),
+            (v_cache, "v_cache"),
+            (out, "out"),
+            (scratch, "scratch"),
+        ] {
+            self.check_owned(b, name)?;
+        }
+        let r = (q.raw, k_cache.raw, v_cache.raw, out.raw, scratch.raw);
+        self.operate("qwen35_attention_f16_chunk", move |ctx| {
+            let mut err = [0 as c_char; ERR_CAP];
+            // SAFETY: raw handles were validated against this context.
+            let code = unsafe {
+                imp::tm_metal_qwen35_attention_f16_chunk(
+                    ctx,
+                    r.0,
+                    r.1,
+                    r.2,
+                    r.3,
+                    r.4,
+                    heads,
+                    pos0,
+                    cap,
+                    head_dim,
+                    group,
+                    scale,
+                    n,
+                    err.as_mut_ptr(),
+                    ERR_CAP,
+                )
             };
             (code, err)
         })

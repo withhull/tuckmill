@@ -355,6 +355,49 @@ uint64_t tm_metal_allocated_bytes(const tm_metal_ctx *ctx);
  * bound never understates. */
 uint64_t tm_metal_in_flight_bytes(const tm_metal_ctx *ctx);
 
+/* Chunk-wide Gated DeltaNet core (engine prefill): each processes `n`
+ * tokens with exactly the per-element arithmetic of its per-token
+ * counterpart (tm_metal_qwen35_conv_step + conv_shift, split_qkv,
+ * beta_decay, gdn_step). Rows are token-major. */
+int tm_metal_qwen35_conv_chunk(tm_metal_ctx *ctx, tm_metal_buffer *hist, tm_metal_buffer *x,
+                               tm_metal_buffer *w, tm_metal_buffer *y, uint32_t channels,
+                               uint32_t kern, uint32_t n, char *err, size_t err_cap);
+int tm_metal_qwen35_split_qkv_chunk(tm_metal_ctx *ctx, tm_metal_buffer *y, tm_metal_buffer *q,
+                                    tm_metal_buffer *k, tm_metal_buffer *v, uint32_t width,
+                                    uint32_t n, char *err, size_t err_cap);
+int tm_metal_qwen35_beta_decay_chunk(tm_metal_ctx *ctx, tm_metal_buffer *raw_beta,
+                                     tm_metal_buffer *alpha, tm_metal_buffer *dt_bias,
+                                     tm_metal_buffer *ssm_a, tm_metal_buffer *beta_out,
+                                     tm_metal_buffer *gate_out, uint32_t per, uint32_t n,
+                                     char *err, size_t err_cap);
+int tm_metal_qwen35_gdn_chunk(tm_metal_ctx *ctx, tm_metal_buffer *q, tm_metal_buffer *k,
+                              tm_metal_buffer *v, tm_metal_buffer *gate, tm_metal_buffer *beta,
+                              tm_metal_buffer *state, tm_metal_buffer *out, uint32_t heads,
+                              uint32_t k_dim, uint32_t v_dim, float q_scale, uint32_t n,
+                              uint32_t qk_stride, uint32_t v_stride, uint32_t g_stride,
+                              char *err, size_t err_cap);
+
+/* Chunk-wide gated attention core (engine prefill): RoPE, packed f16 KV
+ * store and causal attention for `n` tokens at positions pos0..pos0+n-1,
+ * each with exactly its per-token counterpart's arithmetic. Rows are
+ * token-major; attention scratch is [n, heads, cap]. */
+int tm_metal_qwen35_rope_partial_chunk(tm_metal_ctx *ctx, tm_metal_buffer *q, tm_metal_buffer *k,
+                                       tm_metal_buffer *inv_freq, uint32_t pos0,
+                                       uint32_t n_q_heads, uint32_t n_kv_heads,
+                                       uint32_t head_dim, uint32_t n_rot, uint32_t n, char *err,
+                                       size_t err_cap);
+int tm_metal_qwen35_kv_store_f16_chunk(tm_metal_ctx *ctx, tm_metal_buffer *k_src,
+                                       tm_metal_buffer *v_src, tm_metal_buffer *k_cache,
+                                       tm_metal_buffer *v_cache, uint32_t pos0, uint32_t cap,
+                                       uint32_t head_dim, uint32_t kv_heads, uint32_t n, char *err,
+                                       size_t err_cap);
+int tm_metal_qwen35_attention_f16_chunk(tm_metal_ctx *ctx, tm_metal_buffer *q,
+                                        tm_metal_buffer *k_cache, tm_metal_buffer *v_cache,
+                                        tm_metal_buffer *out, tm_metal_buffer *scratch,
+                                        uint32_t heads, uint32_t pos0, uint32_t cap,
+                                        uint32_t head_dim, uint32_t group, float scale, uint32_t n,
+                                        char *err, size_t err_cap);
+
 #ifdef __cplusplus
 }
 #endif

@@ -1171,29 +1171,12 @@ kernel void tm_qwen35_kv_store_f16(device const float *k_src [[buffer(0)]],
  * them (Phase 1C: the per-position barrier and the per-dim recomputation
  * of exp() dominated prefill attention).
  */
-kernel void tm_qwen35_attention_f16(device const float *q [[buffer(0)]],
-                                    device const half *k_cache [[buffer(1)]],
-                                    device const half *v_cache [[buffer(2)]],
-                                    device float *out [[buffer(3)]],
-                                    device float *scratch [[buffer(4)]],
-                                    constant uint &pos [[buffer(5)]],
-                                    constant uint &cap [[buffer(6)]],
-                                    constant uint &head_dim [[buffer(7)]],
-                                    constant uint &group [[buffer(8)]],
-                                    constant float &scale [[buffer(9)]],
-                                    uint head [[threadgroup_position_in_grid]],
-                                    uint tid [[thread_position_in_threadgroup]],
-                                    uint lane [[thread_index_in_simdgroup]],
-                                    uint simd_group [[simdgroup_index_in_threadgroup]]) {
-    threadgroup float reduce_scratch[4];
-    threadgroup float row_stats[2];
-    const uint kv_head = head / group;
-    const device float *qh = q + (size_t)head * (size_t)head_dim;
-    const device half *kc = k_cache + ((size_t)kv_head * (size_t)cap) * (size_t)head_dim;
-    const device half *vc = v_cache + ((size_t)kv_head * (size_t)cap) * (size_t)head_dim;
-    device float *head_scratch = scratch + (size_t)head * (size_t)cap;
-    const uint seq = pos + 1u;
-
+/* One head's causal attention over a packed f16 cache (shared by the
+ * per-token and chunk kernels, so both run exactly this code). */
+inline void tm_q35_attend(const device float *qh, const device half *kc, const device half *vc,
+                          device float *oh, device float *head_scratch, uint seq,
+                          uint head_dim, float scale, uint tid, uint lane, uint simd_group,
+                          threadgroup float *reduce_scratch, threadgroup float *row_stats) {
     for (uint j = simd_group; j < seq; j += 4u) {
         const device half *kr = kc + (size_t)j * (size_t)head_dim;
         float part = 0.0f;
@@ -1240,7 +1223,6 @@ kernel void tm_qwen35_attention_f16(device const float *q [[buffer(0)]],
         head_scratch[j] = exp(head_scratch[j] - row_max) / norm;
     }
     threadgroup_barrier(mem_flags::mem_device | mem_flags::mem_threadgroup);
-    device float *oh = out + (size_t)head * (size_t)head_dim;
 
     for (uint d = tid; d < head_dim; d += 128u) {
         float accv = 0.0f;
@@ -1249,6 +1231,62 @@ kernel void tm_qwen35_attention_f16(device const float *q [[buffer(0)]],
         }
         oh[d] = accv;
     }
+}
+
+kernel void tm_qwen35_attention_f16(device const float *q [[buffer(0)]],
+                                    device const half *k_cache [[buffer(1)]],
+                                    device const half *v_cache [[buffer(2)]],
+                                    device float *out [[buffer(3)]],
+                                    device float *scratch [[buffer(4)]],
+                                    constant uint &pos [[buffer(5)]],
+                                    constant uint &cap [[buffer(6)]],
+                                    constant uint &head_dim [[buffer(7)]],
+                                    constant uint &group [[buffer(8)]],
+                                    constant float &scale [[buffer(9)]],
+                                    uint head [[threadgroup_position_in_grid]],
+                                    uint tid [[thread_position_in_threadgroup]],
+                                    uint lane [[thread_index_in_simdgroup]],
+                                    uint simd_group [[simdgroup_index_in_threadgroup]]) {
+    threadgroup float reduce_scratch[4];
+    threadgroup float row_stats[2];
+    const uint kv_head = head / group;
+    tm_q35_attend(q + (size_t)head * (size_t)head_dim,
+                  k_cache + ((size_t)kv_head * (size_t)cap) * (size_t)head_dim,
+                  v_cache + ((size_t)kv_head * (size_t)cap) * (size_t)head_dim,
+                  out + (size_t)head * (size_t)head_dim, scratch + (size_t)head * (size_t)cap,
+                  pos + 1u, head_dim, scale, tid, lane, simd_group, reduce_scratch, row_stats);
+}
+
+/* Chunk-wide causal attention: threadgroup (head, t) attends query row t of
+ * a chunk starting at `pos0` over positions 0..pos0+t, with the same code as
+ * the per-token kernel. Every chunk token's K/V must already be stored.
+ * Scratch rows are [n, heads, cap]. */
+kernel void tm_qwen35_attention_f16_chunk(device const float *q [[buffer(0)]],
+                                          device const half *k_cache [[buffer(1)]],
+                                          device const half *v_cache [[buffer(2)]],
+                                          device float *out [[buffer(3)]],
+                                          device float *scratch [[buffer(4)]],
+                                          constant uint &pos0 [[buffer(5)]],
+                                          constant uint &cap [[buffer(6)]],
+                                          constant uint &head_dim [[buffer(7)]],
+                                          constant uint &group [[buffer(8)]],
+                                          constant float &scale [[buffer(9)]],
+                                          constant uint &heads [[buffer(10)]],
+                                          uint2 tg [[threadgroup_position_in_grid]],
+                                          uint tid [[thread_index_in_threadgroup]],
+                                          uint lane [[thread_index_in_simdgroup]],
+                                          uint simd_group [[simdgroup_index_in_threadgroup]]) {
+    threadgroup float reduce_scratch[4];
+    threadgroup float row_stats[2];
+    const uint head = tg.x;
+    const uint t = tg.y;
+    const uint kv_head = head / group;
+    const size_t row = (size_t)t * heads + head;
+    tm_q35_attend(q + row * (size_t)head_dim,
+                  k_cache + ((size_t)kv_head * (size_t)cap) * (size_t)head_dim,
+                  v_cache + ((size_t)kv_head * (size_t)cap) * (size_t)head_dim,
+                  out + row * (size_t)head_dim, scratch + row * (size_t)cap, pos0 + t + 1u,
+                  head_dim, scale, tid, lane, simd_group, reduce_scratch, row_stats);
 }
 
 /* attn[i] *= sigmoid(gate[i]) — the joint Q-projection output gate. */
@@ -1288,3 +1326,209 @@ kernel void tm_qwen35_split_qkv(device const float *y [[buffer(0)]],
     k[gid] = y[width + gid];
     v[gid] = y[2u * width + gid];
 }
+
+/* ---------------- Chunk-wide Gated DeltaNet core (engine prefill) ----------
+ * Each kernel processes all `n` tokens of a prefill chunk in one launch with
+ * exactly the per-element arithmetic of its per-token counterpart above,
+ * so chunked prefill equals running the per-token core n times. */
+
+/* Causal convolution over a chunk. Token t's tap j (j < k-1) reads the
+ * input at time t-(k-1)+j: from the chunk when that is >= 0, else from the
+ * carried history (oldest first), exactly as tm_qwen35_conv_step sees it
+ * after t shifts. One thread per (channel, token). */
+kernel void tm_qwen35_conv_chunk(device const float *hist [[buffer(0)]],
+                                 device const float *x [[buffer(1)]],
+                                 device const float *w [[buffer(2)]],
+                                 device float *y [[buffer(3)]],
+                                 constant uint &channels [[buffer(4)]],
+                                 constant uint &kern [[buffer(5)]],
+                                 constant uint &n [[buffer(6)]],
+                                 uint2 gid [[thread_position_in_grid]]) {
+    const uint c = gid.x;
+    const uint t = gid.y;
+    if (c >= channels || t >= n) {
+        return;
+    }
+    const uint k = kern;
+    float acc = 0.0f;
+    for (uint j = 0; j + 1u < k; ++j) {
+        const int src = (int)t + (int)j - (int)(k - 1u);
+        const float v = src >= 0 ? x[(size_t)src * channels + c]
+                                 : hist[(size_t)(t + j) * channels + c];
+        acc += w[c * k + j] * v;
+    }
+    acc += w[c * k + (k - 1u)] * x[(size_t)t * channels + c];
+    y[(size_t)t * channels + c] = acc;
+}
+
+/* History after a chunk: the last k-1 inputs (oldest first), in place.
+ * Reads index n+j > j, so ascending j never reads an overwritten slot. */
+kernel void tm_qwen35_conv_chunk_shift(device float *hist [[buffer(0)]],
+                                       device const float *x [[buffer(1)]],
+                                       constant uint &channels [[buffer(2)]],
+                                       constant uint &kern [[buffer(3)]],
+                                       constant uint &n [[buffer(4)]],
+                                       uint c [[thread_position_in_grid]]) {
+    if (c >= channels || kern < 2u) {
+        return;
+    }
+    const uint h = kern - 1u;
+    for (uint j = 0; j < h; ++j) {
+        const uint src = n + j;
+        hist[(size_t)j * channels + c] =
+            src < h ? hist[(size_t)src * channels + c] : x[(size_t)(src - h) * channels + c];
+    }
+}
+
+/* Per-token q/k/v split of conv rows [n, 3*width] into [n, width] each. */
+kernel void tm_qwen35_split_qkv_chunk(device const float *y [[buffer(0)]],
+                                      device float *q [[buffer(1)]],
+                                      device float *k [[buffer(2)]],
+                                      device float *v [[buffer(3)]],
+                                      constant uint &width [[buffer(4)]],
+                                      constant uint &n [[buffer(5)]],
+                                      uint2 gid [[thread_position_in_grid]]) {
+    const uint i = gid.x;
+    const uint t = gid.y;
+    if (i >= width || t >= n) {
+        return;
+    }
+    const size_t row = (size_t)t * 3u * width;
+    q[(size_t)t * width + i] = y[row + i];
+    k[(size_t)t * width + i] = y[row + width + i];
+    v[(size_t)t * width + i] = y[row + 2u * width + i];
+}
+
+/* tm_qwen35_beta_decay over [n, per] rows; the per-head biases index by
+ * gid % per. */
+kernel void tm_qwen35_beta_decay_chunk(device const float *raw_beta [[buffer(0)]],
+                                       device const float *alpha [[buffer(1)]],
+                                       device const float *dt_bias [[buffer(2)]],
+                                       device const float *ssm_a [[buffer(3)]],
+                                       device float *beta_out [[buffer(4)]],
+                                       device float *gate_out [[buffer(5)]],
+                                       constant uint &total [[buffer(6)]],
+                                       constant uint &per [[buffer(7)]],
+                                       uint gid [[thread_position_in_grid]]) {
+    if (gid >= total) {
+        return;
+    }
+    const uint h = gid % per;
+    const float b = raw_beta[gid];
+    beta_out[gid] = 1.0f / (1.0f + exp(-b));
+    const float t = alpha[gid] + dt_bias[h];
+    const float sp = t > 20.0f ? t : log(1.0f + exp(t));
+    gate_out[gid] = ssm_a[h] * sp;
+}
+
+/* The delta rule over a chunk: thread (column j, head) walks tokens
+ * t = 0..n-1 in order with exactly tm_qwen35_gdn_step's per-element
+ * arithmetic, so the state after the chunk equals n single steps. Per
+ * token, rows are `qk_stride` (q, k), `v_stride` (v, out) and `g_stride`
+ * (gate, beta) wide; head h reads offset h*k_dim / h*v_dim / h. */
+kernel void tm_qwen35_gdn_chunk(device const float *q [[buffer(0)]],
+                                device const float *k [[buffer(1)]],
+                                device const float *v [[buffer(2)]],
+                                device const float *gate [[buffer(3)]],
+                                device const float *beta [[buffer(4)]],
+                                device float *state [[buffer(5)]],
+                                device float *out [[buffer(6)]],
+                                constant uint &k_dim [[buffer(7)]],
+                                constant uint &v_dim [[buffer(8)]],
+                                constant float &q_scale [[buffer(9)]],
+                                constant uint &heads [[buffer(10)]],
+                                constant uint &n [[buffer(11)]],
+                                constant uint &qk_stride [[buffer(12)]],
+                                constant uint &v_stride [[buffer(13)]],
+                                constant uint &g_stride [[buffer(14)]],
+                                uint2 gid [[thread_position_in_grid]]) {
+    const uint j = gid.x;
+    const uint head = gid.y;
+    const uint sk = k_dim;
+    const uint sv = v_dim;
+    if (j >= sv || head >= heads) {
+        return;
+    }
+    device float *s = state + (size_t)head * (size_t)sk * (size_t)sv;
+    for (uint t = 0; t < n; ++t) {
+        const size_t qk_row = (size_t)t * qk_stride + (size_t)head * sk;
+        const size_t v_row = (size_t)t * v_stride + (size_t)head * sv;
+        const device float *kk = k + qk_row;
+        const device float *qq = q + qk_row;
+        const float decay = exp(gate[(size_t)t * g_stride + head]);
+        const float b = beta[(size_t)t * g_stride + head];
+        float sk_acc = 0.0f;
+        for (uint i = 0; i < sk; ++i) {
+            sk_acc += (s[i * sv + j] * decay) * kk[i];
+        }
+        const float d = b * (v[v_row + j] - sk_acc);
+        float acc = 0.0f;
+        for (uint i = 0; i < sk; ++i) {
+            const float updated = s[i * sv + j] * decay + kk[i] * d;
+            s[i * sv + j] = updated;
+            acc += updated * (qq[i] * q_scale);
+        }
+        out[v_row + j] = acc;
+    }
+}
+
+
+
+/* Partial split-half RoPE over a chunk: threadgroup (head, t) rotates q or
+ * k row t at position pos0+t, exactly tm_qwen35_rope_partial_f32's math.
+ * q rows are [n, n_q_heads, head_dim], k rows [n, n_kv_heads, head_dim]. */
+kernel void tm_qwen35_rope_partial_chunk(device float *q [[buffer(0)]],
+                                         device float *k [[buffer(1)]],
+                                         device const float *inv_freq [[buffer(2)]],
+                                         constant uint &pos0 [[buffer(3)]],
+                                         constant uint &n_q_heads [[buffer(4)]],
+                                         constant uint &n_kv_heads [[buffer(5)]],
+                                         constant uint &head_dim [[buffer(6)]],
+                                         constant uint &n_rot [[buffer(7)]],
+                                         uint2 tg [[threadgroup_position_in_grid]],
+                                         uint lane [[thread_index_in_threadgroup]]) {
+    const uint half_rot = n_rot / 2u;
+    if (lane >= half_rot) {
+        return;
+    }
+    const uint head = tg.x;
+    const uint t = tg.y;
+    const bool is_q = head < n_q_heads;
+    const uint local_head = is_q ? head : head - n_q_heads;
+    device float *row = is_q
+        ? q + ((size_t)t * n_q_heads + local_head) * (size_t)head_dim
+        : k + ((size_t)t * n_kv_heads + local_head) * (size_t)head_dim;
+    const float angle = (float)(pos0 + t) * inv_freq[lane];
+    const float c = cos(angle);
+    const float s = sin(angle);
+    const float a = row[lane];
+    const float b = row[lane + half_rot];
+    row[lane] = a * c - b * s;
+    row[lane + half_rot] = a * s + b * c;
+}
+
+/* Packed f16 KV store of a chunk's rows [n, kv_heads, head_dim] at
+ * positions pos0+t (same rounding as tm_qwen35_kv_store_f16). */
+kernel void tm_qwen35_kv_store_f16_chunk(device const float *k_src [[buffer(0)]],
+                                         device const float *v_src [[buffer(1)]],
+                                         device half *k_cache [[buffer(2)]],
+                                         device half *v_cache [[buffer(3)]],
+                                         constant uint &pos0 [[buffer(4)]],
+                                         constant uint &cap [[buffer(5)]],
+                                         constant uint &head_dim [[buffer(6)]],
+                                         constant uint &kv_heads [[buffer(7)]],
+                                         constant uint &n [[buffer(8)]],
+                                         uint gid [[thread_position_in_grid]]) {
+    const uint per = kv_heads * head_dim;
+    if (gid >= per * n) {
+        return;
+    }
+    const size_t t = gid / per;
+    const size_t rem = gid % per;
+    const size_t head = rem / head_dim;
+    const size_t lane = rem % head_dim;
+    const size_t dst = (head * (size_t)cap + (size_t)pos0 + t) * (size_t)head_dim + lane;
+    k_cache[dst] = (half)k_src[gid];
+    v_cache[dst] = (half)v_src[gid];
+}
+

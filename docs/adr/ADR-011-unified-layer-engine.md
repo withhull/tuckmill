@@ -134,3 +134,25 @@ never in a family-specific path.
   paths: the logits download was not the cost). Served decode via
   `tuckmill bench` (128 in / 256 out, ABAB): 56.5 → 64.0 and 51.0 → 59.0
   tok/s (+13–16%), locally-calibrated.
+
+## Engine note (2026-10-26): chunk-wide mixer cores in prefill
+
+- Prefill used to run each layer's sequential core once per token of a
+  16-token chunk (about 14 launches plus 5 slice copies per token per
+  layer). It now runs both mixer cores chunk-wide:
+  - **Gated DeltaNet:** convolution over the chunk with the carried
+    history (`conv_chunk` + history refresh), row-batched SiLU, split,
+    L2 norms, beta/decay and gated norm, and one recurrence launch that
+    walks the chunk's tokens inside each (head, column) thread.
+  - **Gated attention:** row-batched gate split and Q/K norms, then RoPE,
+    packed-f16 KV store and causal attention for all chunk queries.
+    Attention uses one shared inline body (`tm_q35_attend`) for the
+    per-token and chunk kernels.
+- Every chunk kernel keeps its per-token counterpart's per-element
+  arithmetic. Gate: with `set_chunk_core(false)` (the per-token cores) as
+  reference, last-token logits and the next decode step are
+  **bit-identical** on the fixture (prompts 1/5/16/37) and the pinned 0.8B
+  (1/5/16/37/512). The per-token path stays as that reference.
+- Effect (pinned 0.8B, M3 8 GB, in-process): 512-token prefill
+  1.73 s → 1.29 s (DeltaNet core) → 0.84 s (plus attention). Profile now:
+  the matrix-unit GEMM 58%, the DeltaNet chunk recurrence 27%.

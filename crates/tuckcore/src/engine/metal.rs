@@ -241,10 +241,19 @@ struct PrefillWidths {
     d: usize,
     e: usize,
     ffn: usize,
+    /// Chunk-wide Gated DeltaNet core: convolution output, q/k (key
+    /// width), v/out (value width), beta/gate (value heads).
+    conv: usize,
+    gk: usize,
+    gv: usize,
+    gh: usize,
+    /// Chunk-wide attention core: q / gate rows and score rows.
+    aq: usize,
+    ascr: usize,
 }
 
 impl PrefillWidths {
-    fn of(graph: &ModelGraph) -> Self {
+    fn of(graph: &ModelGraph, capacity: usize) -> Self {
         let mut w = PrefillWidths {
             hidden: graph.hidden,
             ..Default::default()
@@ -258,6 +267,10 @@ impl PrefillWidths {
                     w.c = w.c.max(g.dt_rank);
                     w.d = w.d.max(g.dt_rank);
                     w.e = w.e.max(v);
+                    w.conv = w.conv.max(g.channels);
+                    w.gk = w.gk.max(g.groups * g.state_size);
+                    w.gv = w.gv.max(v);
+                    w.gh = w.gh.max(g.dt_rank);
                 }
                 MixerSpec::Attention(a) => {
                     let kv = a.kv_heads * a.head_dim;
@@ -266,6 +279,8 @@ impl PrefillWidths {
                     w.b = w.b.max(kv);
                     w.c = w.c.max(kv);
                     w.e = w.e.max(a.heads * a.head_dim);
+                    w.aq = w.aq.max(a.heads * a.head_dim);
+                    w.ascr = w.ascr.max(a.heads * capacity);
                 }
             }
             match &layer.ffn {
@@ -275,7 +290,7 @@ impl PrefillWidths {
         w
     }
 
-    fn sizes(&self) -> [usize; 12] {
+    fn sizes(&self) -> [usize; 22] {
         let n = PREFILL_BATCH;
         [
             n * self.hidden, // x
@@ -290,6 +305,16 @@ impl PrefillWidths {
             n * self.hidden, // d2
             n * self.ffn,    // g
             n * self.ffn,    // u
+            n * self.conv,   // gdn conv output
+            n * self.gk,     // gdn q
+            n * self.gk,     // gdn k
+            n * self.gv,     // gdn v
+            n * self.gh,     // gdn beta
+            n * self.gh,     // gdn gate
+            n * self.gv,     // gdn recurrence output
+            n * self.aq,     // attention q
+            n * self.aq,     // attention gate
+            n * self.ascr,   // attention scores
         ]
     }
 }
@@ -309,17 +334,28 @@ struct PrefillScratch {
     d2: MetalBuffer,
     g: MetalBuffer,
     u: MetalBuffer,
+    gconv: MetalBuffer,
+    gq: MetalBuffer,
+    gk: MetalBuffer,
+    gv: MetalBuffer,
+    gbeta: MetalBuffer,
+    ggate: MetalBuffer,
+    gout: MetalBuffer,
+    aq: MetalBuffer,
+    ag: MetalBuffer,
+    ascr: MetalBuffer,
 }
 
 impl PrefillScratch {
-    fn plan(graph: &ModelGraph, p: &mut Plan) {
-        for elems in PrefillWidths::of(graph).sizes() {
+    fn plan(graph: &ModelGraph, capacity: usize, p: &mut Plan) {
+        for elems in PrefillWidths::of(graph, capacity).sizes() {
             p.scratch_f32(elems);
         }
     }
 
-    fn load(gpu: &Qwen35Gpu, graph: &ModelGraph) -> Result<Self> {
-        let [x, h, h2, a, b, c, d, e, proj, d2, g, u] = PrefillWidths::of(graph).sizes();
+    fn load(gpu: &Qwen35Gpu, graph: &ModelGraph, capacity: usize) -> Result<Self> {
+        let [x, h, h2, a, b, c, d, e, proj, d2, g, u, gconv, gq, gk, gv, gbeta, ggate, gout, aq, ag, ascr] =
+            PrefillWidths::of(graph, capacity).sizes();
         Ok(Self {
             x: zeros(gpu, x)?,
             h: zeros(gpu, h)?,
@@ -333,6 +369,16 @@ impl PrefillScratch {
             d2: zeros(gpu, d2)?,
             g: zeros(gpu, g)?,
             u: zeros(gpu, u)?,
+            gconv: zeros(gpu, gconv)?,
+            gq: zeros(gpu, gq)?,
+            gk: zeros(gpu, gk)?,
+            gv: zeros(gpu, gv)?,
+            gbeta: zeros(gpu, gbeta)?,
+            ggate: zeros(gpu, ggate)?,
+            gout: zeros(gpu, gout)?,
+            aq: zeros(gpu, aq)?,
+            ag: zeros(gpu, ag)?,
+            ascr: zeros(gpu, ascr)?,
         })
     }
 }
@@ -464,7 +510,28 @@ impl GdnBlock {
         ]
     }
 
+    /// The q/k/v split (per token and chunk-wide) takes equal key and
+    /// value widths; anything else needs its own split before it can run.
+    fn check_supported(s: &GatedDeltaNetSpec) -> Result<()> {
+        let key = s.groups * s.state_size;
+        if s.head_v * s.dt_rank != key || s.channels != 3 * key || s.groups != s.dt_rank {
+            return Err(TuckmillError::new(
+                ErrorCode::UnsupportedArchitecture,
+                format!(
+                    "Gated DeltaNet geometry (key {key}, value {}, channels {}, groups {}, value heads {}) has no engine block yet",
+                    s.head_v * s.dt_rank,
+                    s.channels,
+                    s.groups,
+                    s.dt_rank
+                ),
+            )
+            .with_action("Wait for the matching DeltaNet block; geometry is never approximated."));
+        }
+        Ok(())
+    }
+
     fn plan(s: &GatedDeltaNetSpec, src: &dyn WeightSource, p: &mut Plan) -> Result<()> {
+        Self::check_supported(s)?;
         for m in [s.qkv, s.z, s.alpha, s.beta, s.out] {
             p.weights += Matrix::plan(src, m)?;
         }
@@ -486,6 +553,7 @@ impl GdnBlock {
         s: &GatedDeltaNetSpec,
         eps: f32,
     ) -> Result<Self> {
+        Self::check_supported(s)?;
         let (state, hist) = Self::state_elems(s);
         let [qkv_out, conv_y, q, k, v, z_out, alpha_out, beta_raw, beta_out, gate, o, gated] =
             Self::scratch_elems(s);
@@ -533,9 +601,16 @@ impl GdnBlock {
         self.out.gemv(gpu, &self.gated, proj)
     }
 
-    /// `n` chunk rows: `s.proj = mixer(s.h)`; projections batched, the
-    /// sequential core per token.
-    fn prefill(&self, gpu: &Qwen35Gpu, s: &PrefillScratch, n: usize) -> Result<()> {
+    /// `n` chunk rows: `s.proj = mixer(s.h)`. Projections are batched
+    /// GEMMs; the core runs chunk-wide (`chunk_core`) or per token on the
+    /// decode kernels; both give identical results.
+    fn prefill(
+        &self,
+        gpu: &Qwen35Gpu,
+        s: &PrefillScratch,
+        n: usize,
+        chunk_core: bool,
+    ) -> Result<()> {
         let ctx = gpu.context();
         let spec = &self.spec;
         let nn = n as u32;
@@ -543,6 +618,10 @@ impl GdnBlock {
         self.z.gemm(gpu, &s.h, &s.b, nn)?;
         self.alpha.gemm(gpu, &s.h, &s.c, nn)?;
         self.beta.gemm(gpu, &s.h, &s.d, nn)?;
+        if chunk_core {
+            self.core_chunk(gpu, s, n)?;
+            return self.out.gemm(gpu, &s.e, &s.proj, nn);
+        }
         let ch = spec.channels;
         let vz = spec.head_v * spec.dt_rank;
         let dr = spec.dt_rank;
@@ -555,6 +634,65 @@ impl GdnBlock {
             ctx.copy_f32(&self.gated, 0, &s.e, (i * vz) as u32, vz as u32)?;
         }
         self.out.gemm(gpu, &s.e, &s.proj, nn)
+    }
+
+    /// The core over all `n` chunk tokens at once, from the projected rows
+    /// `s.a` (qkv), `s.b` (z), `s.c` (alpha), `s.d` (raw beta) to `s.e`
+    /// (gated), with exactly [`Self::core`]'s per-element arithmetic.
+    fn core_chunk(&self, gpu: &Qwen35Gpu, s: &PrefillScratch, n: usize) -> Result<()> {
+        let ctx = gpu.context();
+        let spec = &self.spec;
+        let nn = n as u32;
+        let key = (spec.groups * spec.state_size) as u32;
+        let value = (spec.head_v * spec.dt_rank) as u32;
+        ctx.qwen35_conv_chunk(
+            &self.hist,
+            &s.a,
+            &self.conv_w,
+            &s.gconv,
+            spec.channels as u32,
+            spec.conv_kernel as u32,
+            nn,
+        )?;
+        ctx.qwen35_silu(&s.gconv, nn * spec.channels as u32)?;
+        ctx.qwen35_split_qkv_chunk(&s.gconv, &s.gq, &s.gk, &s.gv, key, nn)?;
+        let rows = nn * spec.groups as u32;
+        gpu.l2norm_dev(&s.gq, &s.gq, rows, spec.state_size as u32, self.eps)?;
+        gpu.l2norm_dev(&s.gk, &s.gk, rows, spec.state_size as u32, self.eps)?;
+        ctx.qwen35_beta_decay_chunk(
+            &s.d,
+            &s.c,
+            &self.ssm_dt,
+            &self.ssm_a,
+            &s.gbeta,
+            &s.ggate,
+            spec.dt_rank as u32,
+            nn,
+        )?;
+        ctx.qwen35_gdn_chunk(
+            &s.gq,
+            &s.gk,
+            &s.gv,
+            &s.ggate,
+            &s.gbeta,
+            &self.state,
+            &s.gout,
+            spec.groups as u32,
+            spec.state_size as u32,
+            spec.head_v as u32,
+            1.0 / (spec.state_size as f32).sqrt(),
+            nn,
+            (key, value, spec.dt_rank as u32),
+        )?;
+        gpu.gated_norm_dev(
+            &s.gout,
+            &s.b,
+            &self.ssm_norm,
+            &s.e,
+            nn * spec.dt_rank as u32,
+            spec.head_v as u32,
+            self.eps,
+        )
     }
 
     /// The sequential per-token core, from `qkv_out`/`z_out`/`alpha_out`/
@@ -751,13 +889,24 @@ impl AttentionBlock {
         self.o_w.gemv(gpu, &self.attn, proj)
     }
 
-    fn prefill(&self, gpu: &Qwen35Gpu, s: &PrefillScratch, n: usize, pos0: u32) -> Result<()> {
+    fn prefill(
+        &self,
+        gpu: &Qwen35Gpu,
+        s: &PrefillScratch,
+        n: usize,
+        pos0: u32,
+        chunk_core: bool,
+    ) -> Result<()> {
         let ctx = gpu.context();
         let spec = &self.spec;
         let nn = n as u32;
         self.q_w.gemm(gpu, &s.h, &s.a, nn)?;
         self.k_w.gemm(gpu, &s.h, &s.b, nn)?;
         self.v_w.gemm(gpu, &s.h, &s.c, nn)?;
+        if chunk_core {
+            self.core_chunk(gpu, s, n, pos0)?;
+            return self.o_w.gemm(gpu, &s.e, &s.proj, nn);
+        }
         let qgw = spec.heads * spec.head_dim * 2;
         let kvw = spec.kv_heads * spec.head_dim;
         let aw = spec.heads * spec.head_dim;
@@ -769,6 +918,61 @@ impl AttentionBlock {
             ctx.copy_f32(&self.attn, 0, &s.e, (i * aw) as u32, aw as u32)?;
         }
         self.o_w.gemm(gpu, &s.e, &s.proj, nn)
+    }
+
+    /// The core over all `n` chunk queries at positions `pos0..`, from the
+    /// projected rows `s.a` (q+gate), `s.b` (k), `s.c` (v) to `s.e`, with
+    /// exactly [`Self::core`]'s per-element arithmetic (every chunk K/V is
+    /// stored before any chunk query attends).
+    fn core_chunk(&self, gpu: &Qwen35Gpu, s: &PrefillScratch, n: usize, pos0: u32) -> Result<()> {
+        let ctx = gpu.context();
+        let spec = &self.spec;
+        let nn = n as u32;
+        let (heads, kv, hd) = (
+            spec.heads as u32,
+            spec.kv_heads as u32,
+            spec.head_dim as u32,
+        );
+        gpu.q_gate_split_dev(&s.a, &s.aq, &s.ag, nn * heads, hd)?;
+        ctx.rmsnorm(&s.aq, &self.q_norm, &s.aq, nn * heads, hd, self.eps)?;
+        ctx.rmsnorm(&s.b, &self.k_norm, &s.b, nn * kv, hd, self.eps)?;
+        ctx.qwen35_rope_partial_chunk(
+            &s.aq,
+            &s.b,
+            &self.inv_freq,
+            pos0,
+            heads,
+            kv,
+            hd,
+            spec.rope_dims as u32,
+            nn,
+        )?;
+        ctx.qwen35_kv_store_f16_chunk(
+            &s.b,
+            &s.c,
+            &self.k_cache,
+            &self.v_cache,
+            pos0,
+            self.cache_cap as u32,
+            hd,
+            kv,
+            nn,
+        )?;
+        ctx.qwen35_attention_f16_chunk(
+            &s.aq,
+            &self.k_cache,
+            &self.v_cache,
+            &s.e,
+            &s.ascr,
+            heads,
+            pos0,
+            self.cache_cap as u32,
+            hd,
+            heads / kv,
+            1.0 / (spec.head_dim as f32).sqrt(),
+            nn,
+        )?;
+        gpu.attn_gate_dev(&s.e, &s.ag, nn * heads * hd)
     }
 
     /// The sequential per-token core, from `qg`/`k`/`v` to `attn`.
@@ -929,6 +1133,7 @@ impl Layer {
         self.ffn.decode(gpu, &self.h2, x, hidden)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn prefill(
         &self,
         gpu: &Qwen35Gpu,
@@ -937,13 +1142,14 @@ impl Layer {
         pos0: u32,
         hidden: usize,
         eps: f32,
+        chunk_core: bool,
     ) -> Result<()> {
         let ctx = gpu.context();
         let nn = n as u32;
         ctx.rmsnorm(&s.x, &self.pre_norm, &s.h, nn, hidden as u32, eps)?;
         match &self.mixer {
-            Mixer::Gdn(b) => b.prefill(gpu, s, n)?,
-            Mixer::Attention(b) => b.prefill(gpu, s, n, pos0)?,
+            Mixer::Gdn(b) => b.prefill(gpu, s, n, chunk_core)?,
+            Mixer::Attention(b) => b.prefill(gpu, s, n, pos0, chunk_core)?,
         }
         ctx.f32_axpy(&s.proj, &s.x, 1.0, (n * hidden) as u32)?;
         ctx.rmsnorm(&s.x, &self.post_norm, &s.h2, nn, hidden as u32, eps)?;
@@ -975,7 +1181,7 @@ pub fn alloc_plan(
     p.scratch_f32(graph.vocab); // logits
     p.scratch_f32(ARGMAX_PARTIAL_BYTES / 4); // argmax partials
     p.scratch_f32(2); // token slots (pipelined greedy)
-    PrefillScratch::plan(graph, &mut p);
+    PrefillScratch::plan(graph, capacity, &mut p);
     Ok(GpuAllocPlan {
         weights: p.weights,
         state: p.state,
@@ -1008,6 +1214,8 @@ pub struct EngineModel {
     /// Reused host staging for the logits download (one block for the
     /// session instead of one allocation per generated token).
     logits_staging: std::cell::RefCell<Vec<u8>>,
+    /// Prefill runs mixer cores chunk-wide (default) instead of per token.
+    chunk_core: std::cell::Cell<bool>,
 }
 
 impl EngineModel {
@@ -1051,7 +1259,7 @@ impl EngineModel {
         let logits_buf = zeros(&gpu, graph.vocab)?;
         let argmax_partial = zeros(&gpu, ARGMAX_PARTIAL_BYTES / 4)?;
         let token_ids = zeros(&gpu, 2)?;
-        let prefill = PrefillScratch::load(&gpu, &graph)?;
+        let prefill = PrefillScratch::load(&gpu, &graph, capacity)?;
         Ok(Self {
             gpu,
             layers,
@@ -1071,6 +1279,7 @@ impl EngineModel {
             grouped: std::cell::Cell::new(true),
             prefill_in_flight: Default::default(),
             logits_staging: Default::default(),
+            chunk_core: std::cell::Cell::new(true),
         })
     }
 
@@ -1112,6 +1321,13 @@ impl EngineModel {
     /// operator (profiling attribution). Arithmetic is identical.
     pub fn set_grouped(&self, grouped: bool) {
         self.grouped.set(grouped);
+    }
+
+    /// Run prefill mixer cores chunk-wide (`true`, default) or per token on
+    /// the decode kernels (`false`, the reference the chunk path is gated
+    /// against). Results are identical.
+    pub fn set_chunk_core(&self, chunk: bool) {
+        self.chunk_core.set(chunk);
     }
 
     /// Zero every session state and the position counter. Waits for any
@@ -1425,6 +1641,7 @@ impl EngineModel {
             let (hidden, eps) = (self.graph.hidden, self.graph.eps);
             let want_logits = !matches!(out, Out::None);
             let greedy = matches!(out, Out::Greedy(_));
+            let chunk_core = self.chunk_core.get();
             self.bound_prefill_in_flight();
             let s = &self.prefill;
             let encode = || -> Result<()> {
@@ -1433,7 +1650,7 @@ impl EngineModel {
                         .row_into(&self.gpu, *token, &s.x, (i * hidden) as u32)?;
                 }
                 for layer in &self.layers {
-                    layer.prefill(&self.gpu, s, n, pos as u32, hidden, eps)?;
+                    layer.prefill(&self.gpu, s, n, pos as u32, hidden, eps, chunk_core)?;
                 }
                 if want_logits {
                     let ctx = self.gpu.context();
@@ -2316,6 +2533,116 @@ mod greedy_tests {
             1e3 / cpu_ms,
             1e3 / dev_ms,
             1e3 / pipe_ms
+        );
+    }
+}
+
+#[cfg(test)]
+mod chunk_core_tests {
+    use super::*;
+    use crate::qwen35_forward::{ArtifactTensorSource, TensorSource};
+    use tuckmill_manifest::testing::{synthetic_qwen3_bytes, SyntheticConfig};
+
+    fn gpu_or_skip() -> bool {
+        if tuckmill_metal::probe().available {
+            return true;
+        }
+        assert!(
+            std::env::var("TUCKMILL_REQUIRE_METAL").is_err(),
+            "TUCKMILL_REQUIRE_METAL is set but no Metal device is available"
+        );
+        eprintln!("skipping: no Metal device");
+        false
+    }
+
+    fn bits(v: &[f32]) -> Vec<u32> {
+        v.iter().map(|x| x.to_bits()).collect()
+    }
+
+    /// Prefill `prompt` then one decode step; returns (last-token logits,
+    /// next-step logits, prefill ms).
+    fn run(model: &EngineModel, prompt: &[u32]) -> (Vec<f32>, Vec<f32>, f64) {
+        model.reset().unwrap();
+        let t0 = std::time::Instant::now();
+        let mut logits = Vec::new();
+        let chunks: Vec<&[u32]> = prompt.chunks(PREFILL_BATCH).collect();
+        for (c, chunk) in chunks.iter().enumerate() {
+            model
+                .prefill_chunk(chunk, c + 1 == chunks.len(), &mut logits)
+                .unwrap();
+        }
+        let ms = t0.elapsed().as_secs_f64() * 1e3;
+        let mut next = Vec::new();
+        model.forward_token(prompt[0], &mut next).unwrap();
+        (logits, next, ms)
+    }
+
+    /// The chunk-wide mixer cores are bit-identical to running the
+    /// per-token decode cores over the chunk (last-token logits and the
+    /// next decode step, so recurrent state, convolution history and KV
+    /// agree), for partial, single, exact and multi-chunk prompts.
+    fn chunk_core_matches_per_token(src: &(impl TensorSource + WeightSource), lens: &[usize]) {
+        let graph = crate::engine::adapters::qwen35(src.config(), src.layout());
+        let capacity = lens.iter().max().unwrap() + 8;
+        let plan = alloc_plan(&graph, src, capacity).unwrap();
+        let model = EngineModel::load(
+            Qwen35Gpu::open().unwrap(),
+            graph,
+            src,
+            capacity,
+            plan.total(),
+        )
+        .unwrap();
+        assert_eq!(model.allocated_bytes(), plan.total(), "ledger == plan");
+        for &len in lens {
+            let prompt: Vec<u32> = (0..len as u32).map(|i| (i * 7919 + 13) % 500).collect();
+            model.set_chunk_core(false);
+            let (a_logits, a_next, a_ms) = run(&model, &prompt);
+            model.set_chunk_core(true);
+            let (b_logits, b_next, b_ms) = run(&model, &prompt);
+            assert_eq!(
+                bits(&b_logits),
+                bits(&a_logits),
+                "len {len}: prefill logits"
+            );
+            assert_eq!(bits(&b_next), bits(&a_next), "len {len}: next decode step");
+            if len >= 256 {
+                eprintln!(
+                    "{len}-token prefill: per-token cores {a_ms:.0} ms, chunk cores {b_ms:.0} ms"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn chunk_cores_are_bit_identical_to_per_token_cores_on_the_fixture() {
+        if !gpu_or_skip() {
+            return;
+        }
+        let bytes = synthetic_qwen3_bytes(&SyntheticConfig::tiny_qwen35());
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("q35.gguf");
+        std::fs::write(&path, &bytes).unwrap();
+        chunk_core_matches_per_token(&ArtifactTensorSource::open(&path).unwrap(), &[1, 5, 16, 37]);
+    }
+
+    /// Machine-local (TUCKMILL_QWEN35_GGUF), with 512-token timing.
+    #[test]
+    fn chunk_cores_are_bit_identical_on_the_pinned_artifact() {
+        let Some(path) = std::env::var("TUCKMILL_QWEN35_GGUF")
+            .ok()
+            .map(std::path::PathBuf::from)
+            .filter(|p| p.exists())
+        else {
+            eprintln!("skipping: TUCKMILL_QWEN35_GGUF not set");
+            return;
+        };
+        if !gpu_or_skip() {
+            return;
+        }
+        chunk_core_matches_per_token(
+            &ArtifactTensorSource::open(&path).unwrap(),
+            &[1, 5, 16, 37, 512],
         );
     }
 }
