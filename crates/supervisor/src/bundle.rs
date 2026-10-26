@@ -215,24 +215,21 @@ impl ModelBundle {
         let declared = insp
             .get_str("tokenizer.chat_template")
             .map(|s| s.to_string());
-        let template = match declared.as_deref() {
-            Some(t) => Some(ChatTemplate::recognize(t).ok_or_else(|| {
-                TuckmillError::new(
-                    ErrorCode::UnsupportedArchitecture,
-                    "the artifact declares a chat template this build does not recognize (recognition is byte-exact against the pinned Qwen3 revision); refusing to approximate the model's prompt format",
-                )
-                .with_action(
-                    "Chat with an artifact whose template is supported, or run a raw completion prompt.",
-                )
-            })?),
-            None => None,
-        };
+        // An unrecognized declared template disables chat only: raw
+        // completion never applies a template, so it stays available, and
+        // `render_chat` refuses with the declared template's size. The
+        // template is never approximated.
+        let template = declared.as_deref().and_then(ChatTemplate::recognize);
         let eos_token_id = insp
             .get_u64("tokenizer.ggml.eos_token_id")
             .map(|v| v as u32);
-        let template_id = template.map(|t| t.id()).unwrap_or("none");
+        let template_note = match (template, declared.as_deref()) {
+            (Some(t), _) => format!("{} (canonical semantics)", t.id()),
+            (None, Some(_)) => "unrecognized (chat refused; raw completion only)".to_string(),
+            (None, None) => "none".to_string(),
+        };
         let note = format!(
-            "{}; chat template {template_id} (canonical semantics); eos {}",
+            "{}; chat template {template_note}; eos {}",
             encoder.note(),
             eos_token_id
                 .map(|v| v.to_string())
@@ -444,6 +441,49 @@ mod tests {
         )
         .unwrap();
         ModelBundle::open_path(&path, &Id::new("a".repeat(64)).unwrap()).unwrap()
+    }
+
+    #[test]
+    fn an_unrecognized_template_refuses_chat_but_keeps_raw_completion() {
+        // Same-length single-byte edit of the embedded template: the GGUF
+        // stays valid, recognition (byte-exact) must fail.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("f.gguf");
+        tuckmill_manifest::testing::write_synthetic(
+            &path,
+            &tuckmill_manifest::testing::SyntheticConfig::tiny_qwen3(),
+        )
+        .unwrap();
+        let mut bytes = std::fs::read(&path).unwrap();
+        let template = tuckmill_manifest::chat::QWEN3_CHAT_TEMPLATE.as_bytes();
+        let at = bytes
+            .windows(template.len())
+            .position(|w| w == template)
+            .expect("fixture embeds the template");
+        let last = at + template.len() - 1;
+        bytes[last] = if bytes[last] == b' ' { b'\t' } else { b' ' };
+        std::fs::write(&path, &bytes).unwrap();
+
+        let bundle = ModelBundle::open_path(&path, &Id::new("a".repeat(64)).unwrap()).unwrap();
+        assert!(bundle.template.is_none());
+        assert!(bundle.note.contains("unrecognized"), "{}", bundle.note);
+        let err = bundle
+            .render_chat(&[spec(ChatRole::User, "hi")])
+            .unwrap_err();
+        assert_eq!(err.code(), ErrorCode::UnsupportedArchitecture);
+        let raw = RequestSpec::raw(
+            &bundle,
+            "Hello, world!".to_string(),
+            16,
+            vec![],
+            7,
+            SamplingPolicy::default(),
+            false,
+            2048,
+        )
+        .unwrap();
+        assert!(!raw.is_chat());
+        assert!(!raw.prompt_tokens.is_empty());
     }
 
     #[test]

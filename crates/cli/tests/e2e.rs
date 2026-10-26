@@ -1016,12 +1016,28 @@ fn qwen35_pinned_artifact_contract_when_available() {
         "admission states the hybrid state reservation: {v}"
     );
 
-    // Execution stays refused, and the refusal is precise at every layer.
-    // Without the pinned reference tokenizer the 'qwen35' pre-tokenizer
-    // contract stops it first; with it, the declared multimodal chat
-    // template is byte-exact-unrecognized and the bundle refuses to
-    // approximate a prompt format. The hybrid operators themselves are
-    // refused by the worker (unit-tested in tuckcore; Q35-1 gate).
+    // Q35-1E.2: text needs the pinned reference tokenizer (the 'qwen35'
+    // pre-tokenizer is never approximated by the built-in BPE).
+    if std::env::var("TUCKMILL_LLAMA_LIB").is_err() {
+        let (code, _, stderr) = env.run(&[
+            "run",
+            "q35",
+            "--prompt",
+            "hi",
+            "--max-output",
+            "1",
+            "--engine",
+            "tuckcore",
+            "--kernels",
+            "metal",
+        ]);
+        assert_eq!(code, 1, "stderr: {stderr}");
+        assert!(stderr.contains("pre-tokenizer \"qwen35\""), "{stderr}");
+        return;
+    }
+
+    // The CPU kernels are the oracle, not a served path: the worker
+    // refuses anything but the resident Metal path, precisely.
     let (code, _, stderr) = env.run(&[
         "run",
         "q35",
@@ -1033,12 +1049,70 @@ fn qwen35_pinned_artifact_contract_when_available() {
         "tuckcore",
     ]);
     assert_eq!(code, 1, "stderr: {stderr}");
-    if std::env::var("TUCKMILL_LLAMA_LIB").is_ok() {
-        assert!(stderr.contains("chat template"), "{stderr}");
-        assert!(stderr.contains("does not recognize"), "{stderr}");
-    } else {
-        assert!(stderr.contains("pre-tokenizer \"qwen35\""), "{stderr}");
+    assert!(stderr.contains("resident Metal path only"), "{stderr}");
+
+    // Raw completion through the isolated worker on the GPU; the declared
+    // multimodal chat template stays unrecognized, so only chat is refused.
+    let prompt = "The capital of France is";
+    let max_output = 8usize;
+    let out = env.run_ok(&[
+        "run",
+        "q35",
+        "--prompt",
+        prompt,
+        "--max-output",
+        &max_output.to_string(),
+        "--engine",
+        "tuckcore",
+        "--kernels",
+        "metal",
+        "--json",
+    ]);
+    let v: serde_json::Value = serde_json::from_str(&out).expect("run json");
+    assert_eq!(v["backend"], "tuckcore");
+    assert_eq!(v["synthetic_output"], false);
+    let served = v["text"].as_str().expect("text").to_string();
+
+    // Greedy reference: the CPU oracle over the same reference-tokenized
+    // prompt. The GPU path is qualified within 4.9e-4 of this oracle on
+    // logits; greedy continuations must be identical token for token.
+    let mut reference = tuckmill_llamaref::LlamaRef::new();
+    reference
+        .open_reference_model(std::path::Path::new(&gguf), true)
+        .unwrap();
+    let prompt_tokens = reference.tokenize(prompt, false).unwrap();
+    let mut oracle = tuckmill_tuckcore::qwen35_forward::Qwen35Model::open(
+        std::path::Path::new(&gguf),
+        prompt_tokens.len() + max_output,
+        tuckmill_tuckcore::qwen35_kv::KvPrecision::F16,
+    )
+    .unwrap();
+    let mut logits = Vec::new();
+    oracle.forward_tokens(&prompt_tokens, &mut logits).unwrap();
+    let mut expected = Vec::new();
+    for i in 0..max_output {
+        let next = logits
+            .iter()
+            .enumerate()
+            .fold((0usize, f32::NEG_INFINITY), |best, (j, v)| {
+                if *v > best.1 {
+                    (j, *v)
+                } else {
+                    best
+                }
+            })
+            .0 as u32;
+        if next == 248046 {
+            break; // EOS is never visible
+        }
+        expected.extend(reference.piece_bytes(next).unwrap());
+        if i + 1 < max_output {
+            oracle.forward_token(next, &mut logits).unwrap();
+        }
     }
+    let expected = String::from_utf8_lossy(&expected).to_string();
+    eprintln!("qwen35 served greedy {served:?} vs CPU oracle {expected:?}");
+    assert_eq!(served, expected, "greedy output equals the CPU oracle");
 }
 
 /// Q35-1D reference gate (machine-local): the complete TuckCore Qwen3.5

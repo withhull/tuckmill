@@ -3,11 +3,14 @@
 Statuses live in [`registry.json`](registry.json) and are enforced by
 `tuckmill_planner::kernel_registry`: a kernel must never be selected before
 its correctness gate passes, and every selection keeps a validated reference
-fallback decision. **K01 has its first implemented increment** (aarch64 NEON
-fused Q8_0/F16 packed dot with zero-copy mapped blocks; Q4_0/Q4_1 and the
-Metal path remain on the scalar/reference path). All other packages are
-specified only — every plan lists the kernels its profile requires so the gap
-is explicit rather than implied.
+fallback decision. **K01 has implemented increments** on the CPU (aarch64
+NEON fused Q8_0/F16 packed dot with zero-copy mapped blocks; Q4_0/Q4_1 stay
+on the scalar path) and on Metal (Q8_0 GEMV, Gate C1/C2); K02 has its Metal
+batched-GEMM prefill increment (C3); the Qwen3.5 Metal operators (Q35-2)
+are qualified in ADR-008 and not yet registered as packages. The remaining
+packages are specified only — see `registry.json` for exact statuses; every
+plan lists the kernels its profile requires so the gap is explicit rather
+than implied.
 
 | Package | Function | Gate summary |
 | --- | --- | --- |

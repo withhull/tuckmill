@@ -316,6 +316,13 @@ impl ApiServer {
         while !shutdown.load(Ordering::Relaxed) {
             match self.listener.accept() {
                 Ok((stream, _)) => {
+                    // BSD sockets inherit O_NONBLOCK from the listener; a
+                    // non-blocking connection fails reads with EAGAIN when
+                    // a client's bytes arrive after the headers. Connection
+                    // threads use blocking I/O bounded by read timeouts.
+                    if let Err(e) = stream.set_nonblocking(false) {
+                        return Err(TuckmillError::from(e));
+                    }
                     if self.conn_count.load(Ordering::Relaxed) >= MAX_CONNECTIONS as u64 {
                         let mut s = stream;
                         let err = TuckmillError::new(
@@ -1175,6 +1182,44 @@ mod tests {
             body.len()
         );
         raw_request(addr, &req)
+    }
+
+    #[test]
+    fn a_body_arriving_after_the_headers_is_read_not_rejected() {
+        // Regression: accepted sockets inherited the listener's O_NONBLOCK
+        // on macOS, so a body that arrived after the headers failed the
+        // read with EAGAIN (os error 35) and the client got a 500.
+        let (_dir, runtime, server, token) = test_server();
+        let addr = server.local_addr();
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let s2 = shutdown.clone();
+        let handle = std::thread::spawn(move || server.serve(s2));
+
+        let body = serde_json::json!({
+            "model": "local",
+            "messages": [{"role": "user", "content": "hello"}],
+            "max_tokens": 2
+        })
+        .to_string();
+        let head = format!(
+            "POST /v1/chat/completions HTTP/1.1\r\nHost: 127.0.0.1\r\nAuthorization: Bearer {token}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        );
+        let mut stream = TcpStream::connect(addr).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(30)))
+            .unwrap();
+        stream.write_all(head.as_bytes()).unwrap();
+        stream.flush().unwrap();
+        std::thread::sleep(Duration::from_millis(300));
+        stream.write_all(body.as_bytes()).unwrap();
+        let mut resp = String::new();
+        let _ = stream.read_to_string(&mut resp);
+        assert!(resp.starts_with("HTTP/1.1 200"), "{resp}");
+
+        shutdown.store(true, Ordering::Relaxed);
+        let _ = handle.join();
+        runtime.shutdown();
     }
 
     fn response_json(resp: &str) -> serde_json::Value {

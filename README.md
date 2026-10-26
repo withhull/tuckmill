@@ -9,69 +9,30 @@ simply to run models that do not fit in RAM; it is to make the best possible
 use of every Mac's compute, memory, and storage while preserving model
 quality.
 
-> **Build status (read this first).** The orchestration stack is implemented
-> and tested: inspection, planning, admission, storage, packing, worker
-> isolation, the local API, and the benchmark harness. Three backends exist
-> (ADR-005): the *reference test engine* (synthetic output,
-> `--allow-test-engine`), **TuckCore** (experimental executor for dense Qwen3:
-> bounded block streaming, explicit buffer ownership, completion-fenced
-> release, artifact identity verified before execution, real byte-level BPE
-> tokenization), and the **pinned llama.cpp reference** (`--engine llama`,
-> runtime-loaded, never vendored). Stage A is underway: Qwen3-0.6B executes
-> end-to-end on real weights, `verify --reference` records teacher-forced
-> logits under registered per-dtype tolerances, and the measured gap to
-> llama.cpp named the kernel work: K01's first CPU increment (NEON fused
-> packed dot, zero-copy mapped weight blocks) is implemented and re-validated
-> — scheduling stays bit-exact, the registered envelopes are unchanged under
-> both forced selections, and the matched smoke matrix separates
-> vectorization from copy-avoidance effects. Kernel implementation and
-> weight storage are explicit, recorded load choices (`--kernels`,
-> `--storage`); eviction counts are never presented as RAM release.
-> Nothing is certified; no performance comparative claim is made. The
-> TuckCore Metal path started at Gate C: C0/C1 implement one device/queue
-> owner, typed GPU resource handles with live allocation accounting,
-> completion-fenced dispatch, and the first kernels (packed Q8_0
-> matrix-vector decode plus F16/F32 utilities) compiled from
-> `native/metal/kernels.metal` at this revision and validated against the
-> scalar reference on real tensor shapes and real artifact tensor bytes
-> (ADR-007). C2 completes the path: the pinned Qwen3-0.6B Q8_0 artifact
-> decodes end-to-end on the GPU under `--kernels metal` (fail-closed; no
-> silent CPU fallback), matching the CPU scalar oracle within 4.7e-5 on
-> teacher-forced logits with identical greedy output; GPU weights equal the
-> artifact payload and every allocation is checked against the admitted
-> plan. C3 makes prefill fast: prompt chunks run as batched packed GEMM +
-> chunked causal attention in one grouped command buffer per chunk, the
-> vocabulary projection runs for the final position only, and the batch is
-> chosen by exact preflight geometry against the admitted plan; measured
-> warm-worker TTFT at 512 tokens dropped from 15.1s to ~1.1s (batch 16). Stage A verification is hardened:
-> malformed scoring fails closed, verification records are immutable with
-> held-out qualification, the governor drives real backend commands
-> (protocol v7), tokenization is reference-first (llama.cpp when configured;
-> non-GPT-2 pre-tokenizers are refused, never approximated), and executors
-> verify the artifact's full content digest before running. Chat requests
-> execute with the artifact's own template and typed sampling through the
-> worker: prompts are rendered by a byte-exact recognized Qwen3 template and
-> tokenized reference-first; completed stop sequences and EOS markers never
-> reach visible output — including a stop completing inside a token's text
-> with trailing bytes — with visible (`committed`) and sampled (`generated`)
-> token counts tracked separately and byte provenance preserved for UTF-8
-> characters split across tokens; the worker refuses to load when its live
-> arenas exceed the plan's reservations (KV is priced at the executed
-> representation, 4 bytes per element in TuckCore); and equivalent requests
-> reuse one loaded model with isolated per-request state — a reused request
-> allocates KV for its own admitted need, never for a larger prepared
-> capacity. HTTP streaming reads a request-scoped identity snapshot and can
-> never block on the generating worker; governor commands are scoped to the
-> request that was active when they were decided; benchmark throughput
-> counts model tokens from the worker's Done frame (record schema v4), with
-> visible-chunk cadence reported separately. Every request is validated
-> against the plan it will actually run under at the shared dispatch
-> boundary — before any queueing or allocation, with cold and warm workers
-> rejecting identically — and warm reuse additionally re-checks the
-> worker's retained allocations against the current plan's reservations
-> rather than trusting model identity alone. See
-> [docs/certification-matrix.md](docs/certification-matrix.md) and
-> [docs/claims.md](docs/claims.md).
+## Status (read this first)
+
+Engineering build, nothing certified. Details and evidence:
+[docs/certification-matrix.md](docs/certification-matrix.md); allowed
+statements: [docs/claims.md](docs/claims.md).
+
+- **Orchestration** — inspect, import, pack, plan (`R + U + H <= B`
+  admission), isolated worker, OpenAI-style `/v1/chat/completions` with
+  SSE, `verify --reference` against pinned llama.cpp, labeled bench
+  records: implemented and tested.
+- **TuckCore (experimental executor)** — Qwen3 dense runs on CPU (scalar
+  oracle + NEON K01) and on Metal (resident, batched prefill). Qwen3.5
+  hybrid (`qwen35`) runs on Metal through the CLI and worker (raw
+  completion; sequential prefill). Formats executed: F32/F16/BF16/Q8_0/
+  Q4_0/Q4_1 on CPU, Q8_0/F16 on Metal; K-quants and IQ formats are refused.
+- **Reference backend** — pinned llama.cpp b11695 (`--engine llama`),
+  runtime-loaded, never vendored; the comparison oracle and speed baseline.
+- **Not built yet** — partial residency/streaming on the GPU, MoE
+  execution, speculative decoding, prefix caching, K-quant kernels.
+- **Measured gap** — TuckCore is slower than llama.cpp Metal on every
+  model measured so far; per-tier baselines are in
+  [benchmarks/results/](benchmarks/results/). No comparative claim is
+  made.
+- **Hardware exercised** — one MacBook Air M3 8 GB. Other tiers: pending.
 
 ## Quickstart
 
@@ -87,6 +48,7 @@ tuckmill inspect model.gguf                      # validate without loading weig
 tuckmill import model.gguf --alias my-model      # atomic, resumable, verified
 tuckmill plan my-model                           # R+U+H<=B admission, mode, assumptions
 tuckmill run my-model --prompt "explain RoPE" --engine tuckcore   # real weights
+tuckmill run my-model --prompt "..." --engine tuckcore --kernels metal  # GPU (required for qwen35)
 tuckmill run my-model --engine tuckcore --kernels scalar --storage owned   # forced reference variants
 tuckmill verify my-model                         # residency/streaming equivalence
 tuckmill verify my-model --reference             # llama.cpp vs TuckCore logits (needs TUCKMILL_LLAMA_LIB);
@@ -95,6 +57,7 @@ tuckmill verify my-model --reference --kernels scalar --storage owned   # forced
 tuckmill run my-model --allow-test-engine        # synthetic pipeline run
 tuckmill bench my-model --engine tuckcore        # record: e2e + decode-only throughput, resolved selections
 tuckmill bench my-model --engine llama --gpu-layers 99   # Metal baseline (performance only)
+scripts/bench-baseline.sh model.gguf             # ABBA baseline: tuckcore vs llama.cpp vs llama-bench (+ MLX probe)
 tuckmill stats my-model --engine tuckcore        # resolved kernel/storage, storage accounting, phase counters
 tuckmill serve --allow-test-engine               # loopback API (127.0.0.1:8378)
 tuckmill cache list && tuckmill cache prune --dry-run
@@ -105,16 +68,16 @@ floored at 2 GiB and capped at 24 GiB. `--memory-budget` overrides it.
 
 ## Execution strategy by memory tier
 
-One execution engine, different optimized strategies — never separate
-products. Strategies are chosen per request from measured device state; they
-are strategies, not guarantees that every model fits a tier.
+One execution engine, different strategies per model and per Mac — never
+separate products. The planner chooses by admission (`R + U + H <= B`);
+the table is the target design, with each strategy's state today.
 
-| Unified memory | Strategy |
-| --- | --- |
-| 8 GB | Compact weights, strict memory budgeting, selective streaming, foreground protection |
-| 16–24 GB | Hybrid resident/streamed execution, optimized quantized kernels, adaptive caching |
-| 32–48 GB | Larger resident models, specialized Metal kernels, efficient prefill, speculative decoding where beneficial |
-| 64–128 GB+ | Maximum resident execution, advanced batching, low-latency decoding, high-throughput inference |
+| Unified memory | Strategy | State |
+| --- | --- | --- |
+| 8 GB | Compact weights, strict budgeting, selective streaming, foreground protection | budgeting/admission ✅; CPU block streaming ✅ (dense Qwen3); GPU streaming ⛔ Phase 2 |
+| 16–24 GB | Hybrid resident/streamed execution, quantized kernels, adaptive caching | ⛔ Phases 1–3 |
+| 32–48 GB | Larger resident models, specialized kernels, fast prefill, speculative decoding | resident Metal ✅ (small models); kernels ⛔ Phase 1; speculation ⛔ Phase 4 |
+| 64–128 GB+ | Maximum resident execution, batching, low-latency decoding | ⛔ Phases 1, 4 |
 
 **Resident-first:** when weights fit, they load once and stay resident.
 Streaming protects constrained machines — it is a strategy, not the
@@ -148,8 +111,9 @@ architecture.
 | `bench` — standard-v1 records with per-prompt data, cache-state labels, caveats | ✅ |
 | llama.cpp/ggml reference backend (`--engine llama`) — pinned revision via a header-checked C shim, loaded at runtime (never vendored); `verify --reference` compares it against TuckCore on identical token IDs | ✅ integrated (wrapper uncertified) |
 | Custom CPU kernels | 🟡 K01's first increment — aarch64 NEON fused Q8_0/F16 dot with zero-copy mapped blocks — implemented and numerically validated; K02–K09 specified |
-| Custom Metal kernels | ⛔ none implemented; the scalar CPU path remains the arithmetic oracle |
-| MoE streaming, hybrid/compressed (Bonsai) execution | ⛔ gated milestones |
+| Custom Metal kernels | 🟡 Q8_0/F16 GEMV and batched GEMM, attention, norms, RoPE, SwiGLU (Qwen3); Gated DeltaNet, conv, gated attention, packed f16 KV (Qwen3.5) — correct-first, oracle-qualified, not yet competitive; the scalar CPU path remains the arithmetic oracle |
+| Qwen3.5 hybrid (`qwen35`) on Metal | ✅ experimental: CLI/worker raw completion, greedy output equal to the CPU oracle on the pinned 0.8B; chat ⛔ (template not recognized), batched prefill ⛔ Q35-2D |
+| GPU partial residency / streaming, MoE execution, compressed (Bonsai) execution | ⛔ gated milestones (Phases 2–3) |
 
 ## Architecture
 
@@ -196,16 +160,16 @@ native/metal        TuckCore Metal path: C ABI (tm_metal.h) + MSL kernels (ADR-0
 native/llamaref     tm_llama_shim.c: narrow C surface over pinned llama.cpp
 kernels/            K01–K09 work-package registry (K01 implemented increment; K02–K09 specified)
 adapters/           qwen3, qwen3moe, qwen3.5-hybrid, bonsai2-hybrid specs
-benchmarks/         standard-v1 frozen workload; comparator program (llama.cpp, MLX, Splash)
-docs/adr/           ADR-001..006
+benchmarks/         standard-v1 frozen workload; comparator program; per-tier results/
+docs/adr/           ADR-001..008
 docs/               certification matrix, claim ledger
-scripts/            build.sh, test.sh, demo.sh
+scripts/            build.sh, test.sh, demo.sh, fetch-llama.sh, bench-baseline.sh
 ```
 
 ## Verification and benchmarks
 
 `scripts/test.sh` runs formatting, `clippy -D warnings`, and the full test
-suite (388 tests),
+suite (476 tests at this revision),
 including adversarial GGUF/Safetensors fixtures, planner math, governor
 semantics, import/pack fault injection, worker-protocol framing, HTTP
 auth/SSE (including long streams through the real endpoint), CLI end-to-end

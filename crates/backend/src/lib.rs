@@ -430,6 +430,14 @@ pub struct BackendStats {
     /// bytes; absent when the engine retains no GPU workspaces.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub retained_workspace_bytes: Option<u64>,
+    /// Session state (KV planes, recurrent state) allocated once at load
+    /// for the prepared capacity and held across requests. Engines that
+    /// allocate KV per request report none. When present, reuse of a warm
+    /// worker re-checks it against the current plan's KV reservation: a
+    /// worker prepared for a larger context is never inherited by a plan
+    /// that reserved less state than the worker holds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retained_state_bytes: Option<u64>,
     /// Effective Metal prefill micro-batch prepared at load. Recorded so
     /// benchmarks can report requested versus effective batching.
     #[serde(default, skip_serializing_if = "Option::is_none")]

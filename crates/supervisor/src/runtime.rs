@@ -302,12 +302,15 @@ fn validate_request_against_plan(plan: &ExecutionPlan, request: &RunRequest) -> 
 /// not reserve what the worker still holds; declining reuse reloads under
 /// the new plan, where the batch geometry is re-preflighted (a smaller
 /// reservation yields a smaller prepared batch, or a typed rejection). KV
-/// needs no such check: sessions are allocated per request for the request's
-/// own admitted need, bounded to the current plan by the request validation.
+/// allocated per request needs no such check (it is bounded to the current
+/// plan by the request validation), but session state an engine allocated
+/// once at load and holds across requests (the hybrid GPU path's packed KV
+/// and recurrent state) must fit the current plan's KV reservation.
 fn reuse_fits_retained(
     plan: &ExecutionPlan,
     retained_weight_bytes: u64,
     retained_workspace_bytes: u64,
+    retained_state_bytes: u64,
 ) -> bool {
     let weight_allowance = plan
         .budget
@@ -316,7 +319,10 @@ fn reuse_fits_retained(
         .bytes()
         .saturating_add(plan.budget.reservation_breakdown.io_buffers.bytes());
     let workspace_allowance = plan.budget.reservation_breakdown.workspaces.bytes();
-    retained_weight_bytes <= weight_allowance && retained_workspace_bytes <= workspace_allowance
+    let state_allowance = plan.budget.reservation_breakdown.kv_state.bytes();
+    retained_weight_bytes <= weight_allowance
+        && retained_workspace_bytes <= workspace_allowance
+        && retained_state_bytes <= state_allowance
 }
 
 /// Resolved identity of a loaded worker (caller holds the worker lock or is
@@ -348,6 +354,10 @@ struct WorkerSlot {
     /// buffers). Reuse requires them to fit the current plan's workspaces
     /// reservation as well.
     retained_workspace_bytes: u64,
+    /// Session state allocated at load and held across requests (zero when
+    /// the backend allocates KV per request). Reuse requires it to fit the
+    /// current plan's KV reservation.
+    retained_state_bytes: u64,
 }
 
 /// Stable identity of a loaded model in a worker (B4). Built from immutable
@@ -989,6 +999,7 @@ impl Runtime {
                             plan,
                             w.retained_weight_bytes,
                             w.retained_workspace_bytes,
+                            w.retained_state_bytes,
                         );
                         if identity_ok && !retention_ok {
                             self.logger.warn(
@@ -1001,6 +1012,10 @@ impl Runtime {
                                     (
                                         "retained_workspace_bytes".to_string(),
                                         serde_json::json!(w.retained_workspace_bytes),
+                                    ),
+                                    (
+                                        "retained_state_bytes".to_string(),
+                                        serde_json::json!(w.retained_state_bytes),
                                     ),
                                     (
                                         "plan_weights_allowance_bytes".to_string(),
@@ -1070,6 +1085,10 @@ impl Runtime {
                         .as_ref()
                         .and_then(|s| s.retained_workspace_bytes)
                         .unwrap_or(0);
+                    let retained_state = ack_stats
+                        .as_ref()
+                        .and_then(|s| s.retained_state_bytes)
+                        .unwrap_or(0);
                     let kv_reserved = plan.budget.reservation_breakdown.kv_state.bytes();
                     if kv_prepared > kv_reserved {
                         return Err(TuckmillError::new(
@@ -1120,6 +1139,7 @@ impl Runtime {
                         key: requested,
                         retained_weight_bytes: retained_weight,
                         retained_workspace_bytes: retained_workspace,
+                        retained_state_bytes: retained_state,
                         worker,
                     });
                 } else {
@@ -1965,19 +1985,25 @@ mod tests {
         // is zero and any nonzero retained workspace must decline.
         let workspace_allowance = plan.budget.reservation_breakdown.workspaces.bytes();
         assert_eq!(workspace_allowance, 0);
-        assert!(reuse_fits_retained(&plan, 0, 0));
+        let state_allowance = plan.budget.reservation_breakdown.kv_state.bytes();
+        assert!(reuse_fits_retained(&plan, 0, 0, 0));
         assert!(reuse_fits_retained(
             &plan,
             weight_allowance,
-            workspace_allowance
+            workspace_allowance,
+            state_allowance
         ));
         assert!(
-            !reuse_fits_retained(&plan, weight_allowance + 1, 0),
+            !reuse_fits_retained(&plan, weight_allowance + 1, 0, 0),
             "retained weights beyond the plan's weights + I/O reservations must decline reuse"
         );
         assert!(
-            !reuse_fits_retained(&plan, 0, workspace_allowance + 1),
+            !reuse_fits_retained(&plan, 0, workspace_allowance + 1, 0),
             "retained GPU workspaces beyond the plan's workspaces reservation must decline reuse"
+        );
+        assert!(
+            !reuse_fits_retained(&plan, 0, 0, state_allowance + 1),
+            "session state held across requests beyond the plan's KV reservation must decline reuse"
         );
     }
 

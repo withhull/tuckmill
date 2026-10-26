@@ -352,6 +352,7 @@ mod tests {
                     trims_applied: Some(3),
                     gpu_allocated_bytes: Some(1 << 24),
                     retained_workspace_bytes: Some(1 << 18),
+                    retained_state_bytes: Some(1 << 21),
                     prefill_batch: Some(8),
                     threads: Some(4),
                     kernel_impl: Some("neon".into()),

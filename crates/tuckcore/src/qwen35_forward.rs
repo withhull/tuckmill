@@ -171,7 +171,16 @@ impl ArtifactTensorSource {
                 TuckmillError::new(ErrorCode::StorageLost, format!("cannot stat artifact: {e}"))
             })?
             .len();
+        // The handle's cursor is shared with every clone (a content-digest
+        // pass leaves it at EOF), so inspection starts from offset 0
+        // explicitly rather than wherever the last reader stopped.
         let mut reader = file;
+        std::io::Seek::seek(&mut reader, std::io::SeekFrom::Start(0)).map_err(|e| {
+            TuckmillError::new(
+                ErrorCode::StorageLost,
+                format!("cannot rewind the verified artifact handle: {e}"),
+            )
+        })?;
         let insp = gguf::inspect_reader(&mut reader, len, &Limits::default(), None)?;
         let registry = AdapterRegistry::builtin()?;
         let (cfg, layout) = resolve(&insp, &registry)?;
@@ -1192,6 +1201,17 @@ mod tests {
         std::fs::write(&path, &bytes).unwrap();
         let model = Qwen35Model::open(&path, tokens_hint, KvPrecision::F16).unwrap();
         (dir, model)
+    }
+
+    #[test]
+    fn tensor_source_inspects_from_offset_zero_after_a_full_read() {
+        // Regression (Q35-1E.2): the executor digests the artifact through
+        // the same handle first, leaving the shared cursor at EOF.
+        let (dir, _model) = fixture_model(16);
+        let file = File::open(dir.path().join("q35.gguf")).unwrap();
+        std::io::copy(&mut &file, &mut std::io::sink()).unwrap();
+        let source = ArtifactTensorSource::from_open_file(&file).unwrap();
+        assert!(!source.layout().layers.is_empty());
     }
 
     #[test]

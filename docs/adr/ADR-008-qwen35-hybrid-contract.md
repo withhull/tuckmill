@@ -329,3 +329,45 @@ never accepted by any real artifact.
 - **Real-artifact trace qualification.** Beyond logits, the pinned
   model's hidden states now compare at layers [0, 3, 11, 23] and every
   position: worst |diff| 6.4e-5 (registered 5e-4); logits 4.88e-4.
+
+## Addendum 13 (Q35-1E.2: supervised worker wiring)
+
+- **Served path.** `TuckCore` declares `qwen35` and routes it, after the
+  shared identity prologue (metadata/tensor-index hashes, full content
+  digest through the one opened handle), to `Qwen35GpuModel` on the
+  resident Metal path. The CPU forward stays the oracle: any other
+  resolved kernel set is a typed refusal naming `--kernels metal`.
+- **Options are honored or refused, never ignored.** f32 KV (the GPU
+  stores packed f16 only), `prefill_batch` (batched prefill is Q35-2D),
+  CPU weight-cache/block options, and non-resident plan modes are typed
+  refusals before any GPU allocation.
+- **Plan enforcement per class.** `gpu_alloc_plan` is checked against the
+  plan's weights, kv_state and workspaces reservations separately; after
+  load the device ledger must equal the preflight total. On the pinned
+  artifact at context 2048 the plan's kv_state reservation (45,367,296 B)
+  equals the preflighted state exactly.
+- **Session state is held, so reuse re-checks it.** Unlike dense TuckCore
+  (KV per request), the hybrid model allocates its KV and recurrent state
+  once at load. The worker reports it as `retained_state_bytes`, and the
+  supervisor's reuse gate now requires it to fit the current plan's KV
+  reservation. Every request resets the session first: recurrent state
+  never crosses requests (fixture test: identical repeated requests give
+  identical output).
+- **Scoring** replays from a reset session in order, so logits at a
+  position always come from exactly the prefix (positions out of order
+  included); fixture logits match the CPU oracle within the registered
+  1e-4.
+- **Text.** Raw completion runs with the pinned reference tokenizer (the
+  `qwen35` pre-tokenizer is never approximated). An unrecognized declared
+  chat template now refuses chat only; it previously refused raw
+  completion too, contradicting its own next action.
+- **Evidence** (pinned artifact, isolated worker, release): greedy
+  output for "The capital of France is" equals the CPU oracle's greedy
+  continuation exactly (" Paris.\nThe capital of France is", 8 tokens);
+  the pinned llama.cpp Metal run produces the same 8 tokens.
+- **Fixed on the way:** `ArtifactTensorSource::from_open_file` inspected
+  through the handle's shared cursor, which the content-digest pass
+  leaves at EOF; it now rewinds explicitly (regression test).
+- Scope: sequential prefill (one token per step) and per-layer dispatch
+  as qualified in Q35-2C. The measured baseline is recorded in
+  `benchmarks/results/8gb/`; performance work is Q35-2D/Phase 1.

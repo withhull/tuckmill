@@ -30,6 +30,8 @@ use crate::gpu;
 use crate::kernels::{KernelSelection, ResolvedKernels};
 use crate::loader::{BlockLoader, BlockPolicy, StorageSelection};
 use crate::model;
+use crate::qwen35_forward::{ArtifactTensorSource, TensorSource};
+use crate::qwen35_gpu::{self, GpuAllocPlan, Qwen35Gpu, Qwen35GpuModel};
 use crate::sampling::{self, Rng, SamplingConfig};
 use crate::tensor;
 use crate::tokenizer::{Tokenizer, Utf8StreamDecoder};
@@ -99,9 +101,29 @@ struct Loaded {
     metal: Option<Arc<gpu::MetalForward>>,
 }
 
+/// A loaded Qwen3.5 hybrid (`qwen35`) artifact on the resident Metal path
+/// (Q35-1E.2). Weights, packed f16 KV and f32 recurrent/convolution state
+/// live on one GPU owner for the prepared capacity; every request starts
+/// from a reset session, so recurrent state is never shared across
+/// requests.
+struct HybridLoaded {
+    model: Qwen35GpuModel,
+    tokenizer: Tokenizer,
+    eos_token_id: Option<u32>,
+    context_total: u64,
+    /// Exact preflighted GPU allocation (equal to the device ledger after
+    /// load); each class was checked against its plan reservation.
+    alloc: GpuAllocPlan,
+    /// Session state bytes used by the most recent request (the prepared
+    /// state; 0 before the first request).
+    session_kv_bytes: Arc<AtomicU64>,
+    counters: ProfileCounters,
+}
+
 /// The experimental custom native executor.
 pub struct TuckCore {
     loaded: Option<Loaded>,
+    hybrid: Option<HybridLoaded>,
     /// Optional artificial per-token pacing (tests only; real forward work is
     /// its own pacing).
     pub per_token_delay: Duration,
@@ -121,6 +143,7 @@ impl TuckCore {
     pub fn new() -> Self {
         Self {
             loaded: None,
+            hybrid: None,
             per_token_delay: Duration::ZERO,
             trim_epoch: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             applied_trim_epoch: Arc::new(std::sync::atomic::AtomicU64::new(0)),
@@ -128,7 +151,7 @@ impl TuckCore {
     }
 
     pub fn is_loaded(&self) -> bool {
-        self.loaded.is_some()
+        self.loaded.is_some() || self.hybrid.is_some()
     }
 
     /// Applies a pending cache trim if the governor asked for one; returns
@@ -164,7 +187,11 @@ impl TuckCore {
             certified: false,
             backend_abi_version: BACKEND_ABI_VERSION,
             worker_protocol_version: WORKER_PROTOCOL_VERSION,
-            kernels: kernel_ids(self.loaded.as_ref().map(|l| l.kernels)),
+            kernels: if self.hybrid.is_some() {
+                vec![HYBRID_KERNEL_ID.to_string()]
+            } else {
+                kernel_ids(self.loaded.as_ref().map(|l| l.kernels))
+            },
             build_id: crate::format_build_id(),
         }
     }
@@ -177,15 +204,17 @@ impl InferenceBackend for TuckCore {
 
     fn capabilities(&self) -> BackendCapabilities {
         BackendCapabilities {
-            architectures: vec!["qwen3".to_string()],
+            architectures: vec!["qwen3".to_string(), "qwen35".to_string()],
             moe: false,
-            hybrid: false,
+            hybrid: true,
             ternary: false,
             requires_gpu: false,
             notes: vec![
                 "Stage 0: dense Qwen3 GGUF, scalar f32 reference kernels, bounded weight streaming (ADR-005)"
                     .to_string(),
-                "MoE, hybrid, and ternary profiles remain separately gated; routing is never substituted"
+                "Qwen3.5 hybrid (qwen35): resident Metal path only (--kernels metal), packed f16 KV, sequential prefill (ADR-008)"
+                    .to_string(),
+                "MoE and ternary profiles remain separately gated; routing is never substituted"
                     .to_string(),
             ],
         }
@@ -368,8 +397,6 @@ impl InferenceBackend for TuckCore {
         ProfileCounters::record(&counters.content_verify_nanos, verify_start);
 
         // ---- configuration and type checks ----
-        let registry = AdapterRegistry::builtin()?;
-        let (cfg, _adapter) = model::resolve(&insp, &registry)?;
         for t in &insp.tensors {
             if !tensor::is_supported(t.type_id) {
                 return Err(TuckmillError::new(
@@ -384,6 +411,26 @@ impl InferenceBackend for TuckCore {
                 .with_action("Use a supported type set; packing never re-quantizes."));
             }
         }
+        let payload: u64 = insp.tensors.iter().map(|t| t.byte_size).sum();
+        if insp.arch_id().as_deref() == Some("qwen35") {
+            let note = self.load_qwen35(
+                plan,
+                artifact,
+                &opts,
+                kernels,
+                &insp,
+                &artifact_file,
+                HybridLoadContext {
+                    payload,
+                    content_verified,
+                    counters,
+                    load_start,
+                },
+            )?;
+            return Ok(note);
+        }
+        let registry = AdapterRegistry::builtin()?;
+        let (cfg, _adapter) = model::resolve(&insp, &registry)?;
         let kv_bound = KvState::bytes_for(&cfg, plan.context.total_context);
         if kv_bound > KvState::MAX_KV_BYTES {
             return Err(TuckmillError::new(
@@ -414,7 +461,6 @@ impl InferenceBackend for TuckCore {
                 "Rebuild the plan from the executor's resolved KV representation (4 bytes per element); understated reservations are never loaded.",
             ));
         }
-        let payload: u64 = insp.tensors.iter().map(|t| t.byte_size).sum();
         let weight_allowance = plan
             .budget
             .reservation_breakdown
@@ -599,6 +645,7 @@ impl InferenceBackend for TuckCore {
                 note_batch.unwrap_or(1)
             ));
         }
+        self.hybrid = None;
         self.loaded = Some(Loaded {
             loader,
             tracker,
@@ -617,9 +664,16 @@ impl InferenceBackend for TuckCore {
     }
 
     fn generate(&mut self, req: &GenerateRequest, ctl: &mut GenControl<'_>) -> Result<GenOutcome> {
-        let loaded = self.loaded.as_ref().ok_or_else(|| {
-            TuckmillError::new(ErrorCode::WorkerFailed, "tuckcore has no loaded artifact")
-        })?;
+        let context_total = match (&self.loaded, &self.hybrid) {
+            (Some(l), _) => l.context_total,
+            (None, Some(h)) => h.context_total,
+            (None, None) => {
+                return Err(TuckmillError::new(
+                    ErrorCode::WorkerFailed,
+                    "tuckcore has no loaded artifact",
+                ))
+            }
+        };
         let prompt_len = req.prompt_tokens.len() as u64;
         if prompt_len == 0 {
             return Err(TuckmillError::new(
@@ -633,19 +687,39 @@ impl InferenceBackend for TuckCore {
                 "max_output_tokens must be positive",
             ));
         }
-        if prompt_len + req.max_output_tokens > loaded.context_total {
+        if prompt_len + req.max_output_tokens > context_total {
             return Err(TuckmillError::new(
                 ErrorCode::ContextExceedsBudget,
                 format!(
-                    "prompt {prompt_len} + max output {} exceeds admitted context {}",
-                    req.max_output_tokens, loaded.context_total
+                    "prompt {prompt_len} + max output {} exceeds admitted context {context_total}",
+                    req.max_output_tokens
                 ),
             ));
         }
 
-        let cancelled = {
-            let cancel = ctl.cancel.clone();
-            move || cancel.load(Ordering::Relaxed)
+        if let Some(hybrid) = &self.hybrid {
+            // Every request starts from a zeroed session: recurrent and KV
+            // state are never carried from one request into another.
+            hybrid.model.reset()?;
+            hybrid
+                .session_kv_bytes
+                .store(hybrid.alloc.state, Ordering::Relaxed);
+            let mut engine = StepEngine::Hybrid {
+                model: &hybrid.model,
+            };
+            let spec = SessionSpec {
+                tokenizer: &hybrid.tokenizer,
+                eos_token_id: hybrid.eos_token_id,
+                prefill_batch: 1,
+                per_token_delay: self.per_token_delay,
+            };
+            return run_session(&mut engine, &spec, req, ctl);
+        }
+        let Some(loaded) = self.loaded.as_ref() else {
+            return Err(TuckmillError::new(
+                ErrorCode::WorkerFailed,
+                "tuckcore has no loaded artifact",
+            ));
         };
         // Control closure for the forward loops: services external input
         // (poll) and applies governor-ordered cache trims at safe points.
@@ -696,190 +770,16 @@ impl InferenceBackend for TuckCore {
             }
         };
 
-        // Worker-side timing: measured inside the request, so supervisor
-        // wall time minus this is queueing/transport, never compute.
-        let t0 = Instant::now();
-        let empty_timing = |t0: Instant| RequestTiming {
-            total_ms: t0.elapsed().as_secs_f64() * 1000.0,
-            prefill_ms: None,
-            first_token_ms: None,
-            decode_ms: None,
-        };
-
-        (ctl.on_state)(RunState::Warming);
-        pause_loop(ctl, Duration::from_millis(1))?;
-        if ctl.cancel.load(Ordering::Relaxed) {
-            return Ok(GenOutcome::new(FinishReason::Cancelled, 0).with_timing(empty_timing(t0)));
-        }
-
-        (ctl.on_state)(RunState::Prefilling);
-        // Chunked prefill: the Metal path processes up to its prepared
-        // micro-batch per dispatch group; the CPU path keeps single-token
-        // steps. Vocabulary logits are computed for the final chunk only.
-        let prefill_batch = match &loaded.metal {
-            Some(m) => m.prefill_batch() as usize,
-            None => 1,
-        };
-        let mut logits: Vec<f32> = Vec::new();
-        let prompt_tokens = &req.prompt_tokens;
-        let mut pos = 0usize;
-        while pos < prompt_tokens.len() {
-            let take = prefill_batch.min(prompt_tokens.len() - pos);
-            let want = pos + take == prompt_tokens.len();
-            pause_loop(ctl, Duration::ZERO)?;
-            match engine.prefill_chunk(&prompt_tokens[pos..pos + take], pos, want, &cancelled) {
-                Ok(Some(l)) => logits = l,
-                Ok(None) => {}
-                Err(e) if e.code() == ErrorCode::Cancelled => {
-                    return Ok(
-                        GenOutcome::new(FinishReason::Cancelled, 0).with_timing(empty_timing(t0))
-                    )
-                }
-                Err(e) => return Err(e),
-            }
-            pos += take;
-        }
-        let prefill_ms = t0.elapsed().as_secs_f64() * 1000.0;
-
-        (ctl.on_state)(RunState::Generating);
-        // Typed sampling policy from the request: greedy when temperature is
-        // zero; the declared transforms and seed otherwise. Unsupported
-        // values are refused before any compute, never ignored.
-        req.sampling.validate()?;
-        let sampling_cfg = SamplingConfig {
-            temperature: req.sampling.temperature,
-            top_k: None,
-            top_p: req.sampling.top_p,
-        };
-        let mut rng = Rng::new(req.seed);
-        let mut generated_ids: u64 = 0;
-        let mut release_index: u64 = 0;
-        // Model-token production timing (the honest basis for decode
-        // throughput); visible-content timing stays a supervisor-side,
-        // user-experience concern and is never mixed into it.
-        let mut first_generated_at: Option<Instant> = None;
-        let mut last_generated_at: Option<Instant> = None;
-        // Incremental UTF-8 assembly with byte-level token provenance:
-        // multibyte characters split across tokens are held until complete,
-        // and every token that contributed a byte to a visible character is
-        // counted, never just the token that happened to complete it.
-        let mut decoder = Utf8StreamDecoder::new();
-        // Bounded pending-output buffering: a stop sequence spanning several
-        // tokens (or completing inside a piece, with trailing text after it)
-        // is held until it is found, so no stop marker can leak into the
-        // visible stream.
-        let mut buffer = VisibleOutputBuffer::new(&req.stop);
-        // Emit a release: deliver the chunk and report whether the client
-        // asked to stop.
-        let emit = |text: &str, release_index: &mut u64, ctl: &mut GenControl<'_>| -> bool {
-            if text.is_empty() {
-                return true;
-            }
-            let keep = (ctl.on_token)(*release_index, text);
-            *release_index += 1;
-            keep
-        };
-        let outcome = 'decode: {
-            for i in 0..req.max_output_tokens {
-                if ctl.cancel.load(Ordering::Relaxed) {
-                    let r = buffer.flush();
-                    let _ = emit(&r.text, &mut release_index, ctl);
-                    break 'decode GenOutcome::new(
-                        FinishReason::Cancelled,
-                        buffer.visible_tokens(),
-                    )
-                    .with_generated(generated_ids);
-                }
-                pause_loop(ctl, self.per_token_delay)?;
-
-                let Some(token) = sampling::sample(&logits, &sampling_cfg, &mut rng) else {
-                    return Err(TuckmillError::new(
-                        ErrorCode::WorkerFailed,
-                        "sampling produced no token: every logit was non-finite",
-                    ));
-                };
-                generated_ids = i + 1;
-                let produced_at = Instant::now();
-                if first_generated_at.is_none() {
-                    first_generated_at = Some(produced_at);
-                }
-                last_generated_at = Some(produced_at);
-                if Some(token) == loaded.weights.cfg.eos_token_id {
-                    // The model-defined EOS token is never visible: its
-                    // bytes are not pushed, and anything held is flushed
-                    // because no stop sequence can complete after EOS.
-                    let r = buffer.flush();
-                    let _ = emit(&r.text, &mut release_index, ctl);
-                    break 'decode GenOutcome::new(FinishReason::Eos, buffer.visible_tokens())
-                        .with_generated(generated_ids);
-                }
-                let piece = match loaded.tokenizer.token_text(token) {
-                    Some(_) => decoder.push_token(&loaded.tokenizer.token_bytes(token), i),
-                    None => {
-                        let placeholder = format!("<tok {token}>");
-                        decoder.push_token(placeholder.as_bytes(), i)
-                    }
-                };
-                let mut client_stop = false;
-                let mut stop = false;
-                for run in piece {
-                    let release = buffer.push(&run.owners, &run.text);
-                    if !emit(&release.text, &mut release_index, ctl) {
-                        client_stop = true;
-                        break;
-                    }
-                    if release.stop {
-                        stop = true;
-                        break;
-                    }
-                }
-                if client_stop {
-                    let r = buffer.flush();
-                    let _ = emit(&r.text, &mut release_index, ctl);
-                    break 'decode GenOutcome::new(FinishReason::Stop, buffer.visible_tokens())
-                        .with_generated(generated_ids);
-                }
-                if stop {
-                    break 'decode GenOutcome::new(FinishReason::Stop, buffer.visible_tokens())
-                        .with_generated(generated_ids);
-                }
-                if i + 1 < req.max_output_tokens {
-                    // The generated token i occupies position prompt_len + i.
-                    let pos = (prompt_len + i) as usize;
-                    match engine.step(token, pos, &cancelled) {
-                        Ok(l) => logits = l,
-                        Err(e) if e.code() == ErrorCode::Cancelled => {
-                            let r = buffer.flush();
-                            let _ = emit(&r.text, &mut release_index, ctl);
-                            break 'decode GenOutcome::new(
-                                FinishReason::Cancelled,
-                                buffer.visible_tokens(),
-                            )
-                            .with_generated(generated_ids);
-                        }
-                        Err(e) => return Err(e),
-                    }
-                }
-            }
-            let r = buffer.flush();
-            let _ = emit(&r.text, &mut release_index, ctl);
-            GenOutcome::new(FinishReason::Length, buffer.visible_tokens())
-                .with_generated(generated_ids)
-        };
-        let ms = |from: Instant, to: Instant| (to - from).as_secs_f64() * 1000.0;
-        let timing = RequestTiming {
-            total_ms: ms(t0, Instant::now()),
-            prefill_ms: Some(prefill_ms),
-            // Production-based: time to the first sampled token, and the
-            // span between first and last sampled token. Buffering and
-            // visibility decisions cannot inflate model throughput.
-            first_token_ms: first_generated_at.map(|f| ms(t0, f)),
-            decode_ms: match (first_generated_at, last_generated_at) {
-                (Some(f), Some(l)) if l > f => Some(ms(f, l)),
-                _ => None,
+        let spec = SessionSpec {
+            tokenizer: &loaded.tokenizer,
+            eos_token_id: loaded.weights.cfg.eos_token_id,
+            prefill_batch: match &loaded.metal {
+                Some(m) => m.prefill_batch() as usize,
+                None => 1,
             },
+            per_token_delay: self.per_token_delay,
         };
-        Ok(outcome.with_timing(timing))
+        run_session(&mut engine, &spec, req, ctl)
     }
 
     fn score(
@@ -889,6 +789,9 @@ impl InferenceBackend for TuckCore {
         cancelled: &dyn Fn() -> bool,
         sink: &mut dyn FnMut(u64, &[f32]) -> bool,
     ) -> Result<u64> {
+        if let Some(hybrid) = &self.hybrid {
+            return Self::score_hybrid(hybrid, tokens, positions, cancelled, sink);
+        }
         let loaded = self.loaded.as_ref().ok_or_else(|| {
             TuckmillError::new(ErrorCode::WorkerFailed, "tuckcore has no loaded artifact")
         })?;
@@ -935,6 +838,9 @@ impl InferenceBackend for TuckCore {
     }
 
     fn stats(&self) -> BackendStats {
+        if let Some(hybrid) = &self.hybrid {
+            return Self::hybrid_stats(hybrid);
+        }
         match &self.loaded {
             Some(loaded) => {
                 let s = loaded.loader.stats();
@@ -977,6 +883,8 @@ impl InferenceBackend for TuckCore {
                         bytes => Some(bytes),
                     },
                     retained_weight_bytes: Some(loaded.retained_weight_bytes),
+                    // Dense KV is allocated per request; nothing is held.
+                    retained_state_bytes: None,
                     trims_applied: Some(loaded.counters.trims_applied.load(Ordering::Relaxed)),
                     gpu_allocated_bytes: loaded.metal.as_ref().map(|m| m.allocated_bytes()),
                     retained_workspace_bytes: loaded.metal.as_ref().map(|m| m.workspace_bytes()),
@@ -1015,12 +923,212 @@ impl InferenceBackend for TuckCore {
     }
 
     fn shutdown(&mut self) {
+        self.hybrid = None;
         if let Some(loaded) = self.loaded.take() {
             loaded.loader.evict_all();
             // Leases must have drained; anything left would be a bug.
             debug_assert_eq!(loaded.tracker.in_flight(), 0);
         }
     }
+}
+
+/// What the shared decode loop needs from a loaded model family.
+struct SessionSpec<'a> {
+    tokenizer: &'a Tokenizer,
+    eos_token_id: Option<u32>,
+    prefill_batch: usize,
+    per_token_delay: Duration,
+}
+
+/// The request loop shared by every model family: chunked prefill, typed
+/// sampling, stop/EOS-correct visible output, and production-based timing.
+/// The engine decides the arithmetic; this loop decides nothing about it.
+fn run_session(
+    engine: &mut StepEngine<'_>,
+    spec: &SessionSpec<'_>,
+    req: &GenerateRequest,
+    ctl: &mut GenControl<'_>,
+) -> Result<GenOutcome> {
+    let prompt_len = req.prompt_tokens.len() as u64;
+    let cancelled = {
+        let cancel = ctl.cancel.clone();
+        move || cancel.load(Ordering::Relaxed)
+    };
+    // Worker-side timing: measured inside the request, so supervisor
+    // wall time minus this is queueing/transport, never compute.
+    let t0 = Instant::now();
+    let empty_timing = |t0: Instant| RequestTiming {
+        total_ms: t0.elapsed().as_secs_f64() * 1000.0,
+        prefill_ms: None,
+        first_token_ms: None,
+        decode_ms: None,
+    };
+
+    (ctl.on_state)(RunState::Warming);
+    pause_loop(ctl, Duration::from_millis(1))?;
+    if ctl.cancel.load(Ordering::Relaxed) {
+        return Ok(GenOutcome::new(FinishReason::Cancelled, 0).with_timing(empty_timing(t0)));
+    }
+
+    (ctl.on_state)(RunState::Prefilling);
+    // Chunked prefill: the Metal path processes up to its prepared
+    // micro-batch per dispatch group; the CPU path keeps single-token
+    // steps. Vocabulary logits are computed for the final chunk only.
+    let prefill_batch = spec.prefill_batch;
+    let mut logits: Vec<f32> = Vec::new();
+    let prompt_tokens = &req.prompt_tokens;
+    let mut pos = 0usize;
+    while pos < prompt_tokens.len() {
+        let take = prefill_batch.min(prompt_tokens.len() - pos);
+        let want = pos + take == prompt_tokens.len();
+        pause_loop(ctl, Duration::ZERO)?;
+        match engine.prefill_chunk(&prompt_tokens[pos..pos + take], pos, want, &cancelled) {
+            Ok(Some(l)) => logits = l,
+            Ok(None) => {}
+            Err(e) if e.code() == ErrorCode::Cancelled => {
+                return Ok(GenOutcome::new(FinishReason::Cancelled, 0).with_timing(empty_timing(t0)))
+            }
+            Err(e) => return Err(e),
+        }
+        pos += take;
+    }
+    let prefill_ms = t0.elapsed().as_secs_f64() * 1000.0;
+
+    (ctl.on_state)(RunState::Generating);
+    // Typed sampling policy from the request: greedy when temperature is
+    // zero; the declared transforms and seed otherwise. Unsupported
+    // values are refused before any compute, never ignored.
+    req.sampling.validate()?;
+    let sampling_cfg = SamplingConfig {
+        temperature: req.sampling.temperature,
+        top_k: None,
+        top_p: req.sampling.top_p,
+    };
+    let mut rng = Rng::new(req.seed);
+    let mut generated_ids: u64 = 0;
+    let mut release_index: u64 = 0;
+    // Model-token production timing (the honest basis for decode
+    // throughput); visible-content timing stays a supervisor-side,
+    // user-experience concern and is never mixed into it.
+    let mut first_generated_at: Option<Instant> = None;
+    let mut last_generated_at: Option<Instant> = None;
+    // Incremental UTF-8 assembly with byte-level token provenance:
+    // multibyte characters split across tokens are held until complete,
+    // and every token that contributed a byte to a visible character is
+    // counted, never just the token that happened to complete it.
+    let mut decoder = Utf8StreamDecoder::new();
+    // Bounded pending-output buffering: a stop sequence spanning several
+    // tokens (or completing inside a piece, with trailing text after it)
+    // is held until it is found, so no stop marker can leak into the
+    // visible stream.
+    let mut buffer = VisibleOutputBuffer::new(&req.stop);
+    // Emit a release: deliver the chunk and report whether the client
+    // asked to stop.
+    let emit = |text: &str, release_index: &mut u64, ctl: &mut GenControl<'_>| -> bool {
+        if text.is_empty() {
+            return true;
+        }
+        let keep = (ctl.on_token)(*release_index, text);
+        *release_index += 1;
+        keep
+    };
+    let outcome = 'decode: {
+        for i in 0..req.max_output_tokens {
+            if ctl.cancel.load(Ordering::Relaxed) {
+                let r = buffer.flush();
+                let _ = emit(&r.text, &mut release_index, ctl);
+                break 'decode GenOutcome::new(FinishReason::Cancelled, buffer.visible_tokens())
+                    .with_generated(generated_ids);
+            }
+            pause_loop(ctl, spec.per_token_delay)?;
+
+            let Some(token) = sampling::sample(&logits, &sampling_cfg, &mut rng) else {
+                return Err(TuckmillError::new(
+                    ErrorCode::WorkerFailed,
+                    "sampling produced no token: every logit was non-finite",
+                ));
+            };
+            generated_ids = i + 1;
+            let produced_at = Instant::now();
+            if first_generated_at.is_none() {
+                first_generated_at = Some(produced_at);
+            }
+            last_generated_at = Some(produced_at);
+            if Some(token) == spec.eos_token_id {
+                // The model-defined EOS token is never visible: its
+                // bytes are not pushed, and anything held is flushed
+                // because no stop sequence can complete after EOS.
+                let r = buffer.flush();
+                let _ = emit(&r.text, &mut release_index, ctl);
+                break 'decode GenOutcome::new(FinishReason::Eos, buffer.visible_tokens())
+                    .with_generated(generated_ids);
+            }
+            let piece = match spec.tokenizer.token_text(token) {
+                Some(_) => decoder.push_token(&spec.tokenizer.token_bytes(token), i),
+                None => {
+                    let placeholder = format!("<tok {token}>");
+                    decoder.push_token(placeholder.as_bytes(), i)
+                }
+            };
+            let mut client_stop = false;
+            let mut stop = false;
+            for run in piece {
+                let release = buffer.push(&run.owners, &run.text);
+                if !emit(&release.text, &mut release_index, ctl) {
+                    client_stop = true;
+                    break;
+                }
+                if release.stop {
+                    stop = true;
+                    break;
+                }
+            }
+            if client_stop {
+                let r = buffer.flush();
+                let _ = emit(&r.text, &mut release_index, ctl);
+                break 'decode GenOutcome::new(FinishReason::Stop, buffer.visible_tokens())
+                    .with_generated(generated_ids);
+            }
+            if stop {
+                break 'decode GenOutcome::new(FinishReason::Stop, buffer.visible_tokens())
+                    .with_generated(generated_ids);
+            }
+            if i + 1 < req.max_output_tokens {
+                // The generated token i occupies position prompt_len + i.
+                let pos = (prompt_len + i) as usize;
+                match engine.step(token, pos, &cancelled) {
+                    Ok(l) => logits = l,
+                    Err(e) if e.code() == ErrorCode::Cancelled => {
+                        let r = buffer.flush();
+                        let _ = emit(&r.text, &mut release_index, ctl);
+                        break 'decode GenOutcome::new(
+                            FinishReason::Cancelled,
+                            buffer.visible_tokens(),
+                        )
+                        .with_generated(generated_ids);
+                    }
+                    Err(e) => return Err(e),
+                }
+            }
+        }
+        let r = buffer.flush();
+        let _ = emit(&r.text, &mut release_index, ctl);
+        GenOutcome::new(FinishReason::Length, buffer.visible_tokens()).with_generated(generated_ids)
+    };
+    let ms = |from: Instant, to: Instant| (to - from).as_secs_f64() * 1000.0;
+    let timing = RequestTiming {
+        total_ms: ms(t0, Instant::now()),
+        prefill_ms: Some(prefill_ms),
+        // Production-based: time to the first sampled token, and the
+        // span between first and last sampled token. Buffering and
+        // visibility decisions cannot inflate model throughput.
+        first_token_ms: first_generated_at.map(|f| ms(t0, f)),
+        decode_ms: match (first_generated_at, last_generated_at) {
+            (Some(f), Some(l)) if l > f => Some(ms(f, l)),
+            _ => None,
+        },
+    };
+    Ok(outcome.with_timing(timing))
 }
 
 /// One request's execution session: the CPU scalar forward with its f32
@@ -1035,6 +1143,11 @@ enum StepEngine<'a> {
         forward: &'a gpu::MetalForward,
         kv: gpu::MetalKv,
     },
+    /// Qwen3.5 hybrid on the GPU: the model owns its (reset) session state
+    /// and its position counter; tokens are processed strictly in order.
+    Hybrid {
+        model: &'a Qwen35GpuModel,
+    },
 }
 
 impl StepEngine<'_> {
@@ -1042,6 +1155,7 @@ impl StepEngine<'_> {
         match self {
             StepEngine::Cpu { fwd, kv } => fwd.forward_token(kv, token, pos, cancelled),
             StepEngine::Gpu { forward, kv } => forward.forward_token(kv, token, pos, cancelled),
+            StepEngine::Hybrid { model } => hybrid_step(model, token, pos, cancelled),
         }
     }
 
@@ -1066,6 +1180,261 @@ impl StepEngine<'_> {
             StepEngine::Gpu { forward, kv } => {
                 forward.prefill_chunk(kv, tokens, start, want_logits, cancelled)
             }
+            // Sequential prefill (batched prefill is gated: Q35-2D).
+            StepEngine::Hybrid { model } => {
+                let mut last = None;
+                for (i, token) in tokens.iter().enumerate() {
+                    last = Some(hybrid_step(model, *token, start + i, cancelled)?);
+                }
+                Ok(if want_logits { last } else { None })
+            }
+        }
+    }
+}
+
+/// One in-order hybrid step. Cancellation is honored at every token
+/// boundary; a position that disagrees with the model's own counter is an
+/// internal fault, never silently re-aligned.
+fn hybrid_step(
+    model: &Qwen35GpuModel,
+    token: u32,
+    pos: usize,
+    cancelled: &dyn Fn() -> bool,
+) -> Result<Vec<f32>> {
+    if cancelled() {
+        return Err(TuckmillError::new(
+            ErrorCode::Cancelled,
+            "generation cancelled at a token boundary",
+        ));
+    }
+    if model.positions() != pos {
+        return Err(TuckmillError::new(
+            ErrorCode::Internal,
+            format!(
+                "qwen35 step at position {pos} but the session holds {} positions",
+                model.positions()
+            ),
+        ));
+    }
+    let mut logits = Vec::new();
+    model.forward_token(token, &mut logits)?;
+    Ok(logits)
+}
+
+/// Identity of the hybrid device path: the Q35-2C GPU model over raw
+/// Q8_0/F16 weights, resolved implementation "metal".
+const HYBRID_KERNEL_ID: &str = "Q35-2C:qwen35-q8_0+f16:metal";
+
+/// Load-time facts the shared verification prologue hands to the hybrid
+/// loader.
+struct HybridLoadContext {
+    payload: u64,
+    content_verified: bool,
+    counters: ProfileCounters,
+    load_start: Instant,
+}
+
+impl TuckCore {
+    /// Q35-1E.2: load a verified `qwen35` artifact onto the resident Metal
+    /// path. Every option that does not apply is refused rather than
+    /// ignored, and every GPU allocation class is checked against its plan
+    /// reservation from the exact preflight before any buffer exists.
+    #[allow(clippy::too_many_arguments)]
+    fn load_qwen35(
+        &mut self,
+        plan: &ExecutionPlan,
+        artifact: &ArtifactRef,
+        opts: &TuckCoreOptions,
+        kernels: ResolvedKernels,
+        insp: &tuckmill_manifest::gguf::GgufInspection,
+        artifact_file: &std::fs::File,
+        ctx: HybridLoadContext,
+    ) -> Result<String> {
+        if kernels != ResolvedKernels::Metal {
+            return Err(TuckmillError::new(
+                ErrorCode::UnsupportedArchitecture,
+                format!(
+                    "qwen35 executes on the resident Metal path only in this build (resolved kernels: {}); the CPU forward is the test oracle, not a served path",
+                    kernels.as_str()
+                ),
+            )
+            .with_action("Select --kernels metal."));
+        }
+        if plan.mode != ExecutionMode::Resident {
+            return Err(TuckmillError::new(
+                ErrorCode::InvalidPlan,
+                format!(
+                    "the qwen35 Metal path is resident-only, but the plan mode is {}; streaming is not implemented for this architecture",
+                    plan.mode.as_str()
+                ),
+            )
+            .with_action("Raise --memory-budget so the plan is resident, or lower --context."));
+        }
+        if opts.prefill_batch.is_some() {
+            return Err(TuckmillError::new(
+                ErrorCode::InvalidRequest,
+                "batched prefill for qwen35 is gated (Q35-2D); prompts prefill one token per step, so prefill_batch must not be set",
+            ));
+        }
+        if opts.weight_cache_bytes.is_some() || opts.block_bytes.is_some() {
+            return Err(TuckmillError::new(
+                ErrorCode::InvalidRequest,
+                "weight-cache and block options apply to CPU weight streaming; the qwen35 Metal path keeps weights resident",
+            ));
+        }
+        match opts.kv_precision.as_deref() {
+            None | Some("f16") => {}
+            Some("f32") => {
+                return Err(TuckmillError::new(
+                    ErrorCode::UnsupportedArchitecture,
+                    "the qwen35 GPU KV cache stores packed f16 only; f32 KV is not implemented on this path and is never substituted",
+                )
+                .with_action("Use the default (f16) KV precision for qwen35."))
+            }
+            Some(other) => {
+                return Err(TuckmillError::new(
+                    ErrorCode::InvalidRequest,
+                    format!("unknown kv_precision {other:?}; use \"f32\" or \"f16\""),
+                ))
+            }
+        }
+
+        // The tensor source reads through the verified handle.
+        let source = ArtifactTensorSource::from_open_file(artifact_file)?;
+        let capacity = usize::try_from(plan.context.total_context).map_err(|_| {
+            TuckmillError::new(
+                ErrorCode::ContextExceedsBudget,
+                "admitted context does not fit this platform's address space",
+            )
+        })?;
+        let alloc = qwen35_gpu::gpu_alloc_plan(&source, capacity)?;
+        let reserved = &plan.budget.reservation_breakdown;
+        for (class, need, have) in [
+            ("weights", alloc.weights, reserved.weights.bytes()),
+            ("kv_state", alloc.state, reserved.kv_state.bytes()),
+            ("workspaces", alloc.scratch, reserved.workspaces.bytes()),
+        ] {
+            if need > have {
+                return Err(TuckmillError::new(
+                    ErrorCode::InvalidPlan,
+                    format!(
+                        "the plan reserves {} for {class} but the qwen35 GPU model needs {} at context {}; refusing before any GPU allocation",
+                        Bytes(have),
+                        Bytes(need),
+                        plan.context.total_context
+                    ),
+                )
+                .with_action("Rebuild the plan for this executor; understated reservations are never loaded."));
+            }
+        }
+        let model = Qwen35GpuModel::load(Qwen35Gpu::open()?, &source, capacity, alloc.total())?;
+        if model.allocated_bytes() != alloc.total() {
+            return Err(TuckmillError::new(
+                ErrorCode::Internal,
+                format!(
+                    "qwen35 GPU ledger holds {} but the preflight priced {}; refusing an unaccounted allocation",
+                    model.allocated_bytes(),
+                    alloc.total()
+                ),
+            ));
+        }
+        let tokenizer = Tokenizer::from_gguf(insp)?;
+        let mut note = format!(
+            "tuckcore (experimental, uncertified): qwen35 hybrid, {} layers, vocab {}, kernels metal [oracle-f32], kv f16 packed, sequential prefill; real weights from {} ({} payload), GPU ledger {} = weights {} + state {} + scratch {}",
+            source.layout().layers.len(),
+            source.config().vocab,
+            artifact.path,
+            Bytes(ctx.payload),
+            Bytes(alloc.total()),
+            Bytes(alloc.weights),
+            Bytes(alloc.state),
+            Bytes(alloc.scratch)
+        );
+        note.push_str(&format!(
+            "; payload content hash {}",
+            if ctx.content_verified {
+                "verified"
+            } else {
+                "not verified (no digest recorded or verification disabled by option)"
+            }
+        ));
+        if let Some(extra) = tokenizer.pretokenizer_note() {
+            note.push_str("; ");
+            note.push_str(&extra);
+        }
+        ProfileCounters::record(&ctx.counters.load_nanos, ctx.load_start);
+        self.loaded = None;
+        self.hybrid = Some(HybridLoaded {
+            eos_token_id: source.config().eos_token_id,
+            model,
+            tokenizer,
+            context_total: plan.context.total_context,
+            alloc,
+            session_kv_bytes: Arc::new(AtomicU64::new(0)),
+            counters: ctx.counters,
+        });
+        Ok(note)
+    }
+
+    /// Teacher-forced scoring on the hybrid path: the session is replayed
+    /// in order from a reset state, so logits at a position always come
+    /// from exactly the tokens before and at it.
+    fn score_hybrid(
+        hybrid: &HybridLoaded,
+        tokens: &[u32],
+        positions: &[u64],
+        cancelled: &dyn Fn() -> bool,
+        sink: &mut dyn FnMut(u64, &[f32]) -> bool,
+    ) -> Result<u64> {
+        let model = &hybrid.model;
+        model.reset()?;
+        let mut logits = Vec::new();
+        let mut scored = 0u64;
+        for position in positions {
+            let pos = usize::try_from(*position).unwrap_or(usize::MAX);
+            if tokens.is_empty() || pos >= tokens.len() {
+                return Err(TuckmillError::new(
+                    ErrorCode::InvalidRequest,
+                    "scoring position is outside the token sequence",
+                ));
+            }
+            if model.positions() > pos {
+                model.reset()?;
+            }
+            while model.positions() <= pos {
+                if cancelled() {
+                    return Err(TuckmillError::new(
+                        ErrorCode::Cancelled,
+                        "scoring cancelled at a position boundary",
+                    ));
+                }
+                model.forward_token(tokens[model.positions()], &mut logits)?;
+            }
+            scored += 1;
+            if !sink(*position, &logits) {
+                break;
+            }
+        }
+        Ok(scored)
+    }
+
+    fn hybrid_stats(hybrid: &HybridLoaded) -> BackendStats {
+        BackendStats {
+            kv_precision: Some("f16".to_string()),
+            kv_state_bytes: Some(hybrid.alloc.state),
+            session_kv_bytes: match hybrid.session_kv_bytes.load(Ordering::Relaxed) {
+                0 => None,
+                bytes => Some(bytes),
+            },
+            retained_weight_bytes: Some(hybrid.alloc.weights),
+            retained_workspace_bytes: Some(hybrid.alloc.scratch),
+            retained_state_bytes: Some(hybrid.alloc.state),
+            trims_applied: Some(hybrid.counters.trims_applied.load(Ordering::Relaxed)),
+            gpu_allocated_bytes: Some(hybrid.model.allocated_bytes()),
+            prefill_batch: Some(1),
+            kernel_impl: Some(ResolvedKernels::Metal.as_str().to_string()),
+            numerical_profile: Some(NumericalProfile::OracleF32.as_str().to_string()),
+            ..BackendStats::default()
         }
     }
 }
@@ -1347,6 +1716,164 @@ mod tests {
     /// within the registered f32 reduction-order tolerance where GPU
     /// summation order legitimately differs. CI runs this because the
     /// runner has a GPU; a dev machine without one skips loudly.
+    /// Hybrid (qwen35) fixture artifact with the same generous arena
+    /// reservations as the dense fixture.
+    fn hybrid_fixture() -> (tempfile::TempDir, ArtifactRef, Plan) {
+        let (dir, mut artifact, plan) = fixture();
+        let path = dir.path().join("q35.gguf");
+        write_synthetic(&path, &SyntheticConfig::tiny_qwen35()).unwrap();
+        let insp =
+            tuckmill_manifest::gguf::inspect(&path, &tuckmill_manifest::gguf::Limits::default())
+                .unwrap();
+        artifact.path = path.display().to_string();
+        artifact.file_bytes = insp.file_len;
+        artifact.metadata_hash = insp.metadata_hash().unwrap().as_str().to_string();
+        artifact.tensor_index_hash = insp.tensor_index_hash().unwrap().as_str().to_string();
+        artifact.tokenizer_hash = insp
+            .tokenizer_hash()
+            .unwrap()
+            .map(|h| h.as_str().to_string());
+        artifact.arch_id = Some("qwen35".into());
+        (dir, artifact, plan)
+    }
+
+    fn metal_or_skip() -> bool {
+        if tuckmill_metal::probe().available {
+            return true;
+        }
+        assert!(
+            std::env::var("TUCKMILL_REQUIRE_METAL").is_err(),
+            "TUCKMILL_REQUIRE_METAL is set but no Metal device is available"
+        );
+        eprintln!("skipping: no Metal device");
+        false
+    }
+
+    #[test]
+    fn hybrid_load_refuses_every_option_it_cannot_honor() {
+        let (_dir, artifact, plan) = hybrid_fixture();
+        assert!(TuckCore::new().capabilities().supports_arch("qwen35"));
+        for (opts, code) in [
+            (
+                serde_json::json!({"kernels": "scalar"}),
+                ErrorCode::UnsupportedArchitecture,
+            ),
+            (
+                serde_json::json!({"kernels": "metal", "kv_precision": "f32"}),
+                ErrorCode::UnsupportedArchitecture,
+            ),
+            (
+                serde_json::json!({"kernels": "metal", "prefill_batch": 4}),
+                ErrorCode::InvalidRequest,
+            ),
+            (
+                serde_json::json!({"kernels": "metal", "weight_cache_bytes": 65536}),
+                ErrorCode::InvalidRequest,
+            ),
+        ] {
+            let mut engine = TuckCore::new();
+            let err = engine.load(&plan, &artifact, Some(&opts)).unwrap_err();
+            assert_eq!(err.code(), code, "{opts}: {err}");
+            assert!(!engine.is_loaded(), "{opts}: nothing is loaded on refusal");
+        }
+    }
+
+    #[test]
+    fn hybrid_load_refuses_understated_reservations_before_allocating() {
+        if !metal_or_skip() {
+            return;
+        }
+        let (_dir, artifact, mut plan) = hybrid_fixture();
+        plan.budget.reservation_breakdown.kv_state = Bytes(1);
+        plan.plan_id = plan.compute_id().unwrap();
+        let mut engine = TuckCore::new();
+        let err = engine
+            .load(
+                &plan,
+                &artifact,
+                Some(&serde_json::json!({"kernels": "metal"})),
+            )
+            .unwrap_err();
+        assert_eq!(err.code(), ErrorCode::InvalidPlan, "{err}");
+        assert!(err.to_string().contains("kv_state"), "{err}");
+        assert!(!engine.is_loaded());
+    }
+
+    #[test]
+    fn hybrid_metal_session_matches_the_cpu_oracle_and_resets_per_request() {
+        if !metal_or_skip() {
+            return;
+        }
+        let (_dir, artifact, plan) = hybrid_fixture();
+        let mut engine = TuckCore::new();
+        let note = engine
+            .load(
+                &plan,
+                &artifact,
+                Some(&serde_json::json!({"kernels": "metal"})),
+            )
+            .unwrap();
+        assert!(note.contains("qwen35 hybrid"), "{note}");
+        assert_eq!(
+            engine.identity().kernels,
+            vec![HYBRID_KERNEL_ID.to_string()]
+        );
+
+        // The device ledger equals the preflight, and every class is
+        // reported for the supervisor's plan and reuse checks.
+        let stats = engine.stats();
+        let state = stats.retained_state_bytes.expect("held session state");
+        let weights = stats.retained_weight_bytes.unwrap();
+        let scratch = stats.retained_workspace_bytes.unwrap();
+        assert_eq!(stats.gpu_allocated_bytes, Some(weights + state + scratch));
+        assert_eq!(stats.kv_state_bytes, Some(state));
+        assert_eq!(stats.kernel_impl.as_deref(), Some("metal"));
+        assert_eq!(stats.kv_precision.as_deref(), Some("f16"));
+
+        // Teacher-forced logits vs the CPU oracle (registered 1e-4 on the
+        // fixture, ADR-008 Addendum 10), positions out of order included.
+        let tokens: Vec<u32> = vec![1, 9, 4, 17, 5, 23];
+        let positions = [0u64, 3, 5, 2];
+        let mut got = Vec::new();
+        {
+            let mut sink = |pos: u64, logits: &[f32]| {
+                got.push((pos, logits.to_vec()));
+                true
+            };
+            let scored = engine
+                .score(&tokens, &positions, &|| false, &mut sink)
+                .unwrap();
+            assert_eq!(scored, positions.len() as u64);
+        }
+        let path = std::path::Path::new(&artifact.path);
+        for (pos, logits) in &got {
+            let mut oracle = crate::qwen35_forward::Qwen35Model::open(
+                path,
+                tokens.len(),
+                crate::qwen35_kv::KvPrecision::F16,
+            )
+            .unwrap();
+            let mut want = Vec::new();
+            oracle
+                .forward_tokens(&tokens[..=*pos as usize], &mut want)
+                .unwrap();
+            let worst = logits
+                .iter()
+                .zip(&want)
+                .map(|(a, b)| (a - b).abs())
+                .fold(0f32, f32::max);
+            assert!(worst <= 1e-4, "position {pos}: |diff| {worst}");
+        }
+
+        // Two identical requests produce identical output: recurrent state
+        // never leaks from one request into the next.
+        let (first, text_a) = run_generate(&mut engine, vec![1, 2, 3], 6);
+        let (second, text_b) = run_generate(&mut engine, vec![1, 2, 3], 6);
+        assert_eq!(first.generated, second.generated);
+        assert_eq!(text_a, text_b);
+        assert_eq!(engine.stats().session_kv_bytes, Some(state));
+    }
+
     #[test]
     fn metal_forward_matches_scalar_on_fixture() {
         if !tuckmill_metal::probe().available {

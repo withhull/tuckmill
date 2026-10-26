@@ -820,11 +820,12 @@ impl InferenceBackend for LlamaRef {
 
     fn capabilities(&self) -> BackendCapabilities {
         BackendCapabilities {
-            // Expanded as adapters are validated; the fixture and the Qwen3
-            // dense family are the initial certified-intent set.
-            architectures: vec!["qwen3".to_string()],
+            // Expanded as adapters are validated: the Qwen3 dense family,
+            // and Qwen3.5 hybrid (qwen35), whose adapter was qualified
+            // against this pinned revision (teacher-forced logits, Q35-1D).
+            architectures: vec!["qwen3".to_string(), "qwen35".to_string()],
             moe: false,
-            hybrid: false,
+            hybrid: true,
             ternary: false,
             requires_gpu: false,
             notes: vec![

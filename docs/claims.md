@@ -6,7 +6,7 @@ the code, output, or documentation.
 
 | Claim or hypothesis | Current evidence | Allowed statement in this build |
 | --- | --- | --- |
-| Custom kernels are in the development scope | K01's first increment implemented (aarch64 NEON fused Q8_0/F16 packed dot + zero-copy mapped weight blocks) and validated against the scalar reference and the llama.cpp envelopes; K02–K09 specified in `kernels/registry.json` | K01 increment: "implemented and numerically validated (CPU)"; K02–K09: "Specified" — never "fast"; no Metal kernels are implemented |
+| Custom kernels are in the development scope | K01's first increment implemented (aarch64 NEON fused Q8_0/F16 packed dot + zero-copy mapped weight blocks) and validated against the scalar reference and the llama.cpp envelopes; K02–K09 specified in `kernels/registry.json` | K01 increment: "implemented and numerically validated (CPU)"; K02–K09: "Specified" — never "fast". Metal kernels exist for the Qwen3 (Gate C) and Qwen3.5 (Q35-2) paths, qualified against the CPU oracle — "correct-first, oracle-qualified", never "optimized" or "competitive" |
 | Verification executes the requested configuration | `verify` (both modes) propagates kernel/storage/profile/KV/cache selections into the actual worker load; the record separates requested from resolved (acknowledged) settings, and a substitution fails closed with a typed error. Forced scalar+owned and neon+mapped reference runs are qualified (held-out), and the scalar/neon f16 statistics are bit-identical on this artifact | "The report names the implementation that actually ran; a run whose resolved settings differ from the request is refused, never recorded" |
 | Scoring honors the declared KV precision | Generation and scoring share one typed KV state factory; f16 rounding is applied at store time and is measured (rounding unit test + precision-dependent scoring test); f16 and f32 reference runs are separately qualified on held-out inputs | "A report labeled f16 executed f16 scoring semantics; f32 is a separate qualification, not an assumption" |
 | A compact 9B can be useful on 8 GB | Published weight file sizes (publisher-reported) | "Candidate awaiting physical-Mac qualification" |
@@ -35,40 +35,28 @@ the code, output, or documentation.
 | TuckCore runs the model on the GPU | Gate C2, on the pinned artifact (sha256 `9465e63a…bb031`): the full dense-Qwen3 decode executes on Metal through crates/metal with grouped per-step dispatch; teacher-forced logits match the same-artifact CPU scalar oracle within 4.673e-5 over a max |logit| of 16.589 (top-1 identical at held positions) and greedy generation is identical (" where the air is filled with"); GPU weights are the artifact payload exactly (633,495,552 B) plus ~0.8 MiB workspaces, all checked against the admitted plan before acceptance; `--kernels metal` is fail-closed (no silent CPU fallback) and refuses the llama-cpu numerical profile, which is CPU-only | "Within the registered oracle-f32 comparison policy on this artifact" — measured decode-only 26.66 tok/s is provisional bench evidence, not a performance claim, and first-token latency is dominated by the not-yet-optimized prefill (C3) |
 | TuckCore "runs" a model | Real Qwen3-0.6B Q8_0 executes end-to-end (pinned artifact Qwen/Qwen3-0.6B-GGUF, sha256 `9465e63a…bb031`, re-verified byte-identical before the physical checks): correct completions on real weights (e.g. "The capital of France is" → " Paris. The capital of France"), token IDs within registered llama.cpp envelopes, records persisted | "Experimental, uncertified executor; real-model execution demonstrated; quality and performance unmeasured" |
 | TuckCore tokenizes text | Built-in byte-level BPE derived from the artifact's own GGUF vocabulary (exact byte roundtrip, GPT-2-style pre-tokenizers only — others refused, never approximated); with the pinned llama.cpp shim configured, prompts encode through llama.cpp itself (reference-first) | "Byte-level BPE for GPT-2-style vocabularies; reference tokenizer when configured; unsupported pre-tokenizers are refused" |
-| A TuckCore Metal path exists and is accounted for | Gate C C0/C1: `native/metal` C ABI + `crates/metal` typed handles — one device/queue owner, shared/private buffers with RAII release, live allocated-byte accounting, committed/completed dispatch counters and GPU-time measurement, checked bounds and typed refusals (foreign-context buffers, zero-length allocations, malformed MSL all rejected with messages); Q8_0 packed GEMV and F16/F32 utility kernels compiled at runtime from this revision's MSL | "GPU resources are created, accounted for, and released through one owned context; the model itself is not executed on the GPU yet (C2)" |
+| A TuckCore Metal path exists and is accounted for | Gate C C0/C1: `native/metal` C ABI + `crates/metal` typed handles — one device/queue owner, shared/private buffers with RAII release, live allocated-byte accounting, committed/completed dispatch counters and GPU-time measurement, checked bounds and typed refusals (foreign-context buffers, zero-length allocations, malformed MSL all rejected with messages); Q8_0 packed GEMV and F16/F32 utility kernels compiled at runtime from this revision's MSL | "GPU resources are created, accounted for, and released through one owned context" (full-model GPU execution: see the C2 and Qwen3.5 rows) |
 | GPU results are validated before they are trusted | The packed GEMV matches the sequential f32 scalar reference on synthetic boundary data (scales incl. min subnormal, max finite, zero; quantized extremes -128/127; real shapes 1x32..151936x1024, row tails included) and on real Qwen3-0.6B `blk.0.attn_q.weight` bytes, within tolerance-registered f32 reduction-order error (1e-4 x max|reference|); IEEE round-to-nearest-even f16 conversions verified against a bit-exact reference including subnormals and overflow | "Operator-level GPU numerics are verified against the CPU reference before any GPU execution path is selected" — full-model GPU equivalence arrives with C2 |
 | TuckCore is fast | Only cache/thermal-uncontrolled smoke numbers exist (repeated + historical 64/64 matrices in `benchmarks/README.md`: neon+mapped reproduced within ~6% across sessions at ≈4 e2e / ≈8-9 decode tok/s; owned-storage variants degraded 2-6× under sustained load/free-memory pressure; llama.cpp CPU ≈29-35 e2e and Metal ≈56-61 e2e as speed baselines) — no controlled comparison, no sustained-thermal data | Smoke numbers only as labeled, with the recorded configuration, the throughput definition (end-to-end vs decode-only), and the worker-side vs supervisor-side split named; exact rates are provisional until G3; never a comparative performance claim |
 | Kernel/storage selection is explicit and recorded | `--kernels auto\|scalar\|neon` and `--storage auto\|mapped\|owned` resolve at load (NEON and mapped refuse where unavailable); resolved choices appear in the load note, backend stats, engine identity (`K01:q8_0+f16:<impl>`), and per-sample benchmark records; forced-scalar regression tests prove selection changes the implementation | "The record names the implementation that ran; no hidden downgrades — refusals are typed errors" |
 | Cache eviction is not memory release | Mapped-mode eviction drops cache entries and issues `madvise(MADV_DONTNEED)` (advisory, recorded as `page_advice_bytes`); page residency is measured separately with `mincore`; owned buffers, mapped VM, resident pages, and charged footprint are reported as separate numbers and never summed | Report each storage number for what it is; never present an eviction count as RAM freed, and never present the 512 MiB footprint as "total RAM used" |
 | Streaming equivalence in fixture tests proves real-model behavior | Fixtures prove execution paths, not model behavior | Equivalence speaks to scheduling/streaming fidelity only |
+| Qwen3.5 (`qwen35`) runs through the CLI and the isolated worker | Q35-1E.2 on the pinned ggml-org Qwen3.5-0.8B Q8_0 (sha256 `37ae482d…814f`): the isolated worker loads it on the resident Metal path with per-class plan enforcement (weights / kv_state / workspaces vs the exact GPU preflight; device ledger == preflight) and per-request session reset; greedy raw completion for "The capital of France is" equals the CPU oracle's greedy continuation token for token (" Paris.\nThe capital of France is"), and pinned llama.cpp Metal produces the same 8 tokens; fixture scoring within 1e-4 of the oracle | "Qwen3.5-0.8B runs on the GPU through the CLI/worker, raw completion, greedy-equal to the CPU oracle on the recorded prompt" — chat stays refused (template unrecognized), prefill is sequential, speed is the recorded baseline, not a claim |
+| TuckCore is slower than llama.cpp | Qwen3-0.6B Q8_0 Metal decode ≈33.5 tok/s vs llama.cpp Metal ≈82-88 (smoke, M3 8 GiB); Qwen3.5-0.8B baseline in `benchmarks/results/8gb/` | Stating the measured gap with its record is allowed; it is never generalized to models or tiers that were not measured |
 
 ## Build status statement (canonical)
 
-> Tuckmill v0.2 engineering build (Stage A in progress): a Mac-native, high-performance local
+> Tuckmill v0.2 engineering build: a Mac-native, high-performance local
 > inference framework for Apple Silicon, engineered from the 8 GiB minimum
 > tier upward (ADR-006). The orchestration stack (inspection, planning,
 > admission, storage, packing, worker isolation, local API, benchmark
 > harness) is implemented and tested. TuckCore, the experimental custom
-> executor, runs real dense-Qwen3 weights through a scalar f32 reference path
-> plus a first validated CPU kernel increment (K01: NEON fused packed dot
-> with zero-copy mapped blocks — scheduling stays bit-exact and the
-> registered envelopes are unchanged). The TuckCore Metal path (Gate C)
-> has its first increment: one device/queue owner, typed resource handles
-> with live allocation accounting and completion-fenced dispatch, and the
-> packed Q8_0 GEMV + F16/F32 utility kernels compiled from the repository's
-> MSL and validated against the scalar reference (tolerance-registered) on
-> real tensor shapes and real artifact tensor bytes. C2 completes the
-> path: the pinned Qwen3-0.6B Q8_0 artifact now decodes end-to-end on the
-> GPU (RMSNorm, Q/K norm, RoPE, GQA attention with declared KV precision,
-> SwiGLU, residuals, final projection; CPU sampler unchanged) within
-> 4.7e-5 of the CPU scalar oracle on teacher-forced logits, with identical
-> greedy output; fast prefill is not built yet (C3), so first-token
-> latency remains prefill-bound. No configuration is certified; no
-> performance comparison against llama.cpp / MLX / Splash is claimed before
-> it is measured. Chat execution
-> runs under the artifact's own recognized template with typed sampling and
-> stop/EOS-correct visible output (protocol v7); the planner prices KV at the
-> executed representation and the worker refuses any load whose live arenas
-> exceed the admitted plan; equivalent requests reuse one loaded model with
-> per-request session state. The Gate A numerical baseline (Qwen3-0.6B
-> Q8_0, registered per-dtype envelopes) is unchanged and re-verified.
+> executor, runs dense Qwen3 on the CPU (scalar f32 oracle plus the K01
+> NEON increment) and on Metal (resident, batched prefill; within 4.7e-5
+> of the CPU oracle on teacher-forced logits), and Qwen3.5 hybrid
+> (`qwen35`) on Metal through the CLI and worker (raw completion,
+> sequential prefill, greedy-equal to the CPU oracle on the recorded
+> prompt). Every allocation is checked against the admitted plan before it
+> is accepted. Measured speed is below the pinned llama.cpp Metal baseline
+> on every model recorded so far; no configuration is certified and no
+> favorable comparison against llama.cpp / MLX / Splash is claimed.

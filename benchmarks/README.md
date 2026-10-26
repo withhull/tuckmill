@@ -23,16 +23,33 @@ Frozen workload definition: [`standard-v1.json`](standard-v1.json).
 
 ## This build's output
 
-`tuckmill bench <model> --allow-test-engine` measures the *pipeline* through
-the reference test engine (synthetic output). Records show
-`engine: reference-test`, `certified: false`, and a caveat stating that no
-model weights were executed. These records calibrate nothing about model
-quality or speed and can never promote a plan's confidence label.
+`tuckmill bench <model>` writes a standard-v1 record for the selected
+backend: `--allow-test-engine` measures the *pipeline* only (synthetic
+output, `engine: reference-test`, a caveat stating that no weights ran —
+never evidence of model speed); `--engine tuckcore` and `--engine llama`
+execute real weights and count the worker's model tokens (schema v4).
+Every record carries `certified: false` and its caveats.
 
-Real measurements require a certified executor and the four-way comparison
-of PRD §20.1 (R0 source baseline, R1 compressed reference, T0 Tuckmill
-reference kernels, T1 Tuckmill custom kernels) with randomized/ABBA ordering
-and matched no-inference foreground controls.
+## Phase 0 baselines (`scripts/bench-baseline.sh`)
+
+One command per artifact and machine:
+
+```bash
+scripts/bench-baseline.sh path/to/model.gguf
+```
+
+It runs TuckCore (`--kernels metal`) and the pinned llama.cpp
+(`--gpu-layers 99`) through the same harness on the same frozen token ids,
+alternating their order every round (ABBA), then the pinned `llama-bench`
+tool on the same file (its own tokens; a vendor-tool row, never
+identity-matched), then an offline MLX probe that only accepts the
+identical artifact. Before every model process it checks reclaimable
+memory and that no other model process runs; a run that grows swap beyond
+`SWAP_DISCARD_MIB` is listed as discarded and excluded. The first
+repetition of each invocation (worker spawn + model load) is reported as
+cold-load and kept out of warm medians. Results land in
+[`results/<tier>/`](results/) with the raw records; read them with
+[`results/TEMPLATE.md`](results/TEMPLATE.md).
 
 ## Comparator program (ADR-006)
 
@@ -156,7 +173,8 @@ cost of resident memory.
 
 K01 coverage is precise: Q8_0/F16 CPU fused dot implemented (scalar and
 NEON, selectable and recorded); Q4_0/Q4_1 stay on the scalar dequant path;
-Metal kernels are unbuilt. These exercise the harness and measured the
+the Metal kernels came later (Gate C, Q35-2) and are not covered by this
+CPU table. These exercise the harness and measured the
 kernel gap that named K01's first increment; they are single-run smoke
 numbers, not controlled comparisons (no ABBA, no warm/cold controls, no
 foreground matching). Fixture numbers say nothing about real-model behavior
