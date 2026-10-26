@@ -79,3 +79,35 @@ never in a family-specific path.
   Qwen3.5 speed on blocks). The bit-identical gate makes that safe.
 - The CLI, worker protocol and planner contracts do not change; TuckCore
   still implements `InferenceBackend`.
+
+## Step 1 record (2026-10-26): Qwen3.5 served through the engine
+
+- `crate::engine`: `ModelGraph` (`graph.rs`), the `WeightSource` seam
+  (`mod.rs`), the Qwen3.5 adapter (`adapters.rs`), and on Metal the
+  blocks `Matrix`, `SwiGluBlock`, `GdnBlock` and `AttentionBlock` plus
+  `EngineModel` (`metal.rs`): one plan function, one command buffer per
+  step and per chunk, sessions and profiling. Each block's `decode` and
+  `prefill` share one `core`.
+- **Gate passed before anything was deleted.** Run side by side, one model
+  resident at a time, on the fixture, the pinned 0.8B and the 2B (sha256
+  `1b04acba…21f2c1`): equal session state and plan total, equal device
+  ledger, bit-identical per-layer hidden states and logits at every decode
+  step, bit-identical batched-prefill logits and the decode step after it.
+- The executor serves `qwen35` through `EngineModel`; the load note names
+  the graph. Worker greedy output still equals the CPU oracle.
+- **Retired:** the Qwen3.5 model code in `qwen35_gpu.rs` (layers, model,
+  plan; 1,207 lines). Only the device operators remain there. Its
+  qualification suite moved to `engine::metal::oracle_tests` unchanged,
+  except that it targets the engine.
+- **Found on the way:**
+  - The engine makes the head explicit (`output` if present, else the
+    tied embedding). The retired model always used the embedding; the
+    CPU oracle still does and is fixed when the graph oracle lands.
+  - The derived RoPE tables are now priced as scratch, not weights. The
+    planner reserves exactly the artifact's bytes, and on the 2B (no MTP
+    block, so no slack) the old classing was rightly refused by 768 B.
+- **2B evidence:** `tuckmill run` (unified engine) and pinned llama.cpp
+  Metal produce the same 16 greedy tokens for "The capital of France
+  is".
+- Next: step 2 (dense Qwen3 on the same blocks), and the graph-driven CPU
+  oracle.

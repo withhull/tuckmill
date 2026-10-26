@@ -24,6 +24,9 @@ statements: [docs/claims.md](docs/claims.md).
   hybrid (`qwen35`) runs on Metal through the CLI and worker (raw
   completion; sequential prefill). Formats executed: F32/F16/BF16/Q8_0/
   Q4_0/Q4_1 on CPU, Q8_0/F16 on Metal; K-quants and IQ formats are refused.
+- **Unified engine (ADR-011)** — adapters describe a model as a typed
+  graph and one engine runs it from shared blocks. Qwen3.5 (0.8B, 2B) is
+  served this way; dense Qwen3 migrates next.
 - **Reference backend** — pinned llama.cpp b11695 (`--engine llama`),
   runtime-loaded, never vendored; the comparison oracle and speed baseline.
 - **Not built yet** — partial residency/streaming on the GPU, MoE

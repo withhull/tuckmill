@@ -23,6 +23,7 @@ use tuckmill_manifest::units::Bytes;
 use tuckmill_manifest::{BACKEND_ABI_VERSION, WORKER_PROTOCOL_VERSION};
 
 use crate::completion::CompletionTracker;
+use crate::engine::metal::{self as engine_metal, EngineModel};
 use crate::forward::{
     self, Forward, KvPrecision, KvState, ModelWeights, NumericalProfile, ProfileCounters,
 };
@@ -31,7 +32,7 @@ use crate::kernels::{KernelSelection, ResolvedKernels};
 use crate::loader::{BlockLoader, BlockPolicy, StorageSelection};
 use crate::model;
 use crate::qwen35_forward::{ArtifactTensorSource, TensorSource};
-use crate::qwen35_gpu::{self, GpuAllocPlan, Qwen35Gpu, Qwen35GpuModel};
+use crate::qwen35_gpu::{GpuAllocPlan, Qwen35Gpu};
 use crate::sampling::{self, Rng, SamplingConfig};
 use crate::tensor;
 use crate::tokenizer::{Tokenizer, Utf8StreamDecoder};
@@ -107,7 +108,8 @@ struct Loaded {
 /// from a reset session, so recurrent state is never shared across
 /// requests.
 struct HybridLoaded {
-    model: Qwen35GpuModel,
+    /// The qwen35 graph executed by the unified engine (ADR-011).
+    model: EngineModel,
     tokenizer: Tokenizer,
     eos_token_id: Option<u32>,
     context_total: u64,
@@ -710,7 +712,7 @@ impl InferenceBackend for TuckCore {
             let spec = SessionSpec {
                 tokenizer: &hybrid.tokenizer,
                 eos_token_id: hybrid.eos_token_id,
-                prefill_batch: qwen35_gpu::PREFILL_BATCH,
+                prefill_batch: engine_metal::PREFILL_BATCH,
                 per_token_delay: self.per_token_delay,
             };
             return run_session(&mut engine, &spec, req, ctl);
@@ -1146,7 +1148,7 @@ enum StepEngine<'a> {
     /// Qwen3.5 hybrid on the GPU: the model owns its (reset) session state
     /// and its position counter; tokens are processed strictly in order.
     Hybrid {
-        model: &'a Qwen35GpuModel,
+        model: &'a EngineModel,
     },
 }
 
@@ -1211,7 +1213,7 @@ impl StepEngine<'_> {
 /// boundary; a position that disagrees with the model's own counter is an
 /// internal fault, never silently re-aligned.
 fn hybrid_step(
-    model: &Qwen35GpuModel,
+    model: &EngineModel,
     token: u32,
     pos: usize,
     cancelled: &dyn Fn() -> bool,
@@ -1322,7 +1324,8 @@ impl TuckCore {
                 "admitted context does not fit this platform's address space",
             )
         })?;
-        let alloc = qwen35_gpu::gpu_alloc_plan(&source, capacity)?;
+        let graph = crate::engine::adapters::qwen35(source.config(), source.layout());
+        let alloc = engine_metal::alloc_plan(&graph, &source, capacity)?;
         let reserved = &plan.budget.reservation_breakdown;
         for (class, need, have) in [
             ("weights", alloc.weights, reserved.weights.bytes()),
@@ -1342,7 +1345,7 @@ impl TuckCore {
                 .with_action("Rebuild the plan for this executor; understated reservations are never loaded."));
             }
         }
-        let model = Qwen35GpuModel::load(Qwen35Gpu::open()?, &source, capacity, alloc.total())?;
+        let model = EngineModel::load(Qwen35Gpu::open()?, graph, &source, capacity, alloc.total())?;
         if model.allocated_bytes() != alloc.total() {
             return Err(TuckmillError::new(
                 ErrorCode::Internal,
@@ -1355,9 +1358,11 @@ impl TuckCore {
         }
         let tokenizer = Tokenizer::from_gguf(insp)?;
         let mut note = format!(
-            "tuckcore (experimental, uncertified): qwen35 hybrid, {} layers, vocab {}, kernels metal [oracle-f32], kv f16 packed, batched prefill x16; real weights from {} ({} payload), GPU ledger {} = weights {} + state {} + scratch {}",
-            source.layout().layers.len(),
-            source.config().vocab,
+            "tuckcore (experimental, uncertified): unified engine (ADR-011), graph {} with {} layers, vocab {}, kernels metal [oracle-f32], kv f16 packed, batched prefill x{}; real weights from {} ({} payload), GPU ledger {} = weights {} + state {} + scratch {}",
+            model.graph().architecture,
+            model.graph().layers.len(),
+            model.graph().vocab,
+            engine_metal::PREFILL_BATCH,
             artifact.path,
             Bytes(ctx.payload),
             Bytes(alloc.total()),
@@ -1380,7 +1385,7 @@ impl TuckCore {
         ProfileCounters::record(&ctx.counters.load_nanos, ctx.load_start);
         self.loaded = None;
         self.hybrid = Some(HybridLoaded {
-            eos_token_id: source.config().eos_token_id,
+            eos_token_id: model.graph().eos_token_id,
             model,
             tokenizer,
             context_total: plan.context.total_context,
@@ -1446,7 +1451,7 @@ impl TuckCore {
             retained_state_bytes: Some(hybrid.alloc.state),
             trims_applied: Some(hybrid.counters.trims_applied.load(Ordering::Relaxed)),
             gpu_allocated_bytes: Some(hybrid.model.allocated_bytes()),
-            prefill_batch: Some(qwen35_gpu::PREFILL_BATCH as u32),
+            prefill_batch: Some(engine_metal::PREFILL_BATCH as u32),
             kernel_impl: Some(ResolvedKernels::Metal.as_str().to_string()),
             numerical_profile: Some(NumericalProfile::OracleF32.as_str().to_string()),
             ..BackendStats::default()
@@ -1828,7 +1833,10 @@ mod tests {
                 Some(&serde_json::json!({"kernels": "metal"})),
             )
             .unwrap();
-        assert!(note.contains("qwen35 hybrid"), "{note}");
+        assert!(
+            note.contains("unified engine") && note.contains("graph qwen35"),
+            "{note}"
+        );
         assert_eq!(
             engine.identity().kernels,
             vec![HYBRID_KERNEL_ID.to_string()]

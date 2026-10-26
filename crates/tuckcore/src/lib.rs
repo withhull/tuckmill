@@ -11,6 +11,7 @@
 //! added only after profiling identifies measurable gaps.
 
 pub mod completion;
+pub mod engine;
 pub mod forward;
 pub mod gpu;
 pub mod kernels;

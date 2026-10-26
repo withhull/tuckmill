@@ -1196,10 +1196,18 @@ fn qwen35_teacher_forced_logits_match_reference_when_available() {
         Ok(gpu) => {
             let source =
                 tuckmill_tuckcore::qwen35_forward::ArtifactTensorSource::open(&gguf).unwrap();
-            let plan = tuckmill_tuckcore::qwen35_gpu::gpu_alloc_plan(&source, 16).unwrap();
-            let model =
-                tuckmill_tuckcore::qwen35_gpu::Qwen35GpuModel::load(gpu, &source, 16, plan.total())
-                    .unwrap();
+            use tuckmill_tuckcore::qwen35_forward::TensorSource;
+            let graph =
+                tuckmill_tuckcore::engine::adapters::qwen35(source.config(), source.layout());
+            let plan = tuckmill_tuckcore::engine::metal::alloc_plan(&graph, &source, 16).unwrap();
+            let model = tuckmill_tuckcore::engine::metal::EngineModel::load(
+                gpu,
+                graph,
+                &source,
+                16,
+                plan.total(),
+            )
+            .unwrap();
             let mut gpu_logits = Vec::new();
             model.forward_token(tokens[0], &mut gpu_logits).unwrap();
             for token in &tokens[1..] {
