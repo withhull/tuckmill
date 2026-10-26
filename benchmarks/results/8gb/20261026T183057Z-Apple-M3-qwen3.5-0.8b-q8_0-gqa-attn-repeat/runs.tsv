@@ -1,0 +1,7 @@
+round	slot	engine	status	reclaimable_mib_before	swap_delta_mib	record
+1	A	tuckcore-metal	ok	3010	0	r1-A-tuckcore-metal.json
+1	B	llama-metal	ok	3323	0	r1-B-llama-metal.json
+2	A	llama-metal	ok	3304	0	r2-A-llama-metal.json
+2	B	tuckcore-metal	ok	3293	0	r2-B-tuckcore-metal.json
+3	A	tuckcore-metal	ok	3654	0	r3-A-tuckcore-metal.json
+3	B	llama-metal	ok	3001	0	r3-B-llama-metal.json
