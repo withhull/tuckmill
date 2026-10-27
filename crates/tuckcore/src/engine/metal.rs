@@ -491,6 +491,9 @@ struct GdnBlock {
     conv_w: MetalBuffer,
     state: MetalBuffer,
     hist: MetalBuffer,
+    /// Prefix-cache snapshot of `state` / `hist` at a chunk boundary
+    /// (ADR-012 step 2); absent when the prefix cache is disabled.
+    snapshot: Option<(MetalBuffer, MetalBuffer)>,
     qkv_out: MetalBuffer,
     conv_y: MetalBuffer,
     q: MetalBuffer,
@@ -541,7 +544,12 @@ impl GdnBlock {
         Ok(())
     }
 
-    fn plan(s: &GatedDeltaNetSpec, src: &dyn WeightSource, p: &mut Plan) -> Result<()> {
+    fn plan(
+        s: &GatedDeltaNetSpec,
+        src: &dyn WeightSource,
+        prefix_cache: bool,
+        p: &mut Plan,
+    ) -> Result<()> {
         Self::check_supported(s)?;
         for m in [s.qkv, s.z, s.alpha, s.beta, s.out] {
             p.weights += Matrix::plan(src, m)?;
@@ -550,8 +558,11 @@ impl GdnBlock {
             p.weights_f32(vector_len(src, v)?);
         }
         let (state, hist) = Self::state_elems(s);
-        p.state_f32(state);
-        p.state_f32(hist);
+        let copies = if prefix_cache { 2 } else { 1 };
+        for _ in 0..copies {
+            p.state_f32(state);
+            p.state_f32(hist);
+        }
         for elems in Self::scratch_elems(s) {
             p.scratch_f32(elems);
         }
@@ -563,9 +574,15 @@ impl GdnBlock {
         src: &dyn WeightSource,
         s: &GatedDeltaNetSpec,
         eps: f32,
+        prefix_cache: bool,
     ) -> Result<Self> {
         Self::check_supported(s)?;
         let (state, hist) = Self::state_elems(s);
+        let snapshot = if prefix_cache {
+            Some((zeros(gpu, state)?, zeros(gpu, hist)?))
+        } else {
+            None
+        };
         let [qkv_out, conv_y, q, k, v, z_out, alpha_out, beta_raw, beta_out, gate, o, gated] =
             Self::scratch_elems(s);
         Ok(Self {
@@ -580,6 +597,7 @@ impl GdnBlock {
             conv_w: vector(gpu, src, s.conv1d)?,
             state: zeros(gpu, state)?,
             hist: zeros(gpu, hist)?,
+            snapshot,
             qkv_out: zeros(gpu, qkv_out)?,
             conv_y: zeros(gpu, conv_y)?,
             q: zeros(gpu, q)?,
@@ -600,6 +618,27 @@ impl GdnBlock {
     fn reset(&self) -> Result<()> {
         zero_fill(&self.state)?;
         zero_fill(&self.hist)
+    }
+
+    /// Copy the live state into the snapshot (`save`) or back (restore),
+    /// on the device, in queue order with the surrounding chunks.
+    fn copy_snapshot(&self, gpu: &Qwen35Gpu, save: bool) -> Result<()> {
+        let Some((snap_state, snap_hist)) = &self.snapshot else {
+            return Err(TuckmillError::new(
+                ErrorCode::Internal,
+                "prefix snapshot requested on a block loaded without the prefix cache",
+            ));
+        };
+        let ctx = gpu.context();
+        for (live, snap) in [(&self.state, snap_state), (&self.hist, snap_hist)] {
+            let elems = (live.len() / 4) as u32;
+            if save {
+                ctx.copy_f32(live, 0, snap, 0, elems)?;
+            } else {
+                ctx.copy_f32(snap, 0, live, 0, elems)?;
+            }
+        }
+        Ok(())
     }
 
     /// One token: `proj = mixer(h)`.
@@ -1169,7 +1208,7 @@ impl Layer {
         graph: &ModelGraph,
         src: &dyn WeightSource,
         capacity: usize,
-        kv: KvCache,
+        opts: EngineOptions,
         p: &mut Plan,
     ) -> Result<()> {
         p.weights_f32(vector_len(src, spec.pre_norm)?);
@@ -1178,8 +1217,8 @@ impl Layer {
         p.scratch_f32(graph.hidden); // h2
         p.scratch_f32(graph.hidden); // proj
         match &spec.mixer {
-            MixerSpec::GatedDeltaNet(g) => GdnBlock::plan(g, src, p)?,
-            MixerSpec::Attention(a) => AttentionBlock::plan(a, src, capacity, kv, p)?,
+            MixerSpec::GatedDeltaNet(g) => GdnBlock::plan(g, src, opts.prefix_cache, p)?,
+            MixerSpec::Attention(a) => AttentionBlock::plan(a, src, capacity, opts.kv, p)?,
         }
         SwiGluBlock::plan(&spec.ffn, graph.hidden, src, p)
     }
@@ -1190,7 +1229,7 @@ impl Layer {
         spec: &super::graph::LayerSpec,
         graph: &ModelGraph,
         capacity: usize,
-        kv: KvCache,
+        opts: EngineOptions,
     ) -> Result<Self> {
         Ok(Self {
             pre_norm: vector(gpu, src, spec.pre_norm)?,
@@ -1199,11 +1238,15 @@ impl Layer {
             h2: zeros(gpu, graph.hidden)?,
             proj: zeros(gpu, graph.hidden)?,
             mixer: match &spec.mixer {
-                MixerSpec::GatedDeltaNet(g) => {
-                    Mixer::Gdn(Box::new(GdnBlock::load(gpu, src, g, graph.eps)?))
-                }
+                MixerSpec::GatedDeltaNet(g) => Mixer::Gdn(Box::new(GdnBlock::load(
+                    gpu,
+                    src,
+                    g,
+                    graph.eps,
+                    opts.prefix_cache,
+                )?)),
                 MixerSpec::Attention(a) => Mixer::Attention(Box::new(AttentionBlock::load(
-                    gpu, src, a, graph.eps, capacity, kv,
+                    gpu, src, a, graph.eps, capacity, opts.kv,
                 )?)),
             },
             ffn: SwiGluBlock::load(gpu, src, &spec.ffn, graph.hidden)?,
@@ -1214,6 +1257,16 @@ impl Layer {
         match &self.mixer {
             Mixer::Gdn(b) => b.reset(),
             Mixer::Attention(b) => b.reset(),
+        }
+    }
+
+    /// Save or restore this layer's prefix snapshot. Attention layers hold
+    /// nothing extra: their KV rows below the prefix boundary stay in place
+    /// and are never overwritten by a request that extends the prefix.
+    fn copy_snapshot(&self, gpu: &Qwen35Gpu, save: bool) -> Result<()> {
+        match &self.mixer {
+            Mixer::Gdn(b) => b.copy_snapshot(gpu, save),
+            Mixer::Attention(_) => Ok(()),
         }
     }
 
@@ -1270,19 +1323,40 @@ pub fn alloc_plan(
     src: &dyn WeightSource,
     capacity: usize,
 ) -> Result<GpuAllocPlan> {
-    alloc_plan_with(graph, src, capacity, KvCache::F16)
+    alloc_plan_with(graph, src, capacity, EngineOptions::default())
 }
 
-/// [`alloc_plan`] for a declared KV cache precision.
+/// Load-time engine options (part of the exact allocation plan).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EngineOptions {
+    /// Declared KV cache precision of attention layers.
+    pub kv: KvCache,
+    /// Keep one prefix snapshot (ADR-012 step 2): the recurrent and
+    /// convolution state of every Gated DeltaNet layer at a chunk
+    /// boundary, so a request that extends the snapshotted prefix resumes
+    /// there instead of prefilling it again.
+    pub prefix_cache: bool,
+}
+
+impl Default for EngineOptions {
+    fn default() -> Self {
+        Self {
+            kv: KvCache::F16,
+            prefix_cache: false,
+        }
+    }
+}
+
+/// [`alloc_plan`] for explicit engine options.
 pub fn alloc_plan_with(
     graph: &ModelGraph,
     src: &dyn WeightSource,
     capacity: usize,
-    kv: KvCache,
+    opts: EngineOptions,
 ) -> Result<GpuAllocPlan> {
     let mut p = Plan::default();
     for layer in &graph.layers {
-        Layer::plan(layer, graph, src, capacity, kv, &mut p)?;
+        Layer::plan(layer, graph, src, capacity, opts, &mut p)?;
     }
     p.weights += Matrix::plan(src, graph.embedding)?;
     if graph.head != graph.embedding {
@@ -1329,6 +1403,26 @@ pub struct EngineModel {
     logits_staging: std::cell::RefCell<Vec<u8>>,
     /// Prefill runs mixer cores chunk-wide (default) instead of per token.
     chunk_core: std::cell::Cell<bool>,
+    /// Whether the prefix cache was allocated (see [`EngineOptions`]).
+    prefix_cache: bool,
+    prefix: std::cell::RefCell<PrefixState>,
+}
+
+/// The prefix cache's host-side bookkeeping. The snapshot is valid only
+/// while the session's KV rows below its boundary still hold exactly
+/// `tokens`; every [`EngineModel::reset`] invalidates it.
+#[derive(Default)]
+struct PrefixState {
+    /// Tokens of the snapshotted prefix (its length is the boundary, a
+    /// multiple of [`PREFILL_BATCH`]); valid only when `valid`.
+    tokens: Vec<u32>,
+    valid: bool,
+    /// The boundary this request's prefill snapshots at, with its tokens.
+    planned: Option<Vec<u32>>,
+    /// Positions of `planned` already confirmed written by this request's
+    /// prefill chunks (starting at the restored position). A chunk that
+    /// does not continue the plan exactly drops it.
+    matched: usize,
 }
 
 impl EngineModel {
@@ -1341,19 +1435,26 @@ impl EngineModel {
         capacity: usize,
         admitted_gpu_bytes: u64,
     ) -> Result<Self> {
-        Self::load_with(gpu, graph, src, capacity, admitted_gpu_bytes, KvCache::F16)
+        Self::load_with(
+            gpu,
+            graph,
+            src,
+            capacity,
+            admitted_gpu_bytes,
+            EngineOptions::default(),
+        )
     }
 
-    /// [`Self::load`] with a declared KV cache precision.
+    /// [`Self::load`] with explicit engine options.
     pub fn load_with(
         gpu: Qwen35Gpu,
         graph: ModelGraph,
         src: &dyn WeightSource,
         capacity: usize,
         admitted_gpu_bytes: u64,
-        kv: KvCache,
+        opts: EngineOptions,
     ) -> Result<Self> {
-        let plan = alloc_plan_with(&graph, src, capacity, kv)?;
+        let plan = alloc_plan_with(&graph, src, capacity, opts)?;
         let total = plan.total();
         if total > admitted_gpu_bytes {
             return Err(TuckmillError::new(
@@ -1370,7 +1471,7 @@ impl EngineModel {
         let layers = graph
             .layers
             .iter()
-            .map(|spec| Layer::load(&gpu, src, spec, &graph, capacity, kv))
+            .map(|spec| Layer::load(&gpu, src, spec, &graph, capacity, opts))
             .collect::<Result<Vec<_>>>()?;
         let embedding = Matrix::load(&gpu, src, graph.embedding)?;
         let head = if graph.head != graph.embedding {
@@ -1405,6 +1506,8 @@ impl EngineModel {
             prefill_in_flight: Default::default(),
             logits_staging: Default::default(),
             chunk_core: std::cell::Cell::new(true),
+            prefix_cache: opts.prefix_cache,
+            prefix: Default::default(),
         })
     }
 
@@ -1461,12 +1564,69 @@ impl EngineModel {
     pub fn reset(&self) -> Result<()> {
         self.drain()?;
         self.prefill_in_flight.borrow_mut().clear();
+        // Zeroing the KV planes invalidates the prefix snapshot.
+        *self.prefix.borrow_mut() = PrefixState::default();
         for layer in &self.layers {
             layer.reset()?;
         }
         self.positions.set(0);
         self.session_valid.set(true);
         Ok(())
+    }
+
+    /// Start a request for `prompt` (ADR-012 step 2). With the prefix cache,
+    /// a prompt that strictly extends the snapshotted prefix resumes from
+    /// the snapshot: the Gated DeltaNet state is restored on the device,
+    /// attention KV rows below the boundary are kept, and the returned
+    /// count of positions is already in the session. Otherwise the session
+    /// is reset and 0 is returned. Either way this prompt's prefill will
+    /// snapshot at its last chunk boundary below its length, so prefill
+    /// chunks from the returned position are exactly those a cold prefill
+    /// would run (bit-identical results by construction).
+    pub fn begin_request(&self, prompt: &[u32]) -> Result<usize> {
+        if !self.prefix_cache || prompt.is_empty() {
+            self.reset()?;
+            return Ok(0);
+        }
+        let hit = {
+            let p = self.prefix.borrow();
+            if p.valid
+                && self.session_valid.get()
+                && prompt.len() > p.tokens.len()
+                && prompt.starts_with(&p.tokens)
+            {
+                p.tokens.len()
+            } else {
+                0
+            }
+        };
+        if hit == 0 {
+            self.reset()?;
+        } else {
+            self.drain()?;
+            self.prefill_in_flight.borrow_mut().clear();
+            let restore = || -> Result<()> {
+                for layer in &self.layers {
+                    layer.copy_snapshot(&self.gpu, false)?;
+                }
+                Ok(())
+            };
+            if let Err(e) = self.gpu.grouped(restore) {
+                self.session_valid.set(false);
+                *self.prefix.borrow_mut() = PrefixState::default();
+                return Err(e);
+            }
+            self.positions.set(hit);
+        }
+        let boundary = (prompt.len() - 1) / PREFILL_BATCH * PREFILL_BATCH;
+        let mut p = self.prefix.borrow_mut();
+        p.planned = if boundary > hit {
+            Some(prompt[..boundary].to_vec())
+        } else {
+            None
+        };
+        p.matched = hit;
+        Ok(hit)
     }
 
     fn head(&self) -> &Matrix {
@@ -1767,6 +1927,21 @@ impl EngineModel {
             let want_logits = !matches!(out, Out::None);
             let greedy = matches!(out, Out::Greedy(_));
             let chunk_core = self.chunk_core.get();
+            // Snapshot when this chunk ends exactly at the planned boundary
+            // and the session holds the planned tokens up to it.
+            let snapshot_here = {
+                let mut p = self.prefix.borrow_mut();
+                let continues = matches!(
+                    &p.planned,
+                    Some(t) if p.matched == pos && pos + n <= t.len() && t[pos..pos + n] == *tokens
+                );
+                if continues {
+                    p.matched = pos + n;
+                } else {
+                    p.planned = None;
+                }
+                matches!(&p.planned, Some(t) if t.len() == p.matched)
+            };
             self.bound_prefill_in_flight();
             let s = &self.prefill;
             let encode = || -> Result<()> {
@@ -1776,6 +1951,11 @@ impl EngineModel {
                 }
                 for layer in &self.layers {
                     layer.prefill(&self.gpu, s, n, pos as u32, hidden, eps, chunk_core)?;
+                }
+                if snapshot_here {
+                    for layer in &self.layers {
+                        layer.copy_snapshot(&self.gpu, true)?;
+                    }
                 }
                 if want_logits {
                     let ctx = self.gpu.context();
@@ -1805,6 +1985,11 @@ impl EngineModel {
                     .push_back(self.gpu.context().committed_dispatches());
             }
             self.positions.set(pos + n);
+            if snapshot_here {
+                let mut p = self.prefix.borrow_mut();
+                p.tokens = p.planned.take().unwrap_or_default();
+                p.valid = true;
+            }
             Ok(())
         })();
         self.finish(result)
@@ -2839,7 +3024,16 @@ mod qwen3_tests {
         let bits = |v: &[f32]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
 
         for kv in [KvCache::F32, KvCache::F16] {
-            let plan = alloc_plan_with(&graph, &source, capacity, kv).unwrap();
+            let plan = alloc_plan_with(
+                &graph,
+                &source,
+                capacity,
+                EngineOptions {
+                    kv,
+                    prefix_cache: false,
+                },
+            )
+            .unwrap();
             let expected_state = cfg.layers as usize
                 * 2
                 * cfg.kv_heads as usize
@@ -2853,7 +3047,10 @@ mod qwen3_tests {
                 &source,
                 capacity,
                 plan.total(),
-                kv,
+                EngineOptions {
+                    kv,
+                    prefix_cache: false,
+                },
             )
             .unwrap();
             assert_eq!(
@@ -2932,14 +3129,26 @@ mod qwen3_real_tests {
         let source = super::super::GgufWeights::with_inspection(&file, &insp).unwrap();
         let capacity = 640usize;
         let kv = KvCache::F16;
-        let plan = alloc_plan_with(&graph, &source, capacity, kv).unwrap();
+        let plan = alloc_plan_with(
+            &graph,
+            &source,
+            capacity,
+            EngineOptions {
+                kv,
+                prefix_cache: false,
+            },
+        )
+        .unwrap();
         let model = EngineModel::load_with(
             Qwen35Gpu::open().unwrap(),
             graph,
             &source,
             capacity,
             plan.total(),
-            kv,
+            EngineOptions {
+                kv,
+                prefix_cache: false,
+            },
         )
         .unwrap();
         let prompt: Vec<u32> = (0..512u32).map(|i| 1000 + (i * 7919) % 90_000).collect();
@@ -3006,5 +3215,173 @@ mod qwen3_real_tests {
                 );
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod prefix_cache_tests {
+    use super::*;
+    use crate::qwen35_forward::{ArtifactTensorSource, TensorSource};
+    use tuckmill_manifest::testing::{write_synthetic, SyntheticConfig};
+
+    fn gpu_or_skip() -> bool {
+        if tuckmill_metal::probe().available {
+            return true;
+        }
+        assert!(
+            std::env::var("TUCKMILL_REQUIRE_METAL").is_err(),
+            "TUCKMILL_REQUIRE_METAL is set but no Metal device is available"
+        );
+        eprintln!("skipping: no Metal device");
+        false
+    }
+
+    fn bits(v: &[f32]) -> Vec<u32> {
+        v.iter().map(|x| x.to_bits()).collect()
+    }
+
+    /// Prefill `prompt[start..]` in aligned chunks (as the executor does),
+    /// then `steps` greedy decode steps fed with the argmax of the previous
+    /// logits. Returns the last-prompt-token logits and each step's logits.
+    fn run_from(model: &EngineModel, prompt: &[u32], start: usize, steps: usize) -> Vec<Vec<f32>> {
+        assert_eq!(model.positions(), start);
+        let mut logits = Vec::new();
+        let rest = &prompt[start..];
+        let chunks: Vec<&[u32]> = rest.chunks(PREFILL_BATCH).collect();
+        for (c, chunk) in chunks.iter().enumerate() {
+            model
+                .prefill_chunk(chunk, c + 1 == chunks.len(), &mut logits)
+                .unwrap();
+        }
+        let mut out = vec![logits.clone()];
+        for _ in 0..steps {
+            let next = crate::sampling::argmax(&logits).unwrap_or(0) as u32;
+            model.forward_token(next, &mut logits).unwrap();
+            out.push(logits.clone());
+        }
+        out
+    }
+
+    /// ADR-012 step 2 gate: a request resumed from the prefix snapshot
+    /// produces bit-identical logits (last prompt token and the following
+    /// decode steps) to a cold prefill of the same tokens; misses, exact
+    /// matches and resets resume nothing; ledger == plan with the snapshot.
+    fn check(source: &ArtifactTensorSource, vocab_mod: u32, base: u32) {
+        let graph = crate::engine::adapters::qwen35(source.config(), source.layout());
+        let pb = PREFILL_BATCH;
+        let capacity = 3 * pb + 64;
+        let on = EngineOptions {
+            kv: KvCache::F16,
+            prefix_cache: true,
+        };
+        let plan = alloc_plan_with(&graph, source, capacity, on).unwrap();
+        let off_plan = alloc_plan_with(&graph, source, capacity, EngineOptions::default()).unwrap();
+        let gdn_state: u64 = graph
+            .layers
+            .iter()
+            .filter_map(|l| match &l.mixer {
+                MixerSpec::GatedDeltaNet(g) => {
+                    let (state, hist) = GdnBlock::state_elems(g);
+                    Some(((state + hist) * 4) as u64)
+                }
+                _ => None,
+            })
+            .sum();
+        assert_eq!(
+            plan.state,
+            off_plan.state + gdn_state,
+            "the snapshot costs one copy of the DeltaNet state"
+        );
+        let model = EngineModel::load_with(
+            Qwen35Gpu::open().unwrap(),
+            graph,
+            source,
+            capacity,
+            plan.total(),
+            on,
+        )
+        .unwrap();
+        assert_eq!(model.allocated_bytes(), plan.total(), "ledger == plan");
+
+        let tok = |i: u32, salt: u32| base + (i * 7919 + salt) % vocab_mod;
+        let prompt_a: Vec<u32> = (0..(2 * pb + 10) as u32).map(|i| tok(i, 13)).collect();
+        // B shares A's first 2*pb tokens (A's snapshot boundary), then
+        // diverges and runs past A's length.
+        let mut prompt_b: Vec<u32> = prompt_a[..2 * pb].to_vec();
+        prompt_b.extend((0..40u32).map(|i| tok(i, 101)));
+
+        assert_eq!(
+            model.begin_request(&prompt_a).unwrap(),
+            0,
+            "first request is cold"
+        );
+        let _ = run_from(&model, &prompt_a, 0, 4); // leaves stale KV rows past the boundary
+        let hit = model.begin_request(&prompt_b).unwrap();
+        assert_eq!(hit, 2 * pb, "B resumes at A's snapshot boundary");
+        let resumed = run_from(&model, &prompt_b, hit, 6);
+
+        model.reset().unwrap();
+        let cold = run_from(&model, &prompt_b, 0, 6);
+        for (step, (a, b)) in resumed.iter().zip(&cold).enumerate() {
+            assert_eq!(
+                bits(a),
+                bits(b),
+                "step {step}: resumed == cold, bit for bit"
+            );
+        }
+
+        // reset() invalidated the snapshot; the cold run above (not started
+        // through begin_request) planned none, so B is a miss now.
+        assert_eq!(
+            model.begin_request(&prompt_b).unwrap(),
+            0,
+            "reset invalidates"
+        );
+        let _ = run_from(&model, &prompt_b, 0, 0);
+        // B snapshotted at its own boundary (2*pb): a prompt diverging
+        // inside the prefix misses, and so does one equal to the prefix.
+        let mut diverged = prompt_b.clone();
+        diverged[pb] ^= 1;
+        assert_eq!(
+            model.begin_request(&diverged).unwrap(),
+            0,
+            "divergence misses"
+        );
+        let _ = run_from(&model, &diverged, 0, 0);
+        assert_eq!(
+            model.begin_request(&diverged[..2 * pb]).unwrap(),
+            0,
+            "a prompt equal to the prefix has nothing to prefill: miss"
+        );
+    }
+
+    #[test]
+    fn prefix_hit_is_bit_identical_to_a_cold_prefill_on_the_fixture() {
+        if !gpu_or_skip() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("q35.gguf");
+        write_synthetic(&path, &SyntheticConfig::tiny_qwen35()).unwrap();
+        let source = ArtifactTensorSource::open(&path).unwrap();
+        let vocab = source.config().vocab as u32;
+        check(&source, vocab - 8, 0);
+    }
+
+    #[test]
+    fn prefix_hit_is_bit_identical_to_a_cold_prefill_on_the_pinned_artifact() {
+        let Some(path) = std::env::var("TUCKMILL_QWEN35_GGUF")
+            .ok()
+            .map(std::path::PathBuf::from)
+            .filter(|p| p.exists())
+        else {
+            eprintln!("skipping: TUCKMILL_QWEN35_GGUF not set");
+            return;
+        };
+        if !gpu_or_skip() {
+            return;
+        }
+        let source = ArtifactTensorSource::open(&path).unwrap();
+        check(&source, 90_000, 1000);
     }
 }

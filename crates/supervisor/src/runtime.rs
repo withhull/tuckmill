@@ -2251,7 +2251,10 @@ mod tests {
             &graph,
             &weights,
             512,
-            tuckmill_tuckcore::engine::metal::KvCache::F32,
+            tuckmill_tuckcore::engine::metal::EngineOptions {
+                kv: tuckmill_tuckcore::engine::metal::KvCache::F32,
+                prefix_cache: true,
+            },
         )
         .unwrap();
         let kv_req = tuckmill_tuckcore::forward::KvState::bytes_for(&cfg, 512);

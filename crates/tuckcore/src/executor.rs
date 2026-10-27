@@ -23,7 +23,9 @@ use tuckmill_manifest::units::Bytes;
 use tuckmill_manifest::{BACKEND_ABI_VERSION, WORKER_PROTOCOL_VERSION};
 
 use crate::completion::CompletionTracker;
-use crate::engine::metal::{self as engine_metal, EngineModel, GreedyInput, KvCache, PendingToken};
+use crate::engine::metal::{
+    self as engine_metal, EngineModel, EngineOptions, GreedyInput, KvCache, PendingToken,
+};
 use crate::forward::{
     self, Forward, KvPrecision, KvState, ModelWeights, NumericalProfile, ProfileCounters,
 };
@@ -71,6 +73,10 @@ struct TuckCoreOptions {
     /// the admitted workspaces reservation). Applies to `--kernels metal`
     /// only; refused elsewhere rather than ignored.
     prefill_batch: Option<u32>,
+    /// Engine prefix cache (ADR-012 step 2); default on. Benchmarks turn it
+    /// off so repeated prompts never become hidden cache hits.
+    #[serde(default)]
+    prefix_cache: Option<bool>,
 }
 
 struct Loaded {
@@ -117,6 +123,11 @@ struct EngineLoaded {
     /// Session state bytes used by the most recent request (the prepared
     /// state; 0 before the first request).
     session_kv_bytes: Arc<AtomicU64>,
+    /// Prompt positions the most recent request resumed from the prefix
+    /// cache (0: cold).
+    last_prefix_hit: AtomicU64,
+    /// Whether the engine was loaded with the prefix cache.
+    prefix_cache: bool,
     counters: ProfileCounters,
 }
 
@@ -603,9 +614,14 @@ impl InferenceBackend for TuckCore {
         }
 
         if let Some(hybrid) = &self.engine {
-            // Every request starts from a zeroed session: recurrent and KV
-            // state are never carried from one request into another.
-            hybrid.model.reset()?;
+            // Every request starts from a reset session, except that with
+            // the prefix cache a prompt extending the snapshotted prefix
+            // resumes from the snapshot (state that is exactly what a cold
+            // prefill of those tokens produces; ADR-012 step 2).
+            let start = hybrid.model.begin_request(&req.prompt_tokens)?;
+            hybrid
+                .last_prefix_hit
+                .store(start as u64, Ordering::Relaxed);
             hybrid
                 .session_kv_bytes
                 .store(hybrid.alloc.state, Ordering::Relaxed);
@@ -616,6 +632,7 @@ impl InferenceBackend for TuckCore {
                 tokenizer: &hybrid.tokenizer,
                 eos_token_id: hybrid.eos_token_id,
                 prefill_batch: engine_metal::PREFILL_BATCH,
+                start,
                 per_token_delay: self.per_token_delay,
             };
             return run_session(&mut engine, &spec, req, ctl);
@@ -668,6 +685,7 @@ impl InferenceBackend for TuckCore {
             tokenizer: &loaded.tokenizer,
             eos_token_id: loaded.weights.cfg.eos_token_id,
             prefill_batch: 1,
+            start: 0,
             per_token_delay: self.per_token_delay,
         };
         run_session(&mut engine, &spec, req, ctl)
@@ -818,6 +836,9 @@ struct SessionSpec<'a> {
     tokenizer: &'a DecodeVocab,
     eos_token_id: Option<u32>,
     prefill_batch: usize,
+    /// Prompt positions already in the session (a prefix-cache hit);
+    /// prefill starts here.
+    start: usize,
     per_token_delay: Duration,
 }
 
@@ -866,7 +887,7 @@ fn run_session(
     // one being collected).
     let mut in_flight: Option<PendingToken> = None;
     let prompt_tokens = &req.prompt_tokens;
-    let mut pos = 0usize;
+    let mut pos = spec.start;
     while pos < prompt_tokens.len() {
         let take = prefill_batch.min(prompt_tokens.len() - pos);
         let want = pos + take == prompt_tokens.len();
@@ -1326,6 +1347,7 @@ impl TuckCore {
             graph,
             &source,
             KvCache::F16,
+            opts.prefix_cache.unwrap_or(true),
             HYBRID_KERNEL_ID,
             ctx,
         )
@@ -1387,6 +1409,7 @@ impl TuckCore {
             graph,
             &source,
             kv,
+            opts.prefix_cache.unwrap_or(true),
             QWEN3_ENGINE_KERNEL_ID,
             ctx,
         )
@@ -1404,6 +1427,7 @@ impl TuckCore {
         graph: crate::engine::ModelGraph,
         source: &dyn crate::engine::WeightSource,
         kv: KvCache,
+        prefix_cache: bool,
         kernel_id: &str,
         ctx: EngineLoadContext,
     ) -> Result<String> {
@@ -1414,7 +1438,8 @@ impl TuckCore {
             )
         })?;
         let arch = graph.architecture.clone();
-        let alloc = engine_metal::alloc_plan_with(&graph, source, capacity, kv)?;
+        let engine_opts = EngineOptions { kv, prefix_cache };
+        let alloc = engine_metal::alloc_plan_with(&graph, source, capacity, engine_opts)?;
         let reserved = &plan.budget.reservation_breakdown;
         for (class, need, have) in [
             ("weights", alloc.weights, reserved.weights.bytes()),
@@ -1440,7 +1465,7 @@ impl TuckCore {
             source,
             capacity,
             alloc.total(),
-            kv,
+            engine_opts,
         )?;
         if model.allocated_bytes() != alloc.total() {
             return Err(TuckmillError::new(
@@ -1493,6 +1518,8 @@ impl TuckCore {
             context_total: plan.context.total_context,
             alloc,
             session_kv_bytes: Arc::new(AtomicU64::new(0)),
+            last_prefix_hit: AtomicU64::new(0),
+            prefix_cache,
             counters: ctx.counters,
         });
         crate::release_freed_heap();
@@ -1557,6 +1584,10 @@ impl TuckCore {
             prefill_batch: Some(engine_metal::PREFILL_BATCH as u32),
             kernel_impl: Some(ResolvedKernels::Metal.as_str().to_string()),
             numerical_profile: Some(NumericalProfile::OracleF32.as_str().to_string()),
+            profile: Some(serde_json::json!({
+                "prefix_cache": hybrid.prefix_cache,
+                "last_prefix_hit_tokens": hybrid.last_prefix_hit.load(Ordering::Relaxed),
+            })),
             ..BackendStats::default()
         }
     }

@@ -92,3 +92,48 @@ honest labels, and the unified engine.
 - **Prioritization note** (same day): the product owner asked not to
   spend effort on dense Qwen3, an older family. Steps 2-3 target Qwen3.5
   and newer families.
+
+## Step 2 record (2026-10-27): prefix cache
+
+- **Design: bit-identical by construction.**
+  - A cold prefill runs 128-token chunks aligned at position 0. Each
+    request snapshots at its last chunk boundary below its length
+    (`B = floor((len - 1) / 128) * 128`).
+  - A later prompt that strictly extends the snapshotted prefix resumes at
+    `B` and runs exactly the chunks a cold prefill would run from there.
+  - Attention layers keep their KV rows below `B`: causal attention never
+    reads past the current position, and the new chunks overwrite every
+    row they read.
+  - Gated DeltaNet layers restore their recurrent and convolution state
+    from a device-side copy taken in the same command buffer as the chunk
+    ending at `B`.
+  - A plan is confirmed chunk by chunk. Any non-continuing chunk or step
+    drops it, and `reset()` invalidates the snapshot, so a snapshot only
+    ever describes tokens actually in the KV rows.
+- **Code.**
+  - `EngineOptions { kv, prefix_cache }`;
+  - `EngineModel::begin_request`;
+  - `GdnBlock` snapshot buffers;
+  - the executor resumes `run_session` at the returned position, and
+    engine stats report `last_prefix_hit_tokens`.
+- **Admission.**
+  - The engine plan adds one copy of the DeltaNet state (gated: ledger ==
+    plan).
+  - The planner reserves the hybrid recurrent state twice in
+    `kv_bytes_for`.
+  - Attention-only models need nothing extra.
+- **Benchmarks.** `tuckmill bench` turns the cache off for TuckCore and
+  records a caveat, so warm repetitions are never hidden cache hits.
+- **Gate:**
+  - fixture and pinned Qwen3.5-0.8B: request B, sharing request A's first
+    256 tokens after A's prefill and decode, resumes at 256. Its
+    last-token logits and the next 6 greedy decode steps are bit-identical
+    to a reset and cold prefill of B.
+  - Divergence inside the prefix, a prompt equal to the prefix, and a
+    reset all resume nothing.
+  - `scripts/test.sh`: all checks passed.
+- **Measured** (pinned 0.8B, M3 8 GB, `/v1/chat/completions`, 984-token
+  chat prompt sharing an ~900-token system prompt, 1 output token,
+  client-side, four rounds): cold 0.87-0.93 s, hit 0.33-0.37 s (896
+  positions resumed). Locally-calibrated; it includes rendering,
+  tokenization and HTTP.

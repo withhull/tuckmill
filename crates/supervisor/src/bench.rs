@@ -407,6 +407,12 @@ pub fn run_standard_bench(
     if performance_class == LatencyClass::BatchLocal {
         caveats.push("batch-local classification requires explicit slow-mode acceptance".into());
     }
+    if runtime.execution_options().prefix_cache == Some(false) {
+        caveats.push(
+            "TuckCore prefix cache disabled: every repetition prefills its full prompt (no cross-request reuse), comparable with engines that do not cache"
+                .into(),
+        );
+    }
     if options.ignore_eos {
         caveats.push(
             "ignore-EOS workload: the model's end-of-sequence token did not end generation, so every engine generated the full output count; decode throughput is comparable, output text past EOS is not meaningful"

@@ -38,6 +38,11 @@ pub struct ExecutionOptions {
     /// governor commands mid-run). Refused for real engines.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub per_token_delay_ms: Option<u64>,
+    /// TuckCore engine prefix cache (ADR-012 step 2; engine default on).
+    /// Benchmarks turn it off so repeated prompts never become hidden
+    /// cache hits.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prefix_cache: Option<bool>,
 }
 
 impl ExecutionOptions {
@@ -77,6 +82,12 @@ impl ExecutionOptions {
                     return Err(TuckmillError::new(
                         ErrorCode::InvalidRequest,
                         "phase profile counters apply to the tuckcore engine",
+                    ));
+                }
+                if self.prefix_cache.is_some() {
+                    return Err(TuckmillError::new(
+                        ErrorCode::InvalidRequest,
+                        "the prefix cache option applies to the tuckcore engine",
                     ));
                 }
                 if let Some(n) = self.gpu_layers {
@@ -130,6 +141,9 @@ impl ExecutionOptions {
                 }
                 if let Some(v) = self.profile {
                     obj.insert("profile".into(), Value::from(v));
+                }
+                if let Some(v) = self.prefix_cache {
+                    obj.insert("prefix_cache".into(), Value::from(v));
                 }
             }
             EngineKind::LlamaCpp => {

@@ -1199,6 +1199,11 @@ fn bench(
         }
         execution.kv_precision = Some(kv.to_string());
     }
+    // Benchmarks repeat the same prompt: TuckCore's prefix cache would turn
+    // warm repetitions into hidden cache hits, so it is off for bench.
+    if parse_engine(engine)?.0 == tuckmill_backend::EngineKind::TuckCore {
+        execution.prefix_cache = Some(false);
+    }
     let runtime = open_runtime_with_options(data_dir, engine, allow_test_engine, execution)?;
     let budget = resolve_budget(&runtime, memory_budget)?;
     let (artifact, adapter) = runtime.resolve_artifact(model)?;

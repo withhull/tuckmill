@@ -150,8 +150,11 @@ pub fn make_plan_budget(
 }
 
 /// KV payload for an admitted context: attention KV on the layers that
-/// carry it, plus the constant per-session recurrent state of hybrid
-/// stacks (context-independent, reserved once).
+/// carry it, plus the constant recurrent state of hybrid stacks
+/// (context-independent), reserved twice: the live session state and the
+/// engine's prefix-cache snapshot of it (ADR-012 step 2). Attention KV
+/// needs no extra reservation for the prefix cache: reused rows are the
+/// session's own.
 pub fn kv_bytes_for(
     geometry: Option<&tuckmill_manifest::records::ModelGeometry>,
     context: &PlanContext,
@@ -170,9 +173,8 @@ pub fn kv_bytes_for(
         value_length: g.value_length,
     };
     let attention = estimate_kv_bytes(&kv_geometry, context.total_context, bytes_per_element)?;
-    attention
-        .total_bytes
-        .checked_add(g.state_bytes.unwrap_or(0))
+    let state = g.state_bytes.unwrap_or(0).checked_mul(2)?;
+    attention.total_bytes.checked_add(state)
 }
 
 #[cfg(test)]
@@ -268,7 +270,7 @@ mod tests {
     /// Hybrid geometry prices attention KV on the attention layers only and
     /// reserves the constant recurrent state exactly once (ADR-008).
     #[test]
-    fn hybrid_kv_prices_attention_layers_plus_state_once() {
+    fn hybrid_kv_prices_attention_layers_plus_state_and_its_prefix_snapshot() {
         use tuckmill_manifest::records::ModelGeometry;
         let ctx = PlanContext::new(2048, 256);
         let hybrid = ModelGeometry {
@@ -283,9 +285,10 @@ mod tests {
             expert_used_per_token: None,
         };
         let attention = 6 * 2 * (256 + 256) * 2048 * 2;
+        // Live recurrent state plus the prefix-cache snapshot of it.
         assert_eq!(
             kv_bytes_for(Some(&hybrid), &ctx, 2),
-            Some(attention + 20_201_472)
+            Some(attention + 2 * 20_201_472)
         );
 
         // A dense geometry without hybrid fields is unchanged: every layer
