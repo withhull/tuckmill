@@ -106,3 +106,19 @@ pub const QWEN3_CHAT_TEMPLATE: &str = r##"{%- if tools %}
         {{- '<think>\n\n</think>\n\n' }}
     {%- endif %}
 {%- endif %}"##;
+
+/// Special-token spellings of the Qwen3.5 template's thinking block.
+pub const QWEN35_THINK_START: &str = "<think>";
+pub const QWEN35_THINK_END: &str = "</think>";
+
+/// The exact `tokenizer.chat_template` of the pinned Qwen3.5-0.8B artifact
+/// (7755 bytes, SHA-256
+/// `273d8e0e683b885071fb17e08d71e5f2a5ddfb5309756181681de4f5a1822d80`).
+pub const QWEN35_CHAT_TEMPLATE_0_8B: &str = include_str!("templates/qwen35-0.8b.jinja");
+
+/// The exact `tokenizer.chat_template` of the pinned Qwen3.5-2B artifact
+/// (7816 bytes, SHA-256
+/// `7f0e529032c25183bcd66c7f238da2d377f43be754a94e2725a58c4e16d2ed67`). It
+/// differs from the 0.8B revision only inside the tool-call branch, which
+/// is outside the supported request subset, so both share one renderer.
+pub const QWEN35_CHAT_TEMPLATE_2B: &str = include_str!("templates/qwen35-2b.jinja");

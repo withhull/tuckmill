@@ -21,7 +21,10 @@
 use std::path::Path;
 
 use tuckmill_backend::SamplingPolicy;
-use tuckmill_manifest::chat::{QWEN3_CHAT_TEMPLATE, QWEN3_IM_END, QWEN3_IM_START};
+use tuckmill_manifest::chat::{
+    QWEN35_CHAT_TEMPLATE_0_8B, QWEN35_CHAT_TEMPLATE_2B, QWEN35_THINK_END, QWEN35_THINK_START,
+    QWEN3_CHAT_TEMPLATE, QWEN3_IM_END, QWEN3_IM_START,
+};
 use tuckmill_manifest::error::{ErrorCode, Result, TuckmillError};
 use tuckmill_manifest::ids::Id;
 use tuckmill_manifest::records::ModelArtifact;
@@ -69,6 +72,8 @@ impl ChatRole {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ChatTemplate {
     Qwen3,
+    /// Qwen3.5 (both pinned revisions: 0.8B and 2B).
+    Qwen35,
 }
 
 impl ChatTemplate {
@@ -76,6 +81,8 @@ impl ChatTemplate {
     pub fn recognize(declared: &str) -> Option<Self> {
         if declared == QWEN3_CHAT_TEMPLATE {
             Some(ChatTemplate::Qwen3)
+        } else if declared == QWEN35_CHAT_TEMPLATE_0_8B || declared == QWEN35_CHAT_TEMPLATE_2B {
+            Some(ChatTemplate::Qwen35)
         } else {
             None
         }
@@ -84,14 +91,17 @@ impl ChatTemplate {
     pub fn id(&self) -> &'static str {
         match self {
             ChatTemplate::Qwen3 => "qwen3-chatml",
+            ChatTemplate::Qwen35 => "qwen35-chatml",
         }
     }
 
-    /// Render the conversation (generation prompt included). Messages must
-    /// be non-empty and use only the supported roles.
-    pub fn render(&self, messages: &[ChatMessageSpec]) -> String {
+    /// Render the conversation (generation prompt included). Messages use
+    /// only the supported roles; a conversation the template itself rejects
+    /// (it raises) is refused with the template's own message.
+    pub fn render(&self, messages: &[ChatMessageSpec]) -> Result<String> {
         match self {
-            ChatTemplate::Qwen3 => render_qwen3(messages),
+            ChatTemplate::Qwen3 => Ok(render_qwen3(messages)),
+            ChatTemplate::Qwen35 => render_qwen35(messages),
         }
     }
 }
@@ -163,6 +173,95 @@ fn render_qwen3(messages: &[ChatMessageSpec]) -> String {
     out.push_str(QWEN3_IM_START);
     out.push_str("assistant\n");
     out
+}
+
+/// Jinja2's `trim` filter: Python `str.strip()`, whose whitespace set is
+/// Rust's `char::is_whitespace` plus the separators U+001C..U+001F.
+fn py_strip(s: &str) -> &str {
+    s.trim_matches(|c: char| c.is_whitespace() || ('\u{1c}'..='\u{1f}').contains(&c))
+}
+
+fn template_refusal(message: &str) -> TuckmillError {
+    TuckmillError::new(
+        ErrorCode::InvalidRequest,
+        format!("the model's chat template rejects this conversation: {message}"),
+    )
+    .with_action("Fix the message list (roles and order) to match the model's chat template.")
+}
+
+/// Render the pinned Qwen3.5 templates with their canonical Jinja2
+/// semantics for the supported subset (tools absent; string content; roles
+/// system/user/assistant; no tool_calls). Every message's content is
+/// trimmed; a system message may only come first; at least one user turn
+/// must not be a bare tool response; an assistant turn after the last user
+/// query carries an explicit (possibly empty) thinking block; the
+/// generation prompt uses the template's default, thinking off
+/// (`enable_thinking` is not part of the request contract). Golden-tested
+/// against Jinja2 renderings of both pinned revisions.
+fn render_qwen35(messages: &[ChatMessageSpec]) -> Result<String> {
+    let n = messages.len();
+    if n == 0 {
+        return Err(template_refusal("No messages provided."));
+    }
+    let mut out = String::new();
+    if messages[0].role == ChatRole::System {
+        out.push_str(QWEN3_IM_START);
+        out.push_str("system\n");
+        out.push_str(py_strip(&messages[0].content));
+        out.push_str(QWEN3_IM_END);
+        out.push('\n');
+    }
+    // The newest user turn whose trimmed content is not a bare
+    // `<tool_response>...</tool_response>` carrier.
+    let last_query_index = (0..n).rev().find(|&i| {
+        let m = &messages[i];
+        let c = py_strip(&m.content);
+        m.role == ChatRole::User
+            && !(c.starts_with("<tool_response>") && c.ends_with("</tool_response>"))
+    });
+    let Some(last_query_index) = last_query_index else {
+        return Err(template_refusal("No user query found in messages."));
+    };
+    for (index, m) in messages.iter().enumerate() {
+        let content = py_strip(&m.content);
+        match m.role {
+            ChatRole::System => {
+                if index != 0 {
+                    return Err(template_refusal("System message must be at the beginning."));
+                }
+            }
+            ChatRole::User => {
+                out.push_str(QWEN3_IM_START);
+                out.push_str("user\n");
+                out.push_str(content);
+                out.push_str(QWEN3_IM_END);
+                out.push('\n');
+            }
+            ChatRole::Assistant => {
+                let (reasoning, content) = split_reasoning(content);
+                out.push_str(QWEN3_IM_START);
+                out.push_str("assistant\n");
+                if index > last_query_index {
+                    out.push_str(QWEN35_THINK_START);
+                    out.push('\n');
+                    out.push_str(py_strip(&reasoning));
+                    out.push('\n');
+                    out.push_str(QWEN35_THINK_END);
+                    out.push_str("\n\n");
+                }
+                out.push_str(&content);
+                out.push_str(QWEN3_IM_END);
+                out.push('\n');
+            }
+        }
+    }
+    out.push_str(QWEN3_IM_START);
+    out.push_str("assistant\n");
+    out.push_str(QWEN35_THINK_START);
+    out.push_str("\n\n");
+    out.push_str(QWEN35_THINK_END);
+    out.push_str("\n\n");
+    Ok(out)
 }
 
 /// Split assistant content at `</think>` exactly as the template does:
@@ -265,7 +364,7 @@ impl ModelBundle {
                 "Use raw completion for this artifact, or install an artifact with a recognized chat template.",
             ));
         };
-        Ok(template.render(messages))
+        template.render(messages)
     }
 
     /// Tokenize text through the qualified encoder (special-token spellings
@@ -509,12 +608,110 @@ mod tests {
                     )
                 })
                 .collect();
-            let rendered = ChatTemplate::Qwen3.render(&messages);
+            let rendered = ChatTemplate::Qwen3.render(&messages).unwrap();
             assert_eq!(
                 rendered,
                 conv["prompt"].as_str().unwrap(),
                 "conversation {id:?} must render exactly like the pinned reference"
             );
+        }
+    }
+
+    fn qwen35_goldens() -> Vec<(String, Vec<ChatMessageSpec>, serde_json::Value)> {
+        let goldens: serde_json::Value =
+            serde_json::from_str(include_str!("../tests/data/qwen35_chat_goldens.json")).unwrap();
+        goldens["conversations"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|conv| {
+                let messages = conv["messages"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|m| {
+                        spec(
+                            ChatRole::parse(m["role"].as_str().unwrap()).unwrap(),
+                            m["content"].as_str().unwrap(),
+                        )
+                    })
+                    .collect();
+                (
+                    conv["id"].as_str().unwrap().to_string(),
+                    messages,
+                    conv.clone(),
+                )
+            })
+            .collect()
+    }
+
+    /// ADR-012 step 1: both pinned Qwen3.5 revisions are recognized
+    /// byte-exactly, and the renderer reproduces the Jinja2 goldens (prompts
+    /// and the template's own refusals) for every conversation.
+    #[test]
+    fn qwen35_renderer_matches_the_jinja2_goldens() {
+        for (template, sha) in [
+            (
+                QWEN35_CHAT_TEMPLATE_0_8B,
+                "273d8e0e683b885071fb17e08d71e5f2a5ddfb5309756181681de4f5a1822d80",
+            ),
+            (
+                QWEN35_CHAT_TEMPLATE_2B,
+                "7f0e529032c25183bcd66c7f238da2d377f43be754a94e2725a58c4e16d2ed67",
+            ),
+        ] {
+            assert_eq!(
+                tuckmill_manifest::ids::sha256_hex(template.as_bytes()),
+                sha,
+                "pinned template bytes"
+            );
+            assert_eq!(
+                ChatTemplate::recognize(template),
+                Some(ChatTemplate::Qwen35)
+            );
+        }
+        let goldens = qwen35_goldens();
+        assert!(goldens.len() >= 15);
+        for (id, messages, conv) in goldens {
+            let rendered = ChatTemplate::Qwen35.render(&messages);
+            match conv["error"].as_str() {
+                Some(expected) => {
+                    let err = rendered.expect_err(&id);
+                    assert_eq!(err.code(), ErrorCode::InvalidRequest, "{id}");
+                    assert!(err.to_string().contains(expected), "{id}: {err}");
+                }
+                None => assert_eq!(
+                    rendered.unwrap(),
+                    conv["prompt"].as_str().unwrap(),
+                    "conversation {id:?} must render exactly like Jinja2"
+                ),
+            }
+        }
+    }
+
+    #[test]
+    fn qwen35_reference_token_ids_are_reproduced_when_the_pinned_library_is_configured() {
+        let (Ok(_lib), Ok(gguf)) = (
+            std::env::var("TUCKMILL_LLAMA_LIB"),
+            std::env::var("TUCKMILL_QWEN35_GGUF"),
+        ) else {
+            eprintln!("skipping: set TUCKMILL_LLAMA_LIB and TUCKMILL_QWEN35_GGUF");
+            return;
+        };
+        let path = std::path::PathBuf::from(gguf);
+        let bundle = ModelBundle::open_path(&path, &Id::new("c".repeat(64)).unwrap()).unwrap();
+        assert_eq!(bundle.template.map(|t| t.id()), Some("qwen35-chatml"));
+        for (id, messages, conv) in qwen35_goldens() {
+            let Some(expected) = conv["tokens"].as_array() else {
+                continue;
+            };
+            let rendered = bundle.render_chat(&messages).unwrap();
+            let tokens = bundle.encode(&rendered, false).unwrap();
+            let expected: Vec<u32> = expected
+                .iter()
+                .map(|v| v.as_u64().unwrap() as u32)
+                .collect();
+            assert_eq!(tokens, expected, "conversation {id:?} token ids");
         }
     }
 

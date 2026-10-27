@@ -1,0 +1,560 @@
+{
+ "source": "pinned Qwen3.5 GGUF chat templates",
+ "templates": [
+  {
+   "artifact": "Qwen3.5-0.8B-Q8_0.gguf",
+   "bytes": 7755,
+   "sha256": "273d8e0e683b885071fb17e08d71e5f2a5ddfb5309756181681de4f5a1822d80"
+  },
+  {
+   "artifact": "Qwen3.5-2B-Q8_0.gguf",
+   "bytes": 7816,
+   "sha256": "7f0e529032c25183bcd66c7f238da2d377f43be754a94e2725a58c4e16d2ed67"
+  }
+ ],
+ "method": "prompts rendered with Jinja2 3.1.6 as Hugging Face applies chat templates (ImmutableSandboxedEnvironment, trim_blocks, lstrip_blocks, loopcontrols, raise_exception), add_generation_prompt=True, enable_thinking undefined (the template default: thinking off); token ids from pinned llama.cpp b11695 llama-tokenize with special spellings parsed, tokenized against the first artifact",
+ "conversations": [
+  {
+   "id": "single_user",
+   "messages": [
+    {
+     "role": "user",
+     "content": "Hello, world!"
+    }
+   ],
+   "prompt": "<|im_start|>user\nHello, world!<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n",
+   "tokens": [
+    248045,
+    846,
+    198,
+    9419,
+    11,
+    1814,
+    0,
+    248046,
+    198,
+    248045,
+    74455,
+    198,
+    248068,
+    271,
+    248069,
+    271
+   ]
+  },
+  {
+   "id": "system_then_user",
+   "messages": [
+    {
+     "role": "system",
+     "content": "You are terse."
+    },
+    {
+     "role": "user",
+     "content": "What is 2+2?"
+    }
+   ],
+   "prompt": "<|im_start|>system\nYou are terse.<|im_end|>\n<|im_start|>user\nWhat is 2+2?<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n",
+   "tokens": [
+    248045,
+    8678,
+    198,
+    2523,
+    513,
+    48834,
+    13,
+    248046,
+    198,
+    248045,
+    846,
+    198,
+    3710,
+    369,
+    220,
+    17,
+    10,
+    17,
+    30,
+    248046,
+    198,
+    248045,
+    74455,
+    198,
+    248068,
+    271,
+    248069,
+    271
+   ]
+  },
+  {
+   "id": "multi_turn",
+   "messages": [
+    {
+     "role": "user",
+     "content": "Hi"
+    },
+    {
+     "role": "assistant",
+     "content": "Hello! How can I help?"
+    },
+    {
+     "role": "user",
+     "content": "Tell me a joke."
+    }
+   ],
+   "prompt": "<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\nHello! How can I help?<|im_end|>\n<|im_start|>user\nTell me a joke.<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n",
+   "tokens": [
+    248045,
+    846,
+    198,
+    12675,
+    248046,
+    198,
+    248045,
+    74455,
+    198,
+    9419,
+    0,
+    2500,
+    628,
+    353,
+    1438,
+    30,
+    248046,
+    198,
+    248045,
+    846,
+    198,
+    39113,
+    728,
+    264,
+    20983,
+    13,
+    248046,
+    198,
+    248045,
+    74455,
+    198,
+    248068,
+    271,
+    248069,
+    271
+   ]
+  },
+  {
+   "id": "system_multi_turn",
+   "messages": [
+    {
+     "role": "system",
+     "content": "Be kind."
+    },
+    {
+     "role": "user",
+     "content": "Hi"
+    },
+    {
+     "role": "assistant",
+     "content": "Hello."
+    },
+    {
+     "role": "user",
+     "content": "Bye"
+    }
+   ],
+   "prompt": "<|im_start|>system\nBe kind.<|im_end|>\n<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\nHello.<|im_end|>\n<|im_start|>user\nBye<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n",
+   "tokens": [
+    248045,
+    8678,
+    198,
+    3320,
+    2993,
+    13,
+    248046,
+    198,
+    248045,
+    846,
+    198,
+    12675,
+    248046,
+    198,
+    248045,
+    74455,
+    198,
+    9419,
+    13,
+    248046,
+    198,
+    248045,
+    846,
+    198,
+    1311,
+    68,
+    248046,
+    198,
+    248045,
+    74455,
+    198,
+    248068,
+    271,
+    248069,
+    271
+   ]
+  },
+  {
+   "id": "whitespace_trimmed",
+   "messages": [
+    {
+     "role": "system",
+     "content": "  spaced system \n"
+    },
+    {
+     "role": "user",
+     "content": "\n\n  padded user  \t\n"
+    }
+   ],
+   "prompt": "<|im_start|>system\nspaced system<|im_end|>\n<|im_start|>user\npadded user<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n",
+   "tokens": [
+    248045,
+    8678,
+    198,
+    2085,
+    4289,
+    1785,
+    248046,
+    198,
+    248045,
+    846,
+    198,
+    79,
+    16336,
+    1156,
+    248046,
+    198,
+    248045,
+    74455,
+    198,
+    248068,
+    271,
+    248069,
+    271
+   ]
+  },
+  {
+   "id": "assistant_history_with_think",
+   "messages": [
+    {
+     "role": "user",
+     "content": "Q1"
+    },
+    {
+     "role": "assistant",
+     "content": "<think>\nreason\n</think>\n\nA1"
+    },
+    {
+     "role": "user",
+     "content": "Q2"
+    }
+   ],
+   "prompt": "<|im_start|>user\nQ1<|im_end|>\n<|im_start|>assistant\nA1<|im_end|>\n<|im_start|>user\nQ2<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n",
+   "tokens": [
+    248045,
+    846,
+    198,
+    48,
+    16,
+    248046,
+    198,
+    248045,
+    74455,
+    198,
+    32,
+    16,
+    248046,
+    198,
+    248045,
+    846,
+    198,
+    48,
+    17,
+    248046,
+    198,
+    248045,
+    74455,
+    198,
+    248068,
+    271,
+    248069,
+    271
+   ]
+  },
+  {
+   "id": "trailing_assistant",
+   "messages": [
+    {
+     "role": "user",
+     "content": "Start the story."
+    },
+    {
+     "role": "assistant",
+     "content": "Once upon a time"
+    }
+   ],
+   "prompt": "<|im_start|>user\nStart the story.<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\nOnce upon a time<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n",
+   "tokens": [
+    248045,
+    846,
+    198,
+    3367,
+    279,
+    3255,
+    13,
+    248046,
+    198,
+    248045,
+    74455,
+    198,
+    248068,
+    271,
+    248069,
+    271,
+    12162,
+    5028,
+    264,
+    854,
+    248046,
+    198,
+    248045,
+    74455,
+    198,
+    248068,
+    271,
+    248069,
+    271
+   ]
+  },
+  {
+   "id": "trailing_assistant_with_think",
+   "messages": [
+    {
+     "role": "user",
+     "content": "Q"
+    },
+    {
+     "role": "assistant",
+     "content": "<think>\nplan it\n</think>\n\npartial"
+    }
+   ],
+   "prompt": "<|im_start|>user\nQ<|im_end|>\n<|im_start|>assistant\n<think>\nplan it\n</think>\n\npartial<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n",
+   "tokens": [
+    248045,
+    846,
+    198,
+    48,
+    248046,
+    198,
+    248045,
+    74455,
+    198,
+    248068,
+    198,
+    10083,
+    424,
+    198,
+    248069,
+    271,
+    36182,
+    248046,
+    198,
+    248045,
+    74455,
+    198,
+    248068,
+    271,
+    248069,
+    271
+   ]
+  },
+  {
+   "id": "unicode",
+   "messages": [
+    {
+     "role": "user",
+     "content": "Grüße, 世界! ¿Qué tal? 🙂"
+    }
+   ],
+   "prompt": "<|im_start|>user\nGrüße, 世界! ¿Qué tal? 🙂<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n",
+   "tokens": [
+    248045,
+    846,
+    198,
+    6262,
+    2314,
+    22723,
+    11,
+    220,
+    96748,
+    0,
+    27368,
+    63491,
+    7953,
+    30,
+    26594,
+    248046,
+    198,
+    248045,
+    74455,
+    198,
+    248068,
+    271,
+    248069,
+    271
+   ]
+  },
+  {
+   "id": "empty_user",
+   "messages": [
+    {
+     "role": "user",
+     "content": ""
+    }
+   ],
+   "prompt": "<|im_start|>user\n<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n",
+   "tokens": [
+    248045,
+    846,
+    198,
+    248046,
+    198,
+    248045,
+    74455,
+    198,
+    248068,
+    271,
+    248069,
+    271
+   ]
+  },
+  {
+   "id": "tool_response_user_after_query",
+   "messages": [
+    {
+     "role": "user",
+     "content": "Look it up."
+    },
+    {
+     "role": "assistant",
+     "content": "Calling."
+    },
+    {
+     "role": "user",
+     "content": "<tool_response>42</tool_response>"
+    }
+   ],
+   "prompt": "<|im_start|>user\nLook it up.<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\nCalling.<|im_end|>\n<|im_start|>user\n<tool_response>42</tool_response><|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n",
+   "tokens": [
+    248045,
+    846,
+    198,
+    10071,
+    424,
+    685,
+    13,
+    248046,
+    198,
+    248045,
+    74455,
+    198,
+    248068,
+    271,
+    248069,
+    271,
+    47218,
+    13,
+    248046,
+    198,
+    248045,
+    846,
+    198,
+    248066,
+    19,
+    17,
+    248067,
+    248046,
+    198,
+    248045,
+    74455,
+    198,
+    248068,
+    271,
+    248069,
+    271
+   ]
+  },
+  {
+   "id": "newlines_in_content",
+   "messages": [
+    {
+     "role": "user",
+     "content": "line one\nline two\n\nline four"
+    }
+   ],
+   "prompt": "<|im_start|>user\nline one\nline two\n\nline four<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n",
+   "tokens": [
+    248045,
+    846,
+    198,
+    1021,
+    799,
+    198,
+    1021,
+    1330,
+    271,
+    1021,
+    2943,
+    248046,
+    198,
+    248045,
+    74455,
+    198,
+    248068,
+    271,
+    248069,
+    271
+   ]
+  },
+  {
+   "id": "error_system_only",
+   "messages": [
+    {
+     "role": "system",
+     "content": "Only a system message."
+    }
+   ],
+   "error": "No user query found in messages."
+  },
+  {
+   "id": "error_system_not_first",
+   "messages": [
+    {
+     "role": "user",
+     "content": "Hi"
+    },
+    {
+     "role": "system",
+     "content": "Late system."
+    }
+   ],
+   "error": "System message must be at the beginning."
+  },
+  {
+   "id": "error_only_tool_response",
+   "messages": [
+    {
+     "role": "user",
+     "content": "<tool_response>x</tool_response>"
+    }
+   ],
+   "error": "No user query found in messages."
+  }
+ ]
+}
