@@ -538,11 +538,12 @@ pub struct AdapterRegistry {
 impl AdapterRegistry {
     /// Adapters embedded from the repository `adapters/` directory.
     pub fn builtin() -> Result<Self> {
-        let sources: [&str; 4] = [
+        let sources: [&str; 5] = [
             include_str!("../../../adapters/qwen3.json"),
             include_str!("../../../adapters/qwen3moe.json"),
             include_str!("../../../adapters/qwen3.5-hybrid.json"),
             include_str!("../../../adapters/bonsai2-hybrid.json"),
+            include_str!("../../../adapters/gemma3.json"),
         ];
         let mut adapters = Vec::with_capacity(sources.len());
         for (i, src) in sources.iter().enumerate() {
@@ -645,7 +646,7 @@ mod tests {
     #[test]
     fn builtin_adapters_load_and_validate() {
         let r = registry();
-        assert_eq!(r.all().len(), 4);
+        assert_eq!(r.all().len(), 5);
         for a in r.all() {
             assert_eq!(a.schema_version, ADAPTER_SCHEMA_VERSION);
             assert!(!a.required_kernels.is_empty(), "{} has no kernels", a.id);

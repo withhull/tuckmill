@@ -377,6 +377,21 @@ kernel void tm_rmsnorm_f32(device const float *x [[buffer(0)]],
  * 1/sqrt(head_dim). No mask beyond causality (Qwen3 dense here has no
  * sliding window).
 /* out[i] = silu(gate[i]) * up[i], i < n. */
+/* GeGLU gate: out[i] = gelu_tanh(gate[i]) * up[i], with ggml's tanh
+ * approximation 0.5 x (1 + tanh(sqrt(2/pi) x (1 + 0.044715 x^2))). */
+kernel void tm_gelu_tanh_mul_f32(device const float *gate [[buffer(0)]],
+                                 device const float *up [[buffer(1)]],
+                                 device float *out [[buffer(2)]],
+                                 constant uint &n [[buffer(3)]],
+                                 uint i [[thread_position_in_grid]]) {
+    if (i >= n) {
+        return;
+    }
+    const float x = gate[i];
+    const float inner = 0.7978845608028654f * x * (1.0f + 0.044715f * x * x);
+    out[i] = 0.5f * x * (1.0f + precise::tanh(inner)) * up[i];
+}
+
 kernel void tm_silu_mul_f32(device const float *gate [[buffer(0)]],
                             device const float *up [[buffer(1)]],
                             device float *out [[buffer(2)]],
@@ -928,10 +943,10 @@ kernel void tm_qwen35_kv_store_f16(device const float *k_src [[buffer(0)]],
  * the per-token and chunk kernels, so both run exactly this code. */
 template <typename C>
 inline void tm_q35_attend(const device float *qh, const device C *kc, const device C *vc,
-                          device float *oh, device float *head_scratch, uint seq,
+                          device float *oh, device float *head_scratch, uint start, uint seq,
                           uint head_dim, float scale, uint tid, uint lane, uint simd_group,
                           threadgroup float *reduce_scratch, threadgroup float *row_stats) {
-    for (uint j = simd_group; j < seq; j += 4u) {
+    for (uint j = start + simd_group; j < seq; j += 4u) {
         const device C *kr = kc + (size_t)j * (size_t)head_dim;
         float part = 0.0f;
         for (uint d = lane; d < head_dim; d += 32u) {
@@ -945,7 +960,7 @@ inline void tm_q35_attend(const device float *qh, const device C *kc, const devi
     threadgroup_barrier(mem_flags::mem_device | mem_flags::mem_threadgroup);
 
     float local_max = -INFINITY;
-    for (uint j = tid; j < seq; j += 128u) {
+    for (uint j = start + tid; j < seq; j += 128u) {
         local_max = max(local_max, head_scratch[j]);
     }
     local_max = simd_max(local_max);
@@ -964,7 +979,7 @@ inline void tm_q35_attend(const device float *qh, const device C *kc, const devi
     const float row_max = row_stats[0];
 
     float local_sum = 0.0f;
-    for (uint j = tid; j < seq; j += 128u) {
+    for (uint j = start + tid; j < seq; j += 128u) {
         local_sum += exp(head_scratch[j] - row_max);
     }
     const float denom = tm_reduce_sum_128(local_sum, reduce_scratch, lane, simd_group);
@@ -973,14 +988,14 @@ inline void tm_q35_attend(const device float *qh, const device C *kc, const devi
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
     const float norm = row_stats[1];
-    for (uint j = tid; j < seq; j += 128u) {
+    for (uint j = start + tid; j < seq; j += 128u) {
         head_scratch[j] = exp(head_scratch[j] - row_max) / norm;
     }
     threadgroup_barrier(mem_flags::mem_device | mem_flags::mem_threadgroup);
 
     for (uint d = tid; d < head_dim; d += 128u) {
         float accv = 0.0f;
-        for (uint j = 0; j < seq; ++j) {
+        for (uint j = start; j < seq; ++j) {
             accv += head_scratch[j] * (float)vc[(size_t)j * (size_t)head_dim + d];
         }
         oh[d] = accv;
@@ -1008,7 +1023,14 @@ kernel void tm_qwen35_attention_f16(device const float *q [[buffer(0)]],
                   k_cache + ((size_t)kv_head * (size_t)cap) * (size_t)head_dim,
                   v_cache + ((size_t)kv_head * (size_t)cap) * (size_t)head_dim,
                   out + (size_t)head * (size_t)head_dim, scratch + (size_t)head * (size_t)cap,
-                  pos + 1u, head_dim, scale, tid, lane, simd_group, reduce_scratch, row_stats);
+                  0u, pos + 1u, head_dim, scale, tid, lane, simd_group, reduce_scratch, row_stats);
+}
+
+/* First key a query row attends: the last `window` positions up to and
+ * including its own (sliding-window attention), or position 0 when window
+ * is 0 (full causal attention). */
+inline uint tm_attn_start(uint seq, uint window) {
+    return (window != 0u && seq > window) ? seq - window : 0u;
 }
 
 /* Chunk-wide causal attention: threadgroup (head, t) attends query row t of
@@ -1027,6 +1049,7 @@ kernel void tm_qwen35_attention_chunk(device const float *q [[buffer(0)]],
                                           constant uint &group [[buffer(8)]],
                                           constant float &scale [[buffer(9)]],
                                           constant uint &heads [[buffer(10)]],
+                                          constant uint &window [[buffer(11)]],
                                           uint2 tg [[threadgroup_position_in_grid]],
                                           uint tid [[thread_index_in_threadgroup]],
                                           uint lane [[thread_index_in_simdgroup]],
@@ -1037,11 +1060,13 @@ kernel void tm_qwen35_attention_chunk(device const float *q [[buffer(0)]],
     const uint t = tg.y;
     const uint kv_head = head / group;
     const size_t row = (size_t)t * heads + head;
+    const uint seq = pos0 + t + 1u;
     tm_q35_attend(q + row * (size_t)head_dim,
                   k_cache + ((size_t)kv_head * (size_t)cap) * (size_t)head_dim,
                   v_cache + ((size_t)kv_head * (size_t)cap) * (size_t)head_dim,
-                  out + row * (size_t)head_dim, scratch + row * (size_t)cap, pos0 + t + 1u,
-                  head_dim, scale, tid, lane, simd_group, reduce_scratch, row_stats);
+                  out + row * (size_t)head_dim, scratch + row * (size_t)cap,
+                  tm_attn_start(seq, window), seq, head_dim, scale, tid, lane, simd_group,
+                  reduce_scratch, row_stats);
 }
 
 #define TM_ATTN_CHUNK_ARGS(C)                                                               \
@@ -1050,9 +1075,9 @@ kernel void tm_qwen35_attention_chunk(device const float *q [[buffer(0)]],
         device float *scratch [[buffer(4)]], constant uint &pos0 [[buffer(5)]],             \
         constant uint &cap [[buffer(6)]], constant uint &head_dim [[buffer(7)]],            \
         constant uint &group [[buffer(8)]], constant float &scale [[buffer(9)]],            \
-        constant uint &heads [[buffer(10)]], uint2 tg [[threadgroup_position_in_grid]],     \
-        uint tid [[thread_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]],   \
-        uint simd_group [[simdgroup_index_in_threadgroup]]
+        constant uint &heads [[buffer(10)]], constant uint &window [[buffer(11)]],          \
+        uint2 tg [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]], \
+        uint lane [[thread_index_in_simdgroup]], uint simd_group [[simdgroup_index_in_threadgroup]]
 
 template [[host_name("tm_qwen35_attention_f16_chunk")]] kernel void
 tm_qwen35_attention_chunk<half>(TM_ATTN_CHUNK_ARGS(half));
@@ -1087,6 +1112,7 @@ kernel void tm_qwen35_attention_gqa(device const float *q [[buffer(0)]],
                                     constant uint &group [[buffer(8)]],
                                     constant float &scale [[buffer(9)]],
                                     constant uint &heads [[buffer(10)]],
+                                    constant uint &window [[buffer(11)]],
                                     uint2 tg [[threadgroup_position_in_grid]],
                                     uint tid [[thread_index_in_threadgroup]],
                                     uint lane [[thread_index_in_simdgroup]],
@@ -1102,6 +1128,7 @@ kernel void tm_qwen35_attention_gqa(device const float *q [[buffer(0)]],
     const uint kv_head = tg.x;
     const uint t = tg.y;
     const uint seq = pos0 + t + 1u;
+    const uint start = tm_attn_start(seq, window);
     const uint d0 = lane * EPL;
     const bool active = d0 < HD;
     const size_t row0 = (size_t)t * heads + (size_t)kv_head * G;
@@ -1115,7 +1142,7 @@ kernel void tm_qwen35_attention_gqa(device const float *q [[buffer(0)]],
         qt[idx] = q[row0 * HD + idx];
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    for (uint j = tid; j < seq; j += 128u) {
+    for (uint j = start + tid; j < seq; j += 128u) {
         const device C *kr = kc + (size_t)j * HD;
         float part[G];
         for (uint h = 0; h < G; ++h) {
@@ -1136,16 +1163,16 @@ kernel void tm_qwen35_attention_gqa(device const float *q [[buffer(0)]],
     for (uint h = sg; h < G; h += 4u) {
         device float *sh = scratch + (row0 + h) * cap;
         float m = -INFINITY;
-        for (uint j = lane; j < seq; j += 32u) {
+        for (uint j = start + lane; j < seq; j += 32u) {
             m = max(m, sh[j]);
         }
         m = simd_max(m);
         float sum = 0.0f;
-        for (uint j = lane; j < seq; j += 32u) {
+        for (uint j = start + lane; j < seq; j += 32u) {
             sum += exp(sh[j] - m);
         }
         const float norm = simd_sum(sum);
-        for (uint j = lane; j < seq; j += 32u) {
+        for (uint j = start + lane; j < seq; j += 32u) {
             sh[j] = exp(sh[j] - m) / norm;
         }
     }
@@ -1160,7 +1187,7 @@ kernel void tm_qwen35_attention_gqa(device const float *q [[buffer(0)]],
     /* Values: probabilities are staged per tile of PT keys in threadgroup
      * memory; each SIMD group still takes keys j = sg mod 4 in ascending
      * order, so the accumulation order is unchanged. */
-    for (uint base = 0; base < seq; base += PT) {
+    for (uint base = start; base < seq; base += PT) {
         const uint tile = min(PT, seq - base);
         for (uint idx = tid; idx < G * PT; idx += 128u) {
             const uint h = idx / PT;
@@ -1206,9 +1233,9 @@ kernel void tm_qwen35_attention_gqa(device const float *q [[buffer(0)]],
         device float *scratch [[buffer(4)]], constant uint &pos0 [[buffer(5)]],              \
         constant uint &cap [[buffer(6)]], constant uint &head_dim [[buffer(7)]],             \
         constant uint &group [[buffer(8)]], constant float &scale [[buffer(9)]],             \
-        constant uint &heads [[buffer(10)]], uint2 tg [[threadgroup_position_in_grid]],      \
-        uint tid [[thread_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]],    \
-        uint sg [[simdgroup_index_in_threadgroup]]
+        constant uint &heads [[buffer(10)]], constant uint &window [[buffer(11)]],           \
+        uint2 tg [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]],  \
+        uint lane [[thread_index_in_simdgroup]], uint sg [[simdgroup_index_in_threadgroup]]
 
 template [[host_name("tm_qwen35_attention_gqa_256x4")]] kernel void
 tm_qwen35_attention_gqa<256u, 4u, half>(TM_ATTN_GQA_ARGS(half));

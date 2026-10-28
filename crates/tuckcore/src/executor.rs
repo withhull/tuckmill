@@ -222,7 +222,7 @@ impl InferenceBackend for TuckCore {
 
     fn capabilities(&self) -> BackendCapabilities {
         BackendCapabilities {
-            architectures: vec!["qwen3".to_string(), "qwen35".to_string()],
+            architectures: vec!["qwen3".to_string(), "qwen35".to_string(), "gemma3".to_string()],
             moe: false,
             hybrid: true,
             ternary: false,
@@ -447,6 +447,22 @@ impl InferenceBackend for TuckCore {
                 },
             )?;
             return Ok(note);
+        }
+        if insp.arch_id().as_deref() == Some("gemma3") {
+            return self.load_gemma3_engine(
+                plan,
+                artifact,
+                &opts,
+                metal_mode,
+                &insp,
+                &artifact_file,
+                EngineLoadContext {
+                    payload,
+                    content_verified,
+                    counters,
+                    load_start,
+                },
+            );
         }
         let registry = AdapterRegistry::builtin()?;
         let (cfg, _adapter) = model::resolve(&insp, &registry)?;
@@ -1282,6 +1298,39 @@ const HYBRID_KERNEL_ID: &str = "Q35-2C:qwen35-q8_0+f16:metal";
 /// Identity of dense Qwen3 on the unified engine (ADR-011 step 2), over raw
 /// Q8_0/F16 weights, resolved implementation "metal".
 const QWEN3_ENGINE_KERNEL_ID: &str = "ADR011:qwen3-q8_0+f16:metal";
+/// Kernel identity of Gemma 3 on the unified engine (ADR-013).
+const GEMMA3_ENGINE_KERNEL_ID: &str = "ADR013:gemma3-q8_0+f16:metal";
+
+/// Option checks shared by every unified-engine load: resident plans only,
+/// and no CPU-streaming options.
+fn check_resident_engine_options(plan: &ExecutionPlan, opts: &TuckCoreOptions) -> Result<()> {
+    if plan.mode != ExecutionMode::Resident {
+        return Err(TuckmillError::new(
+            ErrorCode::InvalidPlan,
+            format!(
+                "the Metal path is resident-only, but the plan mode is {}; GPU streaming is not implemented (the CPU kernels stream)",
+                plan.mode.as_str()
+            ),
+        )
+        .with_action("Raise --memory-budget so the plan is resident, lower --context, or use the CPU kernels."));
+    }
+    if opts.prefill_batch.is_some() {
+        return Err(TuckmillError::new(
+            ErrorCode::InvalidRequest,
+            format!(
+                "the unified engine prefills in fixed chunks of {} tokens; prefill_batch must not be set",
+                engine_metal::PREFILL_BATCH
+            ),
+        ));
+    }
+    if opts.weight_cache_bytes.is_some() || opts.block_bytes.is_some() {
+        return Err(TuckmillError::new(
+            ErrorCode::InvalidRequest,
+            "weight-cache and block options apply to CPU weight streaming; the Metal path keeps weights resident",
+        ));
+    }
+    Ok(())
+}
 
 /// Load-time facts the shared verification prologue hands to the hybrid
 /// loader.
@@ -1392,31 +1441,7 @@ impl TuckCore {
         artifact_file: &std::fs::File,
         ctx: EngineLoadContext,
     ) -> Result<String> {
-        if plan.mode != ExecutionMode::Resident {
-            return Err(TuckmillError::new(
-                ErrorCode::InvalidPlan,
-                format!(
-                    "the Metal path is resident-only, but the plan mode is {}; GPU streaming is not implemented (the CPU kernels stream)",
-                    plan.mode.as_str()
-                ),
-            )
-            .with_action("Raise --memory-budget so the plan is resident, lower --context, or use the CPU kernels."));
-        }
-        if opts.prefill_batch.is_some() {
-            return Err(TuckmillError::new(
-                ErrorCode::InvalidRequest,
-                format!(
-                    "the unified engine prefills in fixed chunks of {} tokens; prefill_batch must not be set",
-                    engine_metal::PREFILL_BATCH
-                ),
-            ));
-        }
-        if opts.weight_cache_bytes.is_some() || opts.block_bytes.is_some() {
-            return Err(TuckmillError::new(
-                ErrorCode::InvalidRequest,
-                "weight-cache and block options apply to CPU weight streaming; the Metal path keeps weights resident",
-            ));
-        }
+        check_resident_engine_options(plan, opts)?;
         let mut names = model::TensorNames::for_layers(cfg.layers);
         names.resolve(insp)?;
         let graph = crate::engine::adapters::qwen3(cfg, &names, insp)?;
@@ -1435,6 +1460,53 @@ impl TuckCore {
             opts.prefix_cache.unwrap_or(true),
             opts.speculative.unwrap_or(false),
             QWEN3_ENGINE_KERNEL_ID,
+            ctx,
+        )
+    }
+
+    /// ADR-013: load a verified Gemma 3 text artifact onto the unified
+    /// engine (Metal only). KV precision defaults to f16, as in llama.cpp.
+    #[allow(clippy::too_many_arguments)]
+    fn load_gemma3_engine(
+        &mut self,
+        plan: &ExecutionPlan,
+        artifact: &ArtifactRef,
+        opts: &TuckCoreOptions,
+        metal_mode: bool,
+        insp: &tuckmill_manifest::gguf::GgufInspection,
+        artifact_file: &std::fs::File,
+        ctx: EngineLoadContext,
+    ) -> Result<String> {
+        if !metal_mode {
+            return Err(TuckmillError::new(
+                ErrorCode::UnsupportedArchitecture,
+                "gemma3 runs on the unified engine's resident Metal path only; there is no CPU path for it",
+            )
+            .with_action("Select --kernels metal."));
+        }
+        check_resident_engine_options(plan, opts)?;
+        let kv = match opts.kv_precision.as_deref() {
+            None | Some("f16") => KvCache::F16,
+            Some("f32") => KvCache::F32,
+            Some(other) => {
+                return Err(TuckmillError::new(
+                    ErrorCode::InvalidRequest,
+                    format!("unknown kv_precision {other:?}; use \"f32\" or \"f16\""),
+                ))
+            }
+        };
+        let graph = crate::engine::adapters::gemma3(insp)?;
+        let source = crate::engine::GgufWeights::with_inspection(artifact_file, insp)?;
+        self.load_engine(
+            plan,
+            artifact,
+            insp,
+            graph,
+            &source,
+            kv,
+            opts.prefix_cache.unwrap_or(true),
+            opts.speculative.unwrap_or(false),
+            GEMMA3_ENGINE_KERNEL_ID,
             ctx,
         )
     }

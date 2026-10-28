@@ -15,7 +15,9 @@ use tuckmill_metal::{
     GEMM_MMA_MAX_BATCH,
 };
 
-use super::graph::{AttentionSpec, FfnSpec, GatedDeltaNetSpec, MixerSpec, ModelGraph, Tensor};
+use super::graph::{
+    AttentionSpec, FfnSpec, GatedDeltaNetSpec, GluActivation, MixerSpec, ModelGraph, Tensor,
+};
 use super::WeightSource;
 use crate::qwen35_gpu::{f32_bytes, GpuAllocPlan, Qwen35Gpu, STAGING_CHUNK_BYTES};
 
@@ -324,9 +326,7 @@ impl PrefillWidths {
                     w.ascr = w.ascr.max(a.heads * capacity);
                 }
             }
-            match &layer.ffn {
-                FfnSpec::SwiGlu { width, .. } => w.ffn = w.ffn.max(*width),
-            }
+            w.ffn = w.ffn.max(layer.ffn.parts().3);
         }
         w
     }
@@ -426,11 +426,15 @@ impl PrefillScratch {
 
 // ------------------------------------------------------------------ blocks --
 
-/// SwiGLU FFN: `down(silu(gate x) * up x)`.
+/// Gated FFN: `down(act(gate x) * up x)` with SiLU (SwiGLU) or tanh GELU
+/// (GeGLU), and an optional RMS norm on its output before the residual add.
 struct SwiGluBlock {
     gate: Matrix,
     up: Matrix,
     down: Matrix,
+    act: GluActivation,
+    out_norm: Option<MetalBuffer>,
+    eps: f32,
     g: MetalBuffer,
     u: MetalBuffer,
     out: MetalBuffer,
@@ -438,17 +442,20 @@ struct SwiGluBlock {
 }
 
 impl SwiGluBlock {
-    fn plan(spec: &FfnSpec, hidden: usize, src: &dyn WeightSource, p: &mut Plan) -> Result<()> {
-        let FfnSpec::SwiGlu {
-            gate,
-            up,
-            down,
-            width,
-        } = spec;
-        p.weights +=
-            Matrix::plan(src, *gate)? + Matrix::plan(src, *up)? + Matrix::plan(src, *down)?;
-        p.scratch_f32(*width);
-        p.scratch_f32(*width);
+    fn plan(
+        spec: &FfnSpec,
+        out_norm: Option<Tensor>,
+        hidden: usize,
+        src: &dyn WeightSource,
+        p: &mut Plan,
+    ) -> Result<()> {
+        let (gate, up, down, width, _) = spec.parts();
+        p.weights += Matrix::plan(src, gate)? + Matrix::plan(src, up)? + Matrix::plan(src, down)?;
+        if let Some(n) = out_norm {
+            p.weights_f32(vector_len(src, n)?);
+        }
+        p.scratch_f32(width);
+        p.scratch_f32(width);
         p.scratch_f32(hidden);
         Ok(())
     }
@@ -457,23 +464,33 @@ impl SwiGluBlock {
         gpu: &Qwen35Gpu,
         src: &dyn WeightSource,
         spec: &FfnSpec,
+        out_norm: Option<Tensor>,
         hidden: usize,
+        eps: f32,
     ) -> Result<Self> {
-        let FfnSpec::SwiGlu {
-            gate,
-            up,
-            down,
-            width,
-        } = spec;
+        let (gate, up, down, width, act) = spec.parts();
         Ok(Self {
-            gate: Matrix::load(gpu, src, *gate)?,
-            up: Matrix::load(gpu, src, *up)?,
-            down: Matrix::load(gpu, src, *down)?,
-            g: zeros(gpu, *width)?,
-            u: zeros(gpu, *width)?,
+            gate: Matrix::load(gpu, src, gate)?,
+            up: Matrix::load(gpu, src, up)?,
+            down: Matrix::load(gpu, src, down)?,
+            act,
+            out_norm: out_norm.map(|n| vector(gpu, src, n)).transpose()?,
+            eps,
+            g: zeros(gpu, width)?,
+            u: zeros(gpu, width)?,
             out: zeros(gpu, hidden)?,
-            width: *width,
+            width,
         })
+    }
+
+    /// `out = act(g) * u` in place over `n` elements of `g`.
+    fn gate_mul(&self, gpu: &Qwen35Gpu, g: &MetalBuffer, u: &MetalBuffer, n: u32) -> Result<()> {
+        let ctx = gpu.context();
+        // In place: `out` aliases `gate`; each element is read first.
+        match self.act {
+            GluActivation::Silu => ctx.silu_mul(g, u, g, n),
+            GluActivation::GeluTanh => ctx.gelu_tanh_mul(g, u, g, n),
+        }
     }
 
     /// `x += ffn(h)` for one token.
@@ -487,9 +504,11 @@ impl SwiGluBlock {
         let ctx = gpu.context();
         self.gate.gemv(gpu, h, &self.g)?;
         self.up.gemv(gpu, h, &self.u)?;
-        // In place: `out` aliases `gate`; each element is read first.
-        ctx.silu_mul(&self.g, &self.u, &self.g, self.width as u32)?;
+        self.gate_mul(gpu, &self.g, &self.u, self.width as u32)?;
         self.down.gemv(gpu, &self.g, &self.out)?;
+        if let Some(w) = &self.out_norm {
+            ctx.rmsnorm(&self.out, w, &self.out, 1, hidden as u32, self.eps)?;
+        }
         ctx.f32_axpy(&self.out, x, 1.0, hidden as u32)
     }
 
@@ -506,8 +525,11 @@ impl SwiGluBlock {
         let nn = n as u32;
         self.gate.gemm(gpu, &s.h2, &s.g, nn, exact)?;
         self.up.gemm(gpu, &s.h2, &s.u, nn, exact)?;
-        ctx.silu_mul(&s.g, &s.u, &s.g, (n * self.width) as u32)?;
+        self.gate_mul(gpu, &s.g, &s.u, (n * self.width) as u32)?;
         self.down.gemm(gpu, &s.g, &s.d2, nn, exact)?;
+        if let Some(w) = &self.out_norm {
+            ctx.rmsnorm(&s.d2, w, &s.d2, nn, hidden as u32, self.eps)?;
+        }
         ctx.f32_axpy(&s.d2, &s.x, 1.0, (n * hidden) as u32)
     }
 }
@@ -1095,6 +1117,11 @@ impl AttentionBlock {
         zero_fill(&self.v_cache)
     }
 
+    /// The kernels' window argument: 0 is full causal attention.
+    fn window(&self) -> u32 {
+        self.spec.window.map_or(0, |w| w as u32)
+    }
+
     fn decode(&self, gpu: &Qwen35Gpu, h: &MetalBuffer, proj: &MetalBuffer, pos: u32) -> Result<()> {
         self.q_w.gemv(gpu, h, self.qg.as_ref().unwrap_or(&self.q))?;
         self.k_w.gemv(gpu, h, &self.k)?;
@@ -1196,6 +1223,7 @@ impl AttentionBlock {
             heads / kv,
             1.0 / (spec.head_dim as f32).sqrt(),
             nn,
+            self.window(),
             f32_cache,
         )?;
         if spec.output_gate {
@@ -1238,6 +1266,38 @@ impl AttentionBlock {
             s.rope_dims as u32,
         )?;
         match self.kv {
+            // Sliding-window layers run the chunk kernels with n = 1 (the
+            // kernel prefill uses), with their window.
+            KvCache::F16 if s.window.is_some() => {
+                ctx.qwen35_kv_store_chunk(
+                    &self.k,
+                    &self.v,
+                    &self.k_cache,
+                    &self.v_cache,
+                    pos,
+                    self.cache_cap as u32,
+                    s.head_dim as u32,
+                    s.kv_heads as u32,
+                    1,
+                    false,
+                )?;
+                ctx.qwen35_attention_chunk(
+                    &self.q,
+                    &self.k_cache,
+                    &self.v_cache,
+                    &self.attn,
+                    &self.kv_scratch,
+                    s.heads as u32,
+                    pos,
+                    self.cache_cap as u32,
+                    s.head_dim as u32,
+                    (s.heads / s.kv_heads) as u32,
+                    1.0 / (s.head_dim as f32).sqrt(),
+                    1,
+                    self.window(),
+                    false,
+                )?;
+            }
             KvCache::F16 => {
                 gpu.kv_store_f16_dev(
                     &self.k,
@@ -1291,6 +1351,7 @@ impl AttentionBlock {
                     (s.heads / s.kv_heads) as u32,
                     1.0 / (s.head_dim as f32).sqrt(),
                     1,
+                    self.window(),
                     true,
                 )?;
             }
@@ -1317,6 +1378,8 @@ enum Mixer {
 /// One layer: `x += mixer(norm(x)); x += ffn(norm(x))`.
 struct Layer {
     pre_norm: MetalBuffer,
+    /// RMS norm on the mixer output before its residual add.
+    mixer_out_norm: Option<MetalBuffer>,
     post_norm: MetalBuffer,
     h: MetalBuffer,
     h2: MetalBuffer,
@@ -1336,6 +1399,9 @@ impl Layer {
     ) -> Result<()> {
         p.weights_f32(vector_len(src, spec.pre_norm)?);
         p.weights_f32(vector_len(src, spec.post_norm)?);
+        if let Some(n) = spec.mixer_out_norm {
+            p.weights_f32(vector_len(src, n)?);
+        }
         p.scratch_f32(graph.hidden); // h
         p.scratch_f32(graph.hidden); // h2
         p.scratch_f32(graph.hidden); // proj
@@ -1343,7 +1409,7 @@ impl Layer {
             MixerSpec::GatedDeltaNet(g) => GdnBlock::plan(g, src, opts, p)?,
             MixerSpec::Attention(a) => AttentionBlock::plan(a, src, capacity, opts.kv, p)?,
         }
-        SwiGluBlock::plan(&spec.ffn, graph.hidden, src, p)
+        SwiGluBlock::plan(&spec.ffn, spec.ffn_out_norm, graph.hidden, src, p)
     }
 
     fn load(
@@ -1356,6 +1422,10 @@ impl Layer {
     ) -> Result<Self> {
         Ok(Self {
             pre_norm: vector(gpu, src, spec.pre_norm)?,
+            mixer_out_norm: spec
+                .mixer_out_norm
+                .map(|n| vector(gpu, src, n))
+                .transpose()?,
             post_norm: vector(gpu, src, spec.post_norm)?,
             h: zeros(gpu, graph.hidden)?,
             h2: zeros(gpu, graph.hidden)?,
@@ -1368,7 +1438,14 @@ impl Layer {
                     gpu, src, a, graph.eps, capacity, opts.kv,
                 )?)),
             },
-            ffn: SwiGluBlock::load(gpu, src, &spec.ffn, graph.hidden)?,
+            ffn: SwiGluBlock::load(
+                gpu,
+                src,
+                &spec.ffn,
+                spec.ffn_out_norm,
+                graph.hidden,
+                graph.eps,
+            )?,
         })
     }
 
@@ -1412,6 +1489,9 @@ impl Layer {
             Mixer::Gdn(b) => b.decode(gpu, &self.h, &self.proj)?,
             Mixer::Attention(b) => b.decode(gpu, &self.h, &self.proj, pos)?,
         }
+        if let Some(w) = &self.mixer_out_norm {
+            ctx.rmsnorm(&self.proj, w, &self.proj, 1, hidden as u32, eps)?;
+        }
         ctx.f32_axpy(&self.proj, x, 1.0, hidden as u32)?;
         ctx.rmsnorm(x, &self.post_norm, &self.h2, 1, hidden as u32, eps)?;
         self.ffn.decode(gpu, &self.h2, x, hidden)
@@ -1434,6 +1514,9 @@ impl Layer {
         match &self.mixer {
             Mixer::Gdn(b) => b.prefill(gpu, s, n, mode)?,
             Mixer::Attention(b) => b.prefill(gpu, s, n, pos0, mode)?,
+        }
+        if let Some(w) = &self.mixer_out_norm {
+            ctx.rmsnorm(&s.proj, w, &s.proj, nn, hidden as u32, eps)?;
         }
         ctx.f32_axpy(&s.proj, &s.x, 1.0, (n * hidden) as u32)?;
         ctx.rmsnorm(&s.x, &self.post_norm, &s.h2, nn, hidden as u32, eps)?;
@@ -1971,6 +2054,15 @@ impl EngineModel {
         self.head.as_ref().unwrap_or(&self.embedding)
     }
 
+    /// Apply the graph's embedding scale in place to the first `elems`
+    /// values of `buf` (the embedded rows entering the first layer).
+    fn scale_embeddings(&self, buf: &MetalBuffer, elems: u32) -> Result<()> {
+        match self.graph.embedding_scale {
+            Some(f) => self.gpu.context().f32_scale(buf, buf, f, elems),
+            None => Ok(()),
+        }
+    }
+
     /// Save or restore the MTP head's prefix state: the main hidden state
     /// at the boundary's last position (its KV rows below stay in place).
     fn mtp_snapshot(&self, save: bool) -> Result<()> {
@@ -2085,6 +2177,7 @@ impl EngineModel {
                         ctx.copy_f32(&self.x, 0, &s.x, hh, hh)?;
                     }
                 }
+                self.scale_embeddings(&s.x, 2 * hh)?;
                 let mode = ChunkMode {
                     chunk_core: true,
                     exact: true,
@@ -2323,6 +2416,7 @@ impl EngineModel {
                         &self.x,
                     )?,
                 }
+                self.scale_embeddings(&self.x, hidden as u32)?;
                 for layer in &self.layers {
                     layer.decode(&self.gpu, &self.x, pos as u32, hidden, eps)?;
                 }
@@ -2380,6 +2474,7 @@ impl EngineModel {
             let greedy = matches!(out, Out::Greedy(_));
             let mut encode = || -> Result<()> {
                 self.embedding.row_into(&self.gpu, token, &self.x, 0)?;
+                self.scale_embeddings(&self.x, hidden as u32)?;
                 on_stage(Stage::Embedding, &self.x)?;
                 for (l, layer) in self.layers.iter().enumerate() {
                     layer.decode(&self.gpu, &self.x, pos as u32, hidden, eps)?;
@@ -2472,6 +2567,7 @@ impl EngineModel {
                     self.embedding
                         .row_into(&self.gpu, *token, &s.x, (i * hidden) as u32)?;
                 }
+                self.scale_embeddings(&s.x, (n * hidden) as u32)?;
                 for layer in &self.layers {
                     layer.prefill(&self.gpu, s, n, pos as u32, hidden, eps, mode)?;
                 }
@@ -4240,5 +4336,154 @@ mod mtp_tests {
                 Drafts::Alternating,
             ],
         );
+    }
+}
+
+#[cfg(test)]
+mod gemma3_tests {
+    use super::*;
+    use crate::engine::GgufWeights;
+    use tuckmill_manifest::testing::{write_synthetic, SyntheticConfig};
+
+    fn gpu_or_skip() -> bool {
+        if tuckmill_metal::probe().available {
+            return true;
+        }
+        assert!(
+            std::env::var("TUCKMILL_REQUIRE_METAL").is_err(),
+            "TUCKMILL_REQUIRE_METAL is set but no Metal device is available"
+        );
+        eprintln!("skipping: no Metal device");
+        false
+    }
+
+    fn bits(v: &[f32]) -> Vec<u32> {
+        v.iter().map(|x| x.to_bits()).collect()
+    }
+
+    fn load(graph: ModelGraph, src: &GgufWeights, capacity: usize) -> EngineModel {
+        let plan = alloc_plan(&graph, src, capacity).unwrap();
+        let model = EngineModel::load(
+            Qwen35Gpu::open().unwrap(),
+            graph,
+            src,
+            capacity,
+            plan.total(),
+        )
+        .unwrap();
+        assert_eq!(model.allocated_bytes(), plan.total(), "ledger == plan");
+        model
+    }
+
+    fn prefill(model: &EngineModel, prompt: &[u32]) -> Vec<f32> {
+        model.reset().unwrap();
+        let mut logits = Vec::new();
+        let chunks: Vec<&[u32]> = prompt.chunks(PREFILL_BATCH).collect();
+        for (c, chunk) in chunks.iter().enumerate() {
+            model
+                .prefill_chunk(chunk, c + 1 == chunks.len(), &mut logits)
+                .unwrap();
+        }
+        logits
+    }
+
+    /// ADR-013 on the fixture: the gemma3 graph (sliding-window layers with
+    /// a global layer every sixth, sandwich norms, GeGLU, scaled
+    /// embeddings) runs with batched prefill bit-identical to token-by-token
+    /// decode and chunk cores identical to per-token cores, across the
+    /// window; the window changes nothing below its size and does change
+    /// longer prompts.
+    #[test]
+    fn gemma3_graph_prefill_is_bit_identical_to_decode_across_the_window() {
+        if !gpu_or_skip() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("g3.gguf");
+        write_synthetic(&path, &SyntheticConfig::tiny_gemma3()).unwrap();
+        let insp = tuckmill_manifest::gguf::inspect(&path, &Default::default()).unwrap();
+        let file = std::fs::File::open(&path).unwrap();
+        let src = GgufWeights::with_inspection(&file, &insp).unwrap();
+        let graph = crate::engine::adapters::gemma3(&insp).unwrap();
+        assert_eq!(graph.layers.len(), 6);
+        assert_eq!(graph.embedding_scale, Some(6.0));
+        assert_eq!(graph.head, graph.embedding, "tied head");
+        for (l, layer) in graph.layers.iter().enumerate() {
+            let MixerSpec::Attention(a) = &layer.mixer else {
+                panic!("attention layers only");
+            };
+            let global = l == 5;
+            assert_eq!(a.window, if global { None } else { Some(8) }, "layer {l}");
+            assert_eq!(a.rope_base, if global { 1_000_000.0 } else { 10_000.0 });
+            assert!(layer.mixer_out_norm.is_some() && layer.ffn_out_norm.is_some());
+            assert!(matches!(layer.ffn, FfnSpec::GeGlu { .. }));
+        }
+
+        let capacity = PREFILL_BATCH + 16;
+        let model = load(graph.clone(), &src, capacity);
+        let vocab = graph.vocab as u32;
+        for len in [1usize, 5, 8, 9, 20, PREFILL_BATCH + 4] {
+            let prompt: Vec<u32> = (0..len as u32).map(|i| (i * 37 + 5) % vocab).collect();
+            let next = 77u32;
+            model.reset().unwrap();
+            let mut seq = Vec::new();
+            for t in &prompt {
+                model.forward_token(*t, &mut seq).unwrap();
+            }
+            let mut seq_next = Vec::new();
+            model.forward_token(next, &mut seq_next).unwrap();
+
+            let batched = prefill(&model, &prompt);
+            let mut batched_next = Vec::new();
+            model.forward_token(next, &mut batched_next).unwrap();
+            assert_eq!(
+                bits(&batched),
+                bits(&seq),
+                "prompt {len}: last-token logits"
+            );
+            assert_eq!(
+                bits(&batched_next),
+                bits(&seq_next),
+                "prompt {len}: next step"
+            );
+
+            model.set_chunk_core(false);
+            let per_token = prefill(&model, &prompt);
+            model.set_chunk_core(true);
+            assert_eq!(
+                bits(&per_token),
+                bits(&batched),
+                "prompt {len}: chunk cores"
+            );
+        }
+
+        {
+            let prompt: Vec<u32> = (0..20u32).map(|i| (i * 37 + 5) % vocab).collect();
+            let mut changed = prompt.clone();
+            changed[0] = (changed[0] + 1) % vocab;
+            let a = prefill(&model, &prompt);
+            let b = prefill(&model, &changed);
+            // The fixture sees its input (outside the window, through the
+            // global layer; inside it, everywhere).
+            assert_ne!(bits(&a), bits(&b), "first token reaches the output");
+            let mut changed = prompt.clone();
+            changed[18] = (changed[18] + 1) % vocab;
+            let b = prefill(&model, &changed);
+            assert_ne!(bits(&a), bits(&b), "a recent token reaches the output");
+        }
+        // Without windows: identical below the window size, different past it.
+        let mut full = graph.clone();
+        for layer in &mut full.layers {
+            if let MixerSpec::Attention(a) = &mut layer.mixer {
+                a.window = None;
+            }
+        }
+        let unwindowed = load(full, &src, capacity);
+        for (len, same) in [(8usize, true), (20, false)] {
+            let prompt: Vec<u32> = (0..len as u32).map(|i| (i * 37 + 5) % vocab).collect();
+            let a = prefill(&model, &prompt);
+            let b = prefill(&unwindowed, &prompt);
+            assert_eq!(bits(&a) == bits(&b), same, "prompt {len}: window effect");
+        }
     }
 }

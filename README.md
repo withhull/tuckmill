@@ -22,8 +22,8 @@ statements in [docs/claims.md](docs/claims.md).
 - **TuckCore executor**:
   - **Unified engine (ADR-011):** an adapter describes a model as a typed
     graph, and one Metal engine runs it from shared blocks. Qwen3.5 0.8B
-    and 2B (Q8_0) are served this way, with batched prefill and pipelined
-    greedy decoding on the GPU.
+    and 2B (Q8_0) and Gemma 3 1B (Q8_0, ADR-013) are served this way, with
+    batched prefill and pipelined greedy decoding on the GPU.
   - **Dense Qwen3:** served by the same engine on Metal (f32 or f16 KV);
     the CPU path (scalar and NEON, with bounded weight streaming) stays
     as the CPU executor and arithmetic oracle.
@@ -45,6 +45,9 @@ prompt tokens, 512 tokens in and 256 out, ABBA rounds. Two idle runs at
 | Time to first token | 0.272 s (both runs) | 0.269-0.300 s | 94-106% of llama.cpp per pair |
 | Decode | 84.2-84.3 tok/s | 66.8-84.7 tok/s | 0.99-1.26× per pair |
 
+- **Gemma 3 1B Q8_0** (one run, f16 KV, ignore-EOS): decode 57.1 vs
+  63.7 tok/s (paired 0.896), time to first token 368 vs 331 ms (paired
+  1.11×). Just under the 90% decode bar, before any tuning.
 - **Qwen3.5-2B Q8_0** (two runs, 3 GiB budget): time to first token
   0.623-0.625 s vs 0.587-0.588 s (94%), decode 39.3-39.4 vs
   38.3-40.5 tok/s (paired 0.97-1.03).
@@ -120,6 +123,7 @@ constrained machines, not the architecture.
 | Prefix cache (unified engine, ADR-012): a prompt that extends the previous request's prefix resumes from a snapshot, bit-identical to a cold prefill | ✅ experimental; 984-token chat 0.87-0.93 s cold vs 0.33-0.37 s on a hit (0.8B, indicative); off in `bench` |
 | Model lifecycle (ADR-012): `serve --keep-alive 5m` unloads idle models; `--max-loaded-models N` keeps several resident only when they fit the budget together, unloading the least recently used first; `POST /control/unload` | ✅ experimental |
 | MTP speculative greedy decoding (unified engine, ADR-012): `--speculative` drafts with the artifact's MTP head and verifies with the decode arithmetic, token-identical to plain greedy | ✅ experimental; 0.8B decode 98-101 vs 76-78 tok/s plain, TTFT +4% (`bench` 512/256, ignore-EOS, indicative); the 2B has no MTP block |
+| Gemma 3 text on Metal (unified engine, ADR-013): sliding-window attention, sandwich norms, GeGLU; raw completion | ✅ experimental; logits match pinned llama.cpp Metal (max diff ≤ 0.022); chat template not yet recognized |
 | Dense Qwen3 on Metal (unified engine): f32 or packed f16 KV, batched prefill, device greedy sampling | ✅ experimental; qualified on the pinned Qwen3-0.6B (CPU oracle and llama.cpp envelopes) |
 | Dense Qwen3 on CPU: scalar f32 oracle and NEON Q8_0/F16 kernel, bounded weight streaming | ✅ experimental |
 | Formats executed | CPU: F32, F16, BF16, Q8_0, Q4_0, Q4_1. Metal: Q8_0, F16. K-quants and IQ formats are refused |
@@ -167,13 +171,13 @@ native/llamaref     narrow C shim over pinned llama.cpp
 kernels/            kernel work-package registry
 adapters/           model-family adapter specs
 benchmarks/         standard-v1 workload and per-tier results
-docs/adr/           architecture decisions (ADR-001..012)
+docs/adr/           architecture decisions (ADR-001..013)
 scripts/            build, test, demo, fetch-llama, bench-baseline
 ```
 
 ## Verification
 
-`scripts/test.sh` is the gate (501 tests at this revision). It runs
+`scripts/test.sh` is the gate (503 tests at this revision). It runs
 formatting, `clippy -D warnings` and the full suite:
 - adversarial GGUF and Safetensors fixtures;
 - planner math, governor semantics and import fault injection;

@@ -443,7 +443,75 @@ impl DecodeVocab {
     /// Build straight from the artifact without the encoder's merge table
     /// (the same refusals as [`Tokenizer::from_gguf`]).
     pub fn from_gguf(inspection: &GgufInspection) -> Result<Self> {
+        if inspection.get_str("tokenizer.ggml.model") == Some("llama") {
+            return Self::from_sentencepiece(inspection);
+        }
         Self::from_tokenizer(&Tokenizer::from_gguf_with(inspection, false)?)
+    }
+
+    /// A SentencePiece (`tokenizer.ggml.model = "llama"`) vocabulary, with
+    /// llama.cpp's piece rules: `▁` is a space, `<0xHH>` byte tokens are
+    /// that byte, unknown tokens are `▅`, control tokens are invisible.
+    /// Decode only: encoding needs the llama.cpp reference tokenizer.
+    fn from_sentencepiece(inspection: &GgufInspection) -> Result<Self> {
+        let bad = |what: &str| TuckmillError::new(ErrorCode::InvalidArtifact, what.to_string());
+        let items = inspection
+            .get("tokenizer.ggml.tokens")
+            .and_then(|v| v.as_array())
+            .ok_or_else(|| bad("artifact embeds no tokenizer.ggml.tokens array"))?;
+        if items.is_empty() || items.len() > MAX_VOCAB {
+            return Err(bad(&format!(
+                "vocabulary size {} is outside 1..={MAX_VOCAB}",
+                items.len()
+            )));
+        }
+        let types: Vec<u8> = match inspection
+            .get("tokenizer.ggml.token_type")
+            .and_then(|v| v.as_array())
+        {
+            Some(t) if t.len() == items.len() => t
+                .iter()
+                .map(|v| v.as_u64().map(|x| x as u8).unwrap_or(TOKEN_TYPE_NORMAL))
+                .collect(),
+            Some(_) => {
+                return Err(bad(
+                    "tokenizer.ggml.token_type length differs from the vocabulary",
+                ))
+            }
+            None => vec![TOKEN_TYPE_NORMAL; items.len()],
+        };
+        let mut bytes = Vec::new();
+        let mut offsets = Vec::with_capacity(items.len() + 1);
+        offsets.push(0u32);
+        for (item, ty) in items.iter().zip(&types) {
+            let text = item
+                .as_str()
+                .ok_or_else(|| bad("tokenizer.ggml.tokens contains a non-string entry"))?;
+            match *ty {
+                TOKEN_TYPE_CONTROL => {}
+                TOKEN_TYPE_UNKNOWN => bytes.extend_from_slice("\u{2585}".as_bytes()),
+                TOKEN_TYPE_BYTE => {
+                    let byte = text
+                        .strip_prefix("<0x")
+                        .and_then(|h| h.strip_suffix('>'))
+                        .and_then(|h| u8::from_str_radix(h, 16).ok())
+                        .ok_or_else(|| bad(&format!("byte token {text:?} is not <0xHH>")))?;
+                    bytes.push(byte);
+                }
+                _ => bytes.extend_from_slice(text.replace('\u{2581}', " ").as_bytes()),
+            }
+            let end = u32::try_from(bytes.len())
+                .map_err(|_| bad("vocabulary bytes exceed the decode table's u32 offsets"))?;
+            offsets.push(end);
+        }
+        bytes.shrink_to_fit();
+        Ok(Self {
+            bytes,
+            offsets,
+            pretokenizer_note: Some(
+                "SentencePiece vocabulary; exact encoding requires the llama.cpp reference tokenizer (TUCKMILL_LLAMA_LIB), which this build uses".to_string(),
+            ),
+        })
     }
 
     pub fn from_tokenizer(tokenizer: &Tokenizer) -> Result<Self> {

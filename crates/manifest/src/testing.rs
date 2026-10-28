@@ -80,6 +80,30 @@ impl SyntheticConfig {
         }
     }
 
+    /// Tiny Gemma 3 text (ADR-013): six layers so one is global, a
+    /// window of 8 so short prompts cross it, tied head, F16 weights.
+    /// Hidden 36 keeps embedding rows distinct: fixture values repeat every
+    /// 64 elements, so a hidden size that is a multiple of 64 gives every
+    /// token the same row and makes the model blind to its input.
+    pub fn tiny_gemma3() -> Self {
+        Self {
+            arch: "gemma3".into(),
+            name: "tuckmill-fixture-gemma3-tiny".into(),
+            layers: 6,
+            hidden: 36,
+            heads: 4,
+            kv_heads: 2,
+            head_dim: 16,
+            ffn: 128,
+            vocab: 512,
+            context: 4096,
+            expert_count: None,
+            expert_used: None,
+            quantize_experts: false,
+            hybrid: None,
+        }
+    }
+
     pub fn tiny_qwen3moe() -> Self {
         Self {
             arch: "qwen3moe".into(),
@@ -222,7 +246,8 @@ fn build(cfg: &SyntheticConfig) -> Result<Vec<u8>> {
     tensors.push(tensor("output_norm.weight", &[cfg.hidden as u64], 0)?);
     // The pinned qwen35 artifact ties its output to the token embedding
     // (no output.weight); dense qwen3 fixtures keep a separate head.
-    if cfg.hybrid.is_none() {
+    let gemma = cfg.arch == "gemma3";
+    if cfg.hybrid.is_none() && !gemma {
         tensors.push(tensor(
             "output.weight",
             &[cfg.hidden as u64, cfg.vocab as u64],
@@ -342,6 +367,14 @@ fn build(cfg: &SyntheticConfig) -> Result<Vec<u8>> {
             tensors.push(tensor(&p("attn_q_norm.weight"), &[cfg.head_dim as u64], 0)?);
             tensors.push(tensor(&p("attn_k_norm.weight"), &[cfg.head_dim as u64], 0)?);
             tensors.push(tensor(&p("ffn_norm.weight"), &[cfg.hidden as u64], 0)?);
+            if gemma {
+                tensors.push(tensor(
+                    &p("post_attention_norm.weight"),
+                    &[cfg.hidden as u64],
+                    0,
+                )?);
+                tensors.push(tensor(&p("post_ffw_norm.weight"), &[cfg.hidden as u64], 0)?);
+            }
             if is_moe {
                 let e = cfg.expert_count.unwrap_or(8) as u64;
                 let f = cfg.ffn as u64;
@@ -416,6 +449,9 @@ fn build(cfg: &SyntheticConfig) -> Result<Vec<u8>> {
         format!("{arch}.attention.layer_norm_rms_epsilon"),
         KV::F32(1e-6),
     ));
+    if gemma {
+        kvs.push((format!("{arch}.attention.sliding_window"), KV::U32(8)));
+    }
     if let Some(hy) = &cfg.hybrid {
         kvs.push((
             format!("{arch}.rope.dimension_count"),

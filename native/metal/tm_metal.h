@@ -189,6 +189,10 @@ int tm_metal_f16_gemm(tm_metal_ctx *ctx, tm_metal_buffer *w, tm_metal_buffer *x,
 int tm_metal_silu_mul_f32(tm_metal_ctx *ctx, tm_metal_buffer *gate, tm_metal_buffer *up,
                           tm_metal_buffer *out, uint32_t n, char *err, size_t err_cap);
 
+/* GeGLU gate: out[i] = gelu_tanh(gate[i]) * up[i] (ggml's tanh form). */
+int tm_metal_gelu_tanh_mul_f32(tm_metal_ctx *ctx, tm_metal_buffer *gate, tm_metal_buffer *up,
+                               tm_metal_buffer *out, uint32_t n, char *err, size_t err_cap);
+
 /* Packed Q8_0 matrix-vector decode: y[r] = dot(dequant_q8_0(w_row_r), x).
  * `w` holds `rows * cols / 32` blocks of 34 bytes ([f16 d][i8 qs; 32]).
  * `cols` must be a positive multiple of 32; `x` is f32 of length `cols`;
@@ -376,7 +380,7 @@ int tm_metal_qwen35_attention_f16_chunk(tm_metal_ctx *ctx, tm_metal_buffer *q,
                                         tm_metal_buffer *out, tm_metal_buffer *scratch,
                                         uint32_t heads, uint32_t pos0, uint32_t cap,
                                         uint32_t head_dim, uint32_t group, float scale, uint32_t n,
-                                        char *err, size_t err_cap);
+                                        uint32_t window, char *err, size_t err_cap);
 
 /* The same KV store and chunk attention over an f32 cache (declared f32
  * KV: entries are exact copies, never rounded). Plane layout and geometry
@@ -391,7 +395,7 @@ int tm_metal_qwen35_attention_f32_chunk(tm_metal_ctx *ctx, tm_metal_buffer *q,
                                         tm_metal_buffer *out, tm_metal_buffer *scratch,
                                         uint32_t heads, uint32_t pos0, uint32_t cap,
                                         uint32_t head_dim, uint32_t group, float scale, uint32_t n,
-                                        char *err, size_t err_cap);
+                                        uint32_t window, char *err, size_t err_cap);
 
 /* Testing switch: use the generic device-memory recurrence kernel instead
  * of the register-resident specialization (results are bit-identical). */

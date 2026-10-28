@@ -30,6 +30,10 @@ pub struct AttentionSpec {
     pub rope_base: f32,
     /// Sigmoid gate on the attention output from the joint Q projection.
     pub output_gate: bool,
+    /// Sliding-window attention: each query attends only the last `window`
+    /// positions up to and including its own; `None` is full causal
+    /// attention.
+    pub window: Option<usize>,
 }
 
 /// Gated DeltaNet linear attention (Qwen3.5 recurrent layers).
@@ -74,15 +78,55 @@ pub enum FfnSpec {
         down: Tensor,
         width: usize,
     },
+    /// `down(gelu_tanh(gate x) * up x)` (GeGLU, ggml's tanh GELU).
+    GeGlu {
+        gate: Tensor,
+        up: Tensor,
+        down: Tensor,
+        width: usize,
+    },
 }
 
-/// One layer: `x += mixer(norm(x)); x += ffn(norm(x))`.
+/// Gate activation of a gated FFN.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GluActivation {
+    Silu,
+    GeluTanh,
+}
+
+impl FfnSpec {
+    /// `(gate, up, down, width, activation)`.
+    pub fn parts(&self) -> (Tensor, Tensor, Tensor, usize, GluActivation) {
+        match self {
+            Self::SwiGlu {
+                gate,
+                up,
+                down,
+                width,
+            } => (*gate, *up, *down, *width, GluActivation::Silu),
+            Self::GeGlu {
+                gate,
+                up,
+                down,
+                width,
+            } => (*gate, *up, *down, *width, GluActivation::GeluTanh),
+        }
+    }
+}
+
+/// One layer: `x += out_norm(mixer(norm(x))); x += out_norm(ffn(norm(x)))`,
+/// where each output norm is present only when the artifact has it (Gemma's
+/// post-attention and post-FFN norms).
 #[derive(Debug, Clone, PartialEq)]
 pub struct LayerSpec {
     pub pre_norm: Tensor,
     pub mixer: MixerSpec,
+    /// RMS norm on the mixer output before its residual add.
+    pub mixer_out_norm: Option<Tensor>,
     pub post_norm: Tensor,
     pub ffn: FfnSpec,
+    /// RMS norm on the FFN output before its residual add.
+    pub ffn_out_norm: Option<Tensor>,
 }
 
 /// A multi-token-prediction head (ADR-012 step 3): from the main model's
@@ -113,6 +157,9 @@ pub struct ModelGraph {
     /// RMS norm epsilon shared by every norm in the graph.
     pub eps: f32,
     pub embedding: Tensor,
+    /// Multiplier on embedding rows before the first layer (Gemma:
+    /// `sqrt(hidden)`); `None` is 1.
+    pub embedding_scale: Option<f32>,
     pub layers: Vec<LayerSpec>,
     pub final_norm: Tensor,
     /// Output projection; the embedding itself when the artifact ties them.

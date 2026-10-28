@@ -74,6 +74,7 @@ mod imp {
         u32,
         f32,
         u32,
+        u32,
         *mut c_char,
         usize,
     ) -> c_int;
@@ -237,6 +238,15 @@ mod imp {
             err_cap: usize,
         ) -> c_int;
         pub fn tm_metal_silu_mul_f32(
+            ctx: *mut TmMetalCtx,
+            gate: *mut TmMetalBuffer,
+            up: *mut TmMetalBuffer,
+            out: *mut TmMetalBuffer,
+            n: u32,
+            err: *mut c_char,
+            err_cap: usize,
+        ) -> c_int;
+        pub fn tm_metal_gelu_tanh_mul_f32(
             ctx: *mut TmMetalCtx,
             gate: *mut TmMetalBuffer,
             up: *mut TmMetalBuffer,
@@ -596,6 +606,7 @@ mod imp {
             group: u32,
             scale: f32,
             n: u32,
+            window: u32,
             err: *mut c_char,
             err_cap: usize,
         ) -> c_int;
@@ -613,6 +624,7 @@ mod imp {
             group: u32,
             scale: f32,
             n: u32,
+            window: u32,
             err: *mut c_char,
             err_cap: usize,
         ) -> c_int;
@@ -1473,7 +1485,8 @@ impl MetalContext {
         n: u32,
     ) -> Result<()> {
         self.qwen35_attention_chunk(
-            q, k_cache, v_cache, out, scratch, heads, pos0, cap, head_dim, group, scale, n, false,
+            q, k_cache, v_cache, out, scratch, heads, pos0, cap, head_dim, group, scale, n, 0,
+            false,
         )
     }
 
@@ -1494,6 +1507,7 @@ impl MetalContext {
         group: u32,
         scale: f32,
         n: u32,
+        window: u32,
         f32_cache: bool,
     ) -> Result<()> {
         for (b, name) in [
@@ -1535,6 +1549,7 @@ impl MetalContext {
                     group,
                     scale,
                     n,
+                    window,
                     err.as_mut_ptr(),
                     ERR_CAP,
                 )
@@ -2276,6 +2291,28 @@ impl MetalContext {
             // SAFETY: raw handles were validated against this context.
             let code = unsafe {
                 imp::tm_metal_silu_mul_f32(ctx, gc, uc, oc, n, err.as_mut_ptr(), ERR_CAP)
+            };
+            (code, err)
+        })
+    }
+
+    /// GeGLU gate: `out[i] = gelu_tanh(gate[i]) * up[i]` (ggml's tanh form).
+    pub fn gelu_tanh_mul(
+        &self,
+        gate: &MetalBuffer,
+        up: &MetalBuffer,
+        out: &MetalBuffer,
+        n: u32,
+    ) -> Result<()> {
+        for (buffer, name) in [(gate, "gate"), (up, "up"), (out, "out")] {
+            self.check_owned(buffer, name)?;
+        }
+        let (gc, uc, oc) = (gate.raw, up.raw, out.raw);
+        self.operate("gelu_tanh_mul", move |ctx| {
+            let mut err = [0 as c_char; ERR_CAP];
+            // SAFETY: raw handles were validated against this context.
+            let code = unsafe {
+                imp::tm_metal_gelu_tanh_mul_f32(ctx, gc, uc, oc, n, err.as_mut_ptr(), ERR_CAP)
             };
             (code, err)
         })

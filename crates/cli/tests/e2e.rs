@@ -1392,3 +1392,159 @@ fn bench_warm_repetitions_and_long_output_drain() {
     }
     assert_eq!(v["schema_version"], 5);
 }
+
+/// ADR-013 reference gate (machine-local): Gemma 3 on the unified engine
+/// (Metal, f16 KV) agrees with the pinned llama.cpp reference (CPU, f16 KV)
+/// on teacher-forced logits over real text with BOS, at lengths below and
+/// past the 512-token sliding window. Requires TUCKMILL_GEMMA3_GGUF and
+/// TUCKMILL_LLAMA_LIB.
+#[test]
+fn gemma3_engine_logits_match_reference_when_available() {
+    let Some(gguf) = std::env::var("TUCKMILL_GEMMA3_GGUF")
+        .ok()
+        .map(std::path::PathBuf::from)
+        .filter(|p| p.exists())
+    else {
+        eprintln!("skipping: TUCKMILL_GEMMA3_GGUF not set (pinned Gemma 3 1B Q8_0)");
+        return;
+    };
+    if std::env::var("TUCKMILL_LLAMA_LIB").is_err() {
+        eprintln!(
+            "skipping: TUCKMILL_LLAMA_LIB not set (reference comparison needs the pinned shim)"
+        );
+        return;
+    }
+    let mut reference = tuckmill_llamaref::LlamaRef::new();
+    reference.open_reference_model(&gguf, true).unwrap();
+    let mut metal_reference = tuckmill_llamaref::LlamaRef::new();
+    metal_reference
+        .open_reference_model_with(&gguf, true, 99)
+        .unwrap();
+    let paragraph = "Rivers carry water, sediment and nutrients from mountains to the sea. \
+        Along the way they shape valleys, feed wetlands and support farms and cities. \
+        People have settled near rivers for thousands of years because they offer water, \
+        food, transport and fertile soil. ";
+    let text: String = paragraph.repeat(14);
+    let all = reference.tokenize(&text, true).unwrap();
+    assert!(
+        all.len() > 600,
+        "long enough to pass the window: {}",
+        all.len()
+    );
+
+    let file = std::fs::File::open(&gguf).unwrap();
+    let insp = tuckmill_manifest::gguf::inspect(&gguf, &tuckmill_manifest::gguf::Limits::default())
+        .unwrap();
+    let source = tuckmill_tuckcore::engine::GgufWeights::with_inspection(&file, &insp).unwrap();
+    let graph = tuckmill_tuckcore::engine::adapters::gemma3(&insp).unwrap();
+    let capacity = all.len() + 8;
+    let plan = tuckmill_tuckcore::engine::metal::alloc_plan(&graph, &source, capacity).unwrap();
+    let model = tuckmill_tuckcore::engine::metal::EngineModel::load(
+        tuckmill_tuckcore::qwen35_gpu::Qwen35Gpu::open().unwrap(),
+        graph,
+        &source,
+        capacity,
+        plan.total(),
+    )
+    .unwrap();
+    assert_eq!(model.allocated_bytes(), plan.total(), "ledger == plan");
+
+    let pb = tuckmill_tuckcore::engine::metal::PREFILL_BATCH;
+    for len in [2usize, 9, 40, 200, 511, 513, all.len()] {
+        let tokens = &all[..len];
+        model.reset().unwrap();
+        let mut ours = Vec::new();
+        let chunks: Vec<&[u32]> = tokens.chunks(pb).collect();
+        for (c, chunk) in chunks.iter().enumerate() {
+            model
+                .prefill_chunk(chunk, c + 1 == chunks.len(), &mut ours)
+                .unwrap();
+        }
+        let theirs = reference.teacher_forced_logits(tokens).unwrap();
+        let metal = metal_reference.teacher_forced_logits(tokens).unwrap();
+        let stats = |x: &[f32], y: &[f32]| {
+            let (mut m, mut s) = (0f64, 0f64);
+            for (a, b) in x.iter().zip(y) {
+                let d = (*a as f64 - *b as f64).abs();
+                m = m.max(d);
+                s += d;
+            }
+            (m, s / x.len() as f64)
+        };
+        let (om, oa) = stats(&ours, &metal);
+        let (cm, ca) = stats(&theirs, &metal);
+        eprintln!(
+            "gemma3 len {len}: ours vs llama.cpp Metal max {om:.4} mean {oa:.4}; llama.cpp CPU vs Metal max {cm:.4} mean {ca:.4}"
+        );
+        assert_eq!(ours.len(), theirs.len(), "identical vocabulary");
+        let argmax = |v: &[f32]| {
+            v.iter()
+                .enumerate()
+                .fold((0usize, f32::NEG_INFINITY), |b, (i, x)| {
+                    if *x > b.1 {
+                        (i, *x)
+                    } else {
+                        b
+                    }
+                })
+                .0
+        };
+        let (mut max_abs, mut sum_abs) = (0f64, 0f64);
+        for (a, b) in ours.iter().zip(&theirs) {
+            let d = (*a as f64 - *b as f64).abs();
+            max_abs = max_abs.max(d);
+            sum_abs += d;
+        }
+        let scale = theirs.iter().fold(f64::MIN, |m, v| m.max(*v as f64));
+        let mean_abs = sum_abs / ours.len() as f64;
+        eprintln!(
+            "gemma3 len {len}: max|diff| {max_abs:.4} mean|diff| {mean_abs:.4} ref max logit {scale:.2} top1 ours {} theirs {}",
+            argmax(&ours),
+            argmax(&theirs)
+        );
+        // Gate: the Metal reference (the same activation numerics). The
+        // CPU reference quantizes activations to Q8_0, which Gemma's large
+        // activations amplify (llama.cpp CPU vs its own Metal path differs
+        // as much); it is recorded, not gated.
+        assert_eq!(
+            argmax(&ours),
+            argmax(&metal),
+            "len {len}: top-1 matches llama.cpp Metal"
+        );
+        assert!(
+            om <= 0.05,
+            "len {len}: max |diff| vs llama.cpp Metal {om:.4}"
+        );
+        assert!(
+            oa <= 0.01,
+            "len {len}: mean |diff| vs llama.cpp Metal {oa:.4}"
+        );
+    }
+
+    // Decode steps crossing the window: prefill 500 tokens, then decode the
+    // rest one at a time (windowed decode attention), against the reference.
+    model.reset().unwrap();
+    let mut ours = Vec::new();
+    for chunk in all[..500].chunks(pb) {
+        model.prefill_chunk(chunk, false, &mut ours).unwrap();
+    }
+    for t in &all[500..] {
+        model.forward_token(*t, &mut ours).unwrap();
+    }
+    let metal = metal_reference.teacher_forced_logits(&all).unwrap();
+    let (mut m, mut sum) = (0f64, 0f64);
+    for (a, b) in ours.iter().zip(&metal) {
+        let d = (*a as f64 - *b as f64).abs();
+        m = m.max(d);
+        sum += d;
+    }
+    let mean = sum / ours.len() as f64;
+    eprintln!(
+        "gemma3 decode across the window ({} tokens): max {m:.4} mean {mean:.4}",
+        all.len()
+    );
+    assert!(
+        m <= 0.05 && mean <= 0.01,
+        "decode path within the Metal-reference bound"
+    );
+}

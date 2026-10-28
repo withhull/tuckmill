@@ -469,6 +469,18 @@ impl LlamaRef {
         model_path: &std::path::Path,
         kv_f16: bool,
     ) -> Result<()> {
+        self.open_reference_model_with(model_path, kv_f16, 0)
+    }
+
+    /// [`Self::open_reference_model`] with `gpu_layers` offloaded to Metal
+    /// (0: CPU). The Metal path is a second reference with different
+    /// numerics (no CPU activation quantization), never the oracle.
+    pub fn open_reference_model_with(
+        &mut self,
+        model_path: &std::path::Path,
+        kv_f16: bool,
+        gpu_layers: i32,
+    ) -> Result<()> {
         if !self.handle.is_null() {
             return Err(TuckmillError::new(
                 ErrorCode::InvalidRequest,
@@ -491,7 +503,7 @@ impl LlamaRef {
                 c_path.as_ptr(),
                 4096,
                 threads,
-                0, // the reference comparison runs on the CPU
+                gpu_layers as c_int,
                 kv_f16 as c_int,
                 0,
                 err_buf.as_mut_ptr() as *mut c_char,
@@ -828,7 +840,7 @@ impl InferenceBackend for LlamaRef {
             // Expanded as adapters are validated: the Qwen3 dense family,
             // and Qwen3.5 hybrid (qwen35), whose adapter was qualified
             // against this pinned revision (teacher-forced logits, Q35-1D).
-            architectures: vec!["qwen3".to_string(), "qwen35".to_string()],
+            architectures: vec!["qwen3".to_string(), "qwen35".to_string(), "gemma3".to_string()],
             moe: false,
             hybrid: true,
             ternary: false,

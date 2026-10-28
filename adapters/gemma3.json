@@ -1,0 +1,49 @@
+{
+  "schema_version": 2,
+  "id": "gemma3",
+  "display_name": "Gemma 3 dense (GGUF)",
+  "family": "gemma3",
+  "architecture": "gemma3",
+  "traits": {
+    "dense": true,
+    "moe": false,
+    "hybrid_linear_attention": false,
+    "ternary_quantized": false
+  },
+  "status": "specified",
+  "certification": {
+    "state": "unmeasured",
+    "notes": [
+      "Text-only Gemma 3 (1B anchor): sliding-window and global attention layers, GeGLU, sandwich norms (ADR-013).",
+      "No plan may claim certification before the G1 kernel gates pass on a physical minimum-tier (8 GB) Mac."
+    ]
+  },
+  "required_kernels": ["K01", "K02", "K03", "K08"],
+  "required_transforms": [],
+  "metadata_requirements": [
+    { "key": "general.architecture", "kind": "string", "required": true },
+    { "key": "gemma3.block_count", "kind": "u32", "required": true },
+    { "key": "gemma3.context_length", "kind": "u32", "required": true },
+    { "key": "gemma3.embedding_length", "kind": "u32", "required": true },
+    { "key": "gemma3.attention.head_count", "kind": "u32", "required": true },
+    { "key": "gemma3.attention.head_count_kv", "kind": "u32", "required": true },
+    { "key": "gemma3.feed_forward_length", "kind": "u32", "required": true },
+    { "key": "gemma3.attention.key_length", "kind": "u32", "required": true },
+    { "key": "gemma3.attention.value_length", "kind": "u32", "required": true },
+    { "key": "gemma3.attention.sliding_window", "kind": "u32", "required": true },
+    { "key": "general.name", "kind": "string", "required": false },
+    { "key": "tokenizer.ggml.tokens", "kind": "array", "required": true },
+    { "key": "tokenizer.ggml.model", "kind": "string", "required": false }
+  ],
+  "kv": {
+    "layers_key": "gemma3.block_count",
+    "head_count_key": "gemma3.attention.head_count",
+    "kv_head_count_key": "gemma3.attention.head_count_kv",
+    "embedding_key": "gemma3.embedding_length",
+    "key_length_key": "gemma3.attention.key_length",
+    "value_length_key": "gemma3.attention.value_length"
+  },
+  "notes": [
+    "Every layer keeps full-context KV rows; sliding-window layers read only the last window of them (the KV estimate is not reduced for the window)."
+  ]
+}
