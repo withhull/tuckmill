@@ -54,6 +54,48 @@ pub struct ChatCompletionRequest {
     pub stop: Option<Vec<String>>,
     #[serde(default)]
     pub seed: Option<u64>,
+    /// Ollama-style keep-alive for the serving model from this request on:
+    /// a duration (`"5m"`), seconds, `0` (unload right after) or negative /
+    /// `"forever"` (keep loaded). Extension field (ADR-012 step 4).
+    #[serde(default)]
+    pub keep_alive: Option<serde_json::Value>,
+    /// LM Studio-style idle TTL in seconds (an alias of `keep_alive`).
+    #[serde(default)]
+    pub ttl: Option<serde_json::Value>,
+}
+
+/// The request's keep-alive (`keep_alive` or `ttl`, never both).
+fn request_keep_alive(
+    keep_alive: Option<&serde_json::Value>,
+    ttl: Option<&serde_json::Value>,
+) -> Result<Option<Option<std::time::Duration>>, TuckmillError> {
+    match (keep_alive, ttl) {
+        (Some(_), Some(_)) => Err(TuckmillError::new(
+            ErrorCode::InvalidRequest,
+            "set keep_alive or ttl, not both",
+        )),
+        (Some(k), None) => crate::runtime::keep_alive_from_json(k).map(Some),
+        (None, Some(t)) => match t.as_f64() {
+            Some(secs) if secs >= 0.0 => crate::runtime::keep_alive_from_json(t).map(Some),
+            _ => Err(TuckmillError::new(
+                ErrorCode::InvalidRequest,
+                "ttl must be a non-negative number of seconds",
+            )),
+        },
+        (None, None) => Ok(None),
+    }
+}
+
+/// Body of `/control/load` and `/control/unload`.
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ModelControlRequest {
+    #[serde(default)]
+    model: Option<String>,
+    #[serde(default)]
+    keep_alive: Option<serde_json::Value>,
+    #[serde(default)]
+    ttl: Option<serde_json::Value>,
 }
 
 fn validate_chat_request(req: &ChatCompletionRequest) -> Result<(), TuckmillError> {
@@ -469,10 +511,37 @@ fn handle_connection(
             );
             Ok(())
         }
+        ("POST", "/control/load") => {
+            match control_load(&runtime, &request.body) {
+                Ok(v) => {
+                    let _ = respond_json(&mut stream, 200, "OK", &v);
+                }
+                Err(e) => respond_error(&mut stream, &e),
+            }
+            Ok(())
+        }
         ("POST", "/control/unload") => {
-            // Unload every idle resident model now (ADR-012 step 4). A
-            // running generation is never interrupted: its worker is busy.
-            match runtime.unload_idle() {
+            // Unload one model ({"model": ...}) or every idle model now
+            // (ADR-012 step 4). A running generation is never interrupted:
+            // its worker is busy.
+            let target = match parse_control(&request.body) {
+                Ok(c) => c.model,
+                Err(e) => {
+                    respond_error(&mut stream, &e);
+                    return Ok(());
+                }
+            };
+            let unloaded = match target {
+                Some(model) => match runtime.resolve_artifact(&model) {
+                    Ok((artifact, _)) => runtime.unload_model(artifact.artifact_id.as_str()),
+                    Err(e) => {
+                        respond_error(&mut stream, &e);
+                        return Ok(());
+                    }
+                },
+                None => runtime.unload_idle(),
+            };
+            match unloaded {
                 Some(n) => {
                     let _ =
                         respond_json(&mut stream, 200, "OK", &serde_json::json!({"unloaded": n}));
@@ -518,6 +587,49 @@ fn handle_connection(
             Ok(())
         }
     }
+}
+
+fn parse_control(body: &[u8]) -> Result<ModelControlRequest, TuckmillError> {
+    if body.iter().all(u8::is_ascii_whitespace) {
+        return Ok(ModelControlRequest::default());
+    }
+    serde_json::from_slice(body).map_err(|e| {
+        TuckmillError::new(
+            ErrorCode::InvalidRequest,
+            format!("control body must be {{\"model\", \"keep_alive\" | \"ttl\"}}: {e}"),
+        )
+    })
+}
+
+/// `POST /control/load {"model", "keep_alive"?}`: load (or keep) a model
+/// under the same admission as a request, and set its keep-alive.
+fn control_load(runtime: &Arc<Runtime>, body: &[u8]) -> Result<serde_json::Value, TuckmillError> {
+    let c = parse_control(body)?;
+    let model = c
+        .model
+        .ok_or_else(|| TuckmillError::new(ErrorCode::InvalidRequest, "load needs a model"))?;
+    let keep_alive = request_keep_alive(c.keep_alive.as_ref(), c.ttl.as_ref())?;
+    let (artifact, adapter) = runtime.resolve_artifact(&model)?;
+    let plan = runtime.plan_for(
+        &artifact,
+        &adapter,
+        runtime.default_budget,
+        runtime.default_context,
+        runtime.default_max_output,
+    )?;
+    runtime.plan_admitted(&plan)?;
+    runtime.admit_engine(&plan)?;
+    let artifact_ref = tuckmill_backend::ArtifactRef::from_record(
+        &artifact,
+        &runtime.layout.artifact_payload_path(&artifact.artifact_id),
+    );
+    runtime.preload(&plan, &artifact_ref, keep_alive)?;
+    let loaded = runtime
+        .status()
+        .loaded_models
+        .into_iter()
+        .find(|m| m.artifact_id == artifact.artifact_id.as_str());
+    Ok(serde_json::json!({"loaded": loaded}))
 }
 
 fn list_models(runtime: &Runtime) -> serde_json::Value {
@@ -596,7 +708,7 @@ fn handle_chat_completions(runtime: Arc<Runtime>, mut stream: TcpStream, body: &
                 format!("request does not match the supported chat-completions subset: {e}"),
             )
             .with_action(
-                "Supported fields: model, messages[{role,content}], stream, max_tokens, temperature, top_p, stop, seed.",
+                "Supported fields: model, messages[{role,content}], stream, max_tokens, temperature, top_p, stop, seed; extensions keep_alive, ttl.",
             );
             respond_error(&mut stream, &err);
             return;
@@ -606,6 +718,13 @@ fn handle_chat_completions(runtime: Arc<Runtime>, mut stream: TcpStream, body: &
         respond_error(&mut stream, &e);
         return;
     }
+    let keep_alive = match request_keep_alive(request.keep_alive.as_ref(), request.ttl.as_ref()) {
+        Ok(k) => k,
+        Err(e) => {
+            respond_error(&mut stream, &e);
+            return;
+        }
+    };
 
     // B1 order: resolve the model bundle (tokenizer + template), render the
     // model-specific chat prompt, tokenize it, count the actual prompt
@@ -701,6 +820,7 @@ fn handle_chat_completions(runtime: Arc<Runtime>, mut stream: TcpStream, body: &
             seed: spec.seed,
             sampling: spec.sampling,
             ignore_eos: false,
+            keep_alive,
         },
     ) {
         Ok(r) => r,
@@ -999,6 +1119,40 @@ pub fn token_file_path(runtime: &Runtime) -> PathBuf {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn request_keep_alive_accepts_ollama_and_lm_studio_forms() {
+        use std::time::Duration;
+        let ka = |k: Option<serde_json::Value>, t: Option<serde_json::Value>| {
+            super::request_keep_alive(k.as_ref(), t.as_ref())
+        };
+        let j = |v: serde_json::Value| Some(v);
+        assert_eq!(ka(None, None).unwrap(), None, "unset leaves the model's");
+        assert_eq!(
+            ka(j("5m".into()), None).unwrap(),
+            Some(Some(Duration::from_secs(300)))
+        );
+        assert_eq!(
+            ka(j(30.into()), None).unwrap(),
+            Some(Some(Duration::from_secs(30)))
+        );
+        assert_eq!(ka(j(0.into()), None).unwrap(), Some(Some(Duration::ZERO)));
+        assert_eq!(
+            ka(j((-1).into()), None).unwrap(),
+            Some(None),
+            "negative keeps"
+        );
+        assert_eq!(ka(j("forever".into()), None).unwrap(), Some(None));
+        assert_eq!(
+            ka(None, j(120.into())).unwrap(),
+            Some(Some(Duration::from_secs(120)))
+        );
+        assert!(ka(j("5m".into()), j(5.into())).is_err(), "not both");
+        assert!(ka(None, j((-1).into())).is_err(), "ttl is non-negative");
+        assert!(ka(j("soon".into()), None).is_err());
+        assert!(ka(j(true.into()), None).is_err());
+        assert!(ka(j(1e12.into()), None).is_err(), "bounded");
+    }
+
     use super::*;
     use crate::runtime::RuntimeOptions;
     use tuckmill_manifest::testing::{write_synthetic, SyntheticConfig};
@@ -1646,6 +1800,8 @@ mod tests {
             top_p: None,
             stop: None,
             seed: None,
+            keep_alive: None,
+            ttl: None,
         };
         assert!(validate_chat_request(&base).is_ok());
         let bad_role = ChatCompletionRequest {
@@ -1660,6 +1816,8 @@ mod tests {
             top_p: None,
             stop: None,
             seed: None,
+            keep_alive: None,
+            ttl: None,
         };
         assert!(validate_chat_request(&bad_role).is_err());
         let bad_temp = ChatCompletionRequest {
@@ -1674,6 +1832,8 @@ mod tests {
             top_p: None,
             stop: None,
             seed: None,
+            keep_alive: None,
+            ttl: None,
         };
         assert!(validate_chat_request(&bad_temp).is_err());
         let empty_stop = ChatCompletionRequest {
@@ -1688,6 +1848,8 @@ mod tests {
             top_p: None,
             stop: Some(vec!["".into()]),
             seed: None,
+            keep_alive: None,
+            ttl: None,
         };
         assert!(validate_chat_request(&empty_stop).is_err());
     }

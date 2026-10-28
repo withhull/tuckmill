@@ -172,6 +172,11 @@ enum Cmd {
         /// the memory budget; idle models leave least recently used first).
         #[arg(long, default_value_t = 1)]
         max_loaded_models: usize,
+        /// Keep idle models loaded under macOS memory pressure (by default
+        /// a sustained warning unloads idle models but the most recent one,
+        /// and a critical level unloads every idle model).
+        #[arg(long)]
+        no_pressure_unload: bool,
         /// llama.cpp GPU offload layers (Metal performance baseline ONLY;
         /// never for arithmetic diagnostics). Requires --engine llama.
         #[arg(long)]

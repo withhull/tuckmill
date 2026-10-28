@@ -93,6 +93,7 @@ pub fn dispatch(cmd: &Cmd, json: bool, data_dir: Option<&Path>) -> Result<ExitCo
             probe_only,
             keep_alive,
             max_loaded_models,
+            no_pressure_unload,
             gpu_layers,
             kernels,
             storage,
@@ -104,6 +105,7 @@ pub fn dispatch(cmd: &Cmd, json: bool, data_dir: Option<&Path>) -> Result<ExitCo
             *probe_only,
             keep_alive,
             *max_loaded_models,
+            *no_pressure_unload,
             *gpu_layers,
             kernels.as_deref(),
             storage.as_deref(),
@@ -289,32 +291,11 @@ fn open_runtime_with_options(
     })
 }
 
-/// `--keep-alive`: `forever`, `0`, or a whole number with an `s`, `m` or
-/// `h` suffix. `None` keeps an idle model until it must make room.
+/// `--keep-alive`: the shared keep-alive grammar (`forever`, negative,
+/// `0`, seconds, or `s`/`m`/`h` suffixes). `None` keeps an idle model
+/// until it must make room.
 fn parse_keep_alive(value: &str) -> Result<Option<std::time::Duration>> {
-    let bad = || {
-        TuckmillError::new(
-            ErrorCode::InvalidRequest,
-            format!("invalid --keep-alive {value:?}; use e.g. 30s, 5m, 1h, 0 or forever"),
-        )
-    };
-    let v = value.trim();
-    if v == "forever" {
-        return Ok(None);
-    }
-    if v == "0" {
-        return Ok(Some(std::time::Duration::ZERO));
-    }
-    let (digits, unit) = v.split_at(v.len().saturating_sub(1));
-    let n: u64 = digits.parse().map_err(|_| bad())?;
-    let secs = match unit {
-        "s" => Some(n),
-        "m" => n.checked_mul(60),
-        "h" => n.checked_mul(3600),
-        _ => None,
-    }
-    .ok_or_else(bad)?;
-    Ok(Some(std::time::Duration::from_secs(secs)))
+    tuckmill_supervisor::runtime::parse_keep_alive(value)
 }
 
 /// Build the typed execution options for run/bench/stats/verify from CLI
@@ -989,6 +970,7 @@ fn run(
             seed: 0,
             sampling: tuckmill_backend::SamplingPolicy::default(),
             ignore_eos: false,
+            keep_alive: None,
         },
     )?;
 
@@ -1123,6 +1105,7 @@ fn serve(
     probe_only: bool,
     keep_alive: &str,
     max_loaded_models: usize,
+    no_pressure_unload: bool,
     gpu_layers: Option<i32>,
     kernels: Option<&str>,
     storage: Option<&str>,
@@ -1141,6 +1124,7 @@ fn serve(
         execution: execution_options(engine, gpu_layers, kernels, storage, speculative)?,
         keep_alive: parse_keep_alive(keep_alive)?,
         max_loaded_models,
+        pressure_unload: !no_pressure_unload,
         ..Default::default()
     })?;
     let server = tuckmill_supervisor::api::ApiServer::bind(runtime.clone(), port, None)?;
@@ -1437,6 +1421,7 @@ fn stats(
             seed: 0,
             sampling: tuckmill_backend::SamplingPolicy::default(),
             ignore_eos: false,
+            keep_alive: None,
         },
     )?;
     let committed;
@@ -1652,7 +1637,26 @@ mod tests {
         );
         assert_eq!(parse_keep_alive("0").unwrap(), Some(Duration::ZERO));
         assert_eq!(parse_keep_alive("forever").unwrap(), None);
-        for bad in ["", "5", "m", "-1m", "1.5h", "5d", "99999999999999999h"] {
+        assert_eq!(
+            parse_keep_alive("45").unwrap(),
+            Some(Duration::from_secs(45))
+        );
+        assert_eq!(
+            parse_keep_alive("-1").unwrap(),
+            None,
+            "negative keeps (Ollama)"
+        );
+        assert_eq!(parse_keep_alive("-5m").unwrap(), None);
+        for bad in [
+            "",
+            "m",
+            "-",
+            "1.5h",
+            "5d",
+            "99999999999999999h",
+            "31d",
+            "1000h",
+        ] {
             assert!(parse_keep_alive(bad).is_err(), "{bad:?}");
         }
     }

@@ -177,6 +177,7 @@ pub fn run_standard_bench(
                 seed: rep as u64,
                 sampling: tuckmill_backend::SamplingPolicy::default(),
                 ignore_eos: options.ignore_eos,
+                keep_alive: None,
             },
         )?;
 
@@ -645,6 +646,8 @@ mod tests {
             allow_test_engine: true,
             keep_alive: Some(crate::runtime::DEFAULT_KEEP_ALIVE),
             max_loaded_models: 1,
+            pressure_unload: true,
+            pressure_grace: std::time::Duration::from_secs(5),
         })
         .unwrap();
         (dir, runtime)

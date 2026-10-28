@@ -238,3 +238,41 @@ honest labels, and the unified engine.
 - **Real model** (pinned 0.8B through `serve --keep-alive 3s`, one chat
   request): resident at 1.58 GB charged against the 2 GiB budget, then
   unloaded 2-4 s idle (2 s monitor poll), logged with reason `idle`.
+
+## Step 4b record (2026-10-28): memory pressure and per-request keep-alive
+
+How others do it (checked 2026-10-28):
+- **Ollama:** per-request `keep_alive` (duration, seconds, 0 unloads,
+  negative keeps) that sticks to the model; `/api/ps` shows `expires_at`;
+  eviction picks the shortest keep-alive, not LRU; free-memory estimates
+  at load; no OS memory-pressure signal.
+- **llama.cpp `llama-server` (router mode):** `--models-max`, opt-in
+  `--sleep-idle-seconds`; no per-request keep-alive; no pressure signal.
+- **LM Studio:** per-request `ttl` (seconds) on its OpenAI-compatible API,
+  auto-evict of the previous JIT model.
+- **Splash:** a per-model memory plan; no documented lifecycle controls.
+
+What Tuckmill does now:
+- **Per-request keep-alive** on `/v1/chat/completions`: `keep_alive`
+  (Ollama's forms, plus `"forever"`) or `ttl` (LM Studio's seconds), never
+  both. It sticks to the model until another request changes it.
+- **`POST /control/load`** preloads under the same admission as a request.
+  **`POST /control/unload`** unloads one model or every idle one. Status
+  shows each model's `keep_alive_ms` and `expires_in_ms`.
+- **macOS memory pressure** (`kern.memorystatus_vm_pressure_level`):
+  - a warning held for 5 s unloads idle models except the most recently
+    used one;
+  - a critical level unloads every idle model at once;
+  - a load under pressure first unloads the other idle models instead of
+    stacking on them;
+  - a running generation is never interrupted. `serve --no-pressure-unload`
+    turns this off.
+- **Eviction for room** stays least recently used and budget-exact (every
+  resident is charged its plan's admitted total).
+
+Gate: isolated-worker tests for preload reuse, sticky short, forever and
+zero keep-alives, targeted unload, warning (keeps the most recent),
+critical (unloads all) and load under pressure; API parsing tests for
+both field forms and their refusals. Real 0.8B through `serve`: preload at
+2 m with a live expiry, `forever`, `ttl: 1` unloaded within 4 s, both
+fields refused, targeted unload. `scripts/test.sh`: 506 tests passed.

@@ -85,6 +85,14 @@ pub struct RuntimeOptions {
     /// Most models resident at once; every load is also admitted against
     /// the residency budget (the default budget).
     pub max_loaded_models: usize,
+    /// React to macOS memory pressure (ADR-012 step 4): a sustained
+    /// warning unloads idle models but the most recently used one, a
+    /// critical level unloads every idle model, and a load under pressure
+    /// first unloads the other idle models. A running request is never
+    /// interrupted.
+    pub pressure_unload: bool,
+    /// How long a warning must persist before it unloads anything.
+    pub pressure_grace: Duration,
 }
 
 /// Default keep-alive of an idle loaded model.
@@ -110,6 +118,8 @@ impl Default for RuntimeOptions {
             execution: crate::options::ExecutionOptions::default(),
             keep_alive: Some(DEFAULT_KEEP_ALIVE),
             max_loaded_models: 1,
+            pressure_unload: true,
+            pressure_grace: Duration::from_secs(5),
         }
     }
 }
@@ -185,6 +195,11 @@ pub struct RunRequest {
     pub sampling: tuckmill_backend::SamplingPolicy,
     /// Benchmark workloads only (see `GenerateRequest::ignore_eos`).
     pub ignore_eos: bool,
+    /// The serving model's keep-alive from this request on (ADR-012 step
+    /// 4): `None` leaves it as it is, `Some(None)` keeps the model loaded
+    /// until it must make room, `Some(Some(d))` unloads it after `d` idle
+    /// (zero: right after this request).
+    pub keep_alive: Option<Option<Duration>>,
 }
 
 impl RunRequest {
@@ -197,7 +212,85 @@ impl RunRequest {
             seed: 0,
             sampling: tuckmill_backend::SamplingPolicy::default(),
             ignore_eos: false,
+            keep_alive: None,
         }
+    }
+}
+
+/// Longest keep-alive accepted as a duration (longer is `forever`).
+pub const MAX_KEEP_ALIVE: Duration = Duration::from_secs(30 * 24 * 3600);
+
+/// A keep-alive as text: `forever`, a negative number (forever, as in
+/// Ollama), `0`, a whole number of seconds, or a whole number with an `s`,
+/// `m` or `h` suffix. `None` is forever.
+pub fn parse_keep_alive(value: &str) -> Result<Option<Duration>> {
+    let bad = || {
+        TuckmillError::new(
+            ErrorCode::InvalidRequest,
+            format!("invalid keep-alive {value:?}; use e.g. 30s, 5m, 1h, 300, 0, -1 or forever"),
+        )
+    };
+    let v = value.trim();
+    if v == "forever" {
+        return Ok(None);
+    }
+    // Ollama: any negative duration keeps the model loaded.
+    let (negative, body) = match v.strip_prefix('-') {
+        Some(rest) => (true, rest),
+        None => (false, v),
+    };
+    let (digits, unit) = match body.char_indices().last() {
+        Some((i, c)) if c.is_ascii_alphabetic() => (&body[..i], &body[i..]),
+        _ => (body, "s"),
+    };
+    if digits.is_empty() || !digits.chars().all(|c| c.is_ascii_digit()) {
+        return Err(bad());
+    }
+    let n: u64 = digits.parse().map_err(|_| bad())?;
+    let secs = match unit {
+        "s" => Some(n),
+        "m" => n.checked_mul(60),
+        "h" => n.checked_mul(3600),
+        _ => None,
+    }
+    .ok_or_else(bad)?;
+    if negative {
+        return Ok(None);
+    }
+    let d = Duration::from_secs(secs);
+    if d > MAX_KEEP_ALIVE {
+        return Err(TuckmillError::new(
+            ErrorCode::InvalidRequest,
+            format!("keep-alive {value:?} exceeds 30 days; use forever to keep a model loaded"),
+        ));
+    }
+    Ok(Some(d))
+}
+
+/// A keep-alive from JSON: a string ([`parse_keep_alive`]) or a number of
+/// seconds (negative: forever).
+pub fn keep_alive_from_json(value: &serde_json::Value) -> Result<Option<Duration>> {
+    match value {
+        serde_json::Value::String(s) => parse_keep_alive(s),
+        serde_json::Value::Number(n) => {
+            let secs = n.as_f64().filter(|x| x.is_finite()).ok_or_else(|| {
+                TuckmillError::new(ErrorCode::InvalidRequest, "keep_alive must be finite")
+            })?;
+            if secs < 0.0 {
+                return Ok(None);
+            }
+            if secs > MAX_KEEP_ALIVE.as_secs_f64() {
+                return Err(TuckmillError::new(
+                    ErrorCode::InvalidRequest,
+                    "keep_alive exceeds 30 days; use -1 to keep a model loaded",
+                ));
+            }
+            Ok(Some(Duration::from_secs_f64(secs)))
+        }
+        _ => Err(TuckmillError::new(
+            ErrorCode::InvalidRequest,
+            "keep_alive must be a duration string or a number of seconds",
+        )),
     }
 }
 
@@ -233,6 +326,10 @@ pub struct LoadedModelStatus {
     pub charged_bytes: u64,
     /// Milliseconds since this model last served a request.
     pub idle_ms: u64,
+    /// The model's keep-alive (`None`: stays until it must make room).
+    pub keep_alive_ms: Option<u64>,
+    /// Milliseconds until the keep-alive unloads it (`None`: never by time).
+    pub expires_in_ms: Option<u64>,
 }
 
 /// Lock-free view of a resident worker (status never waits on a run).
@@ -242,6 +339,7 @@ struct ResidentEntry {
     pid: u32,
     charged_bytes: u64,
     last_used: Instant,
+    keep_alive: Option<Duration>,
 }
 
 pub struct Runtime {
@@ -267,6 +365,10 @@ pub struct Runtime {
     residents: Mutex<Vec<ResidentEntry>>,
     keep_alive: Option<Duration>,
     max_loaded_models: usize,
+    pressure_unload: bool,
+    pressure_grace: Duration,
+    /// When memory pressure (warning or worse) began, while it lasts.
+    pressure_since: Mutex<Option<Instant>>,
     pub policy: PlannerPolicy,
     pub default_budget: Bytes,
     pub default_context: u64,
@@ -404,6 +506,8 @@ struct WorkerSlot {
     /// The load plan's admitted total, charged to the residency budget.
     charged_bytes: u64,
     last_used: Instant,
+    /// Idle time after which this model unloads (`None`: never by time).
+    keep_alive: Option<Duration>,
 }
 
 /// Stable identity of a loaded model in a worker (B4). Built from immutable
@@ -530,6 +634,9 @@ impl Runtime {
             residents: Mutex::new(Vec::new()),
             keep_alive: options.keep_alive,
             max_loaded_models: options.max_loaded_models,
+            pressure_unload: options.pressure_unload,
+            pressure_grace: options.pressure_grace,
+            pressure_since: Mutex::new(None),
             policy: options.policy,
             default_budget,
             default_context: options.default_context,
@@ -683,6 +790,10 @@ impl Runtime {
                     pid: e.pid,
                     charged_bytes: e.charged_bytes,
                     idle_ms: e.last_used.elapsed().as_millis() as u64,
+                    keep_alive_ms: e.keep_alive.map(|k| k.as_millis() as u64),
+                    expires_in_ms: e
+                        .keep_alive
+                        .map(|k| k.saturating_sub(e.last_used.elapsed()).as_millis() as u64),
                 })
                 .collect(),
         }
@@ -698,6 +809,7 @@ impl Runtime {
                 pid: s.worker.pid(),
                 charged_bytes: s.charged_bytes,
                 last_used: s.last_used,
+                keep_alive: s.keep_alive,
             })
             .collect();
         let pid = slots.last().map_or(0, |s| s.worker.pid());
@@ -738,25 +850,344 @@ impl Runtime {
         Some(n)
     }
 
-    /// Unload residents idle past the keep-alive (monitor; non-blocking).
-    fn unload_expired(&self) {
-        let Some(keep) = self.keep_alive else {
-            return;
+    /// Make the model of `plan` the most recently used resident in `slots`
+    /// (the caller holds the worker lock): reuse a resident that satisfies
+    /// it, or unload what residency admission requires and load it
+    /// (ADR-012 step 4). A request's keep-alive, when it sets one, sticks
+    /// to the model.
+    #[allow(clippy::too_many_arguments)]
+    fn ensure_resident(
+        &self,
+        slots: &mut Vec<WorkerSlot>,
+        plan: &ExecutionPlan,
+        artifact: &ArtifactRef,
+        request_id: &str,
+        keep_alive: Option<Option<Duration>>,
+        set_state: &dyn Fn(&str),
+    ) -> Result<()> {
+        let load_options = self.execution.load_json(self.engine_kind);
+        let requested =
+            LoadedModelKey::new(self.engine_kind, plan, artifact, load_options.as_ref());
+        let reusable = |w: &WorkerSlot| -> bool {
+            {
+                let identity_ok = w.key.satisfies(&requested);
+                let retention_ok = reuse_fits_retained(
+                    plan,
+                    w.retained_weight_bytes,
+                    w.retained_workspace_bytes,
+                    w.retained_state_bytes,
+                );
+                if identity_ok && !retention_ok {
+                    self.logger.warn(
+                        "REUSE_DECLINED_RETENTION",
+                        [
+                            (
+                                "retained_weight_bytes".to_string(),
+                                serde_json::json!(w.retained_weight_bytes),
+                            ),
+                            (
+                                "retained_workspace_bytes".to_string(),
+                                serde_json::json!(w.retained_workspace_bytes),
+                            ),
+                            (
+                                "retained_state_bytes".to_string(),
+                                serde_json::json!(w.retained_state_bytes),
+                            ),
+                            (
+                                "plan_weights_allowance_bytes".to_string(),
+                                serde_json::json!(plan
+                                    .budget
+                                    .reservation_breakdown
+                                    .weights
+                                    .bytes()
+                                    .saturating_add(
+                                        plan.budget.reservation_breakdown.io_buffers.bytes()
+                                    )),
+                            ),
+                            (
+                                "plan_workspaces_reservation_bytes".to_string(),
+                                serde_json::json!(plan
+                                    .budget
+                                    .reservation_breakdown
+                                    .workspaces
+                                    .bytes()),
+                            ),
+                        ]
+                        .into_iter()
+                        .collect(),
+                    );
+                }
+                identity_ok && retention_ok
+            }
         };
-        let expired = self
-            .residents
-            .lock()
-            .expect("residents lock")
-            .iter()
-            .any(|e| e.last_used.elapsed() >= keep);
-        if !expired {
+        if let Some(index) = slots.iter().position(&reusable) {
+            // Most recently used goes last.
+            let slot = slots.remove(index);
+            slots.push(slot);
+            // Warm reuse: the loaded model identity and prepared
+            // capacities satisfy this request; no reload, no new
+            // session state (KV state is allocated per request).
+            self.logger.info(
+                "WORKER_REUSED",
+                [
+                    ("request_id".to_string(), serde_json::json!(request_id)),
+                    (
+                        "prepared_context".to_string(),
+                        serde_json::json!(requested.prepared_context_total),
+                    ),
+                ]
+                .into_iter()
+                .collect(),
+            );
+        } else {
+            // A resident of the same model that cannot serve this
+            // plan is replaced, never loaded twice.
+            let (stale, others): (Vec<_>, Vec<_>) = slots
+                .drain(..)
+                .partition(|w| w.key.artifact_id == requested.artifact_id);
+            *slots = others;
+            for old in stale {
+                self.unload(old, "reload");
+            }
+            // Under memory pressure a new load first clears the other idle
+            // models instead of stacking on top of them.
+            if self.pressure_unload && self.under_pressure() {
+                for old in slots.drain(..) {
+                    self.unload(old, "memory-pressure-load");
+                }
+            }
+            // Residency admission (ADR-012 step 4): the residents'
+            // charges plus this load's fit the residency budget and
+            // the count fits the cap, else idle residents leave
+            // least recently used first.
+            let charge = plan.budget.admitted_total().bytes();
+            loop {
+                let held: u64 = slots.iter().map(|w| w.charged_bytes).sum();
+                let over_count = slots.len() >= self.max_loaded_models;
+                let over_budget = held.saturating_add(charge) > self.default_budget.bytes();
+                if slots.is_empty() || !(over_count || over_budget) {
+                    break;
+                }
+                let lru = slots.remove(0);
+                self.unload(lru, if over_count { "capacity" } else { "budget" });
+            }
+            self.publish_residents(slots);
+            set_state("warming");
+            let mut worker =
+                IsolatedWorker::spawn(&self.worker_exe, &self.layout.tmp_dir(), self.engine_kind)?;
+            self.worker_generations.fetch_add(1, Ordering::Relaxed);
+            let note = worker.load(plan, artifact, load_options.as_ref())?;
+            // Resolved settings, acknowledged by the worker right
+            // after load (the worker is idle here): an explicit
+            // request must match exactly or the run is refused.
+            let (_, _, ack_stats) = worker.stats()?;
+            let acknowledged = self.execution.acknowledged(
+                self.engine_kind,
+                &worker.resolved_kernels,
+                ack_stats.as_ref().unwrap_or(&BackendStats::default()),
+            )?;
+            // Plan acknowledgement (B3): the worker's prepared KV
+            // state must fit what the admitted plan reserved. A
+            // worker that would allocate more than the plan priced
+            // fails closed before any request runs on it.
+            let kv_prepared = ack_stats
+                .as_ref()
+                .and_then(|s| s.kv_state_bytes)
+                .unwrap_or(0);
+            let retained_weight = ack_stats
+                .as_ref()
+                .and_then(|s| s.retained_weight_bytes)
+                .unwrap_or(0);
+            let retained_workspace = ack_stats
+                .as_ref()
+                .and_then(|s| s.retained_workspace_bytes)
+                .unwrap_or(0);
+            let retained_state = ack_stats
+                .as_ref()
+                .and_then(|s| s.retained_state_bytes)
+                .unwrap_or(0);
+            let kv_reserved = plan.budget.reservation_breakdown.kv_state.bytes();
+            if kv_prepared > kv_reserved {
+                return Err(TuckmillError::new(
+                    ErrorCode::InvalidPlan,
+                    format!(
+                        "the worker prepared {} of KV state for context {} but the plan reserved only {}; refusing to run on an understated plan",
+                        tuckmill_manifest::units::Bytes(kv_prepared),
+                        plan.context.total_context,
+                        tuckmill_manifest::units::Bytes(kv_reserved)
+                    ),
+                )
+                .with_action(
+                    "Rebuild the plan from the worker's resolved KV representation.",
+                ));
+            }
+            self.logger.info(
+                "WORKER_RESOLVED",
+                [
+                    (
+                        "kernels".to_string(),
+                        serde_json::json!(acknowledged.kernel_impl),
+                    ),
+                    (
+                        "storage".to_string(),
+                        serde_json::json!(acknowledged.storage_mode),
+                    ),
+                    (
+                        "numerical_profile".to_string(),
+                        serde_json::json!(acknowledged.numerical_profile),
+                    ),
+                    ("kv_state_bytes".to_string(), serde_json::json!(kv_prepared)),
+                    (
+                        "kv_reserved_bytes".to_string(),
+                        serde_json::json!(kv_reserved),
+                    ),
+                ]
+                .into_iter()
+                .collect(),
+            );
+            self.logger.info(
+                "WORKER_LOADED",
+                [("note".to_string(), serde_json::json!(note))]
+                    .into_iter()
+                    .collect(),
+            );
+            slots.push(WorkerSlot {
+                key: requested,
+                retained_weight_bytes: retained_weight,
+                retained_workspace_bytes: retained_workspace,
+                retained_state_bytes: retained_state,
+                charged_bytes: charge,
+                last_used: Instant::now(),
+                keep_alive: self.keep_alive,
+                worker,
+            });
+        }
+        if let Some(last) = slots.last_mut() {
+            last.last_used = Instant::now();
+            if let Some(k) = keep_alive {
+                last.keep_alive = k;
+            }
+        }
+        self.publish_residents(slots);
+        Ok(())
+    }
+
+    /// Unload one model if it is resident and idle. `None` when a
+    /// generation holds the workers; otherwise the number unloaded (0 when
+    /// it was not loaded).
+    pub fn unload_model(&self, artifact_id: &str) -> Option<usize> {
+        let mut slots = self.worker.try_lock().ok()?;
+        let (gone, kept): (Vec<_>, Vec<_>) = slots
+            .drain(..)
+            .partition(|w| w.key.artifact_id.as_str() == artifact_id);
+        *slots = kept;
+        let n = gone.len();
+        for slot in gone {
+            self.unload(slot, "request");
+        }
+        self.publish_residents(&slots);
+        Some(n)
+    }
+
+    /// Load a model ahead of its first request (or refresh its keep-alive)
+    /// under the same admission as a request. Waits for a running
+    /// generation to finish first.
+    pub fn preload(
+        &self,
+        plan: &ExecutionPlan,
+        artifact: &ArtifactRef,
+        keep_alive: Option<Option<Duration>>,
+    ) -> Result<()> {
+        if self.engine_mode != EngineMode::Isolated {
+            return Err(TuckmillError::new(
+                ErrorCode::InvalidRequest,
+                "preloading applies to isolated workers; the in-process test engine loads per request",
+            ));
+        }
+        self.check_plan_fresh(plan)?;
+        self.plan_admitted(plan)?;
+        if self.governor_state() == GovState::Failed {
+            return Err(TuckmillError::new(
+                ErrorCode::WorkerFailed,
+                "governor is in the failed state; restart the service",
+            ));
+        }
+        let mut slots = self.worker.lock().expect("worker lock");
+        self.ensure_resident(&mut slots, plan, artifact, "preload", keep_alive, &|_| {})
+    }
+
+    /// Whether macOS currently reports memory pressure (warning or worse).
+    fn under_pressure(&self) -> bool {
+        matches!(
+            self.signals.pressure(),
+            crate::pressure::PressureLevel::Warning | crate::pressure::PressureLevel::Critical
+        )
+    }
+
+    /// The memory-pressure policy (monitor; non-blocking): a warning held
+    /// for the grace period unloads idle models except the most recently
+    /// used one; a critical level unloads every idle model at once.
+    fn react_to_pressure(&self, level: &crate::pressure::PressureLevel) {
+        use crate::pressure::PressureLevel;
+        if !self.pressure_unload {
+            return;
+        }
+        let since = {
+            let mut since = self.pressure_since.lock().expect("pressure lock");
+            match level {
+                PressureLevel::Warning | PressureLevel::Critical => {
+                    *since.get_or_insert_with(Instant::now)
+                }
+                _ => {
+                    *since = None;
+                    return;
+                }
+            }
+        };
+        let critical = *level == PressureLevel::Critical;
+        if !critical && since.elapsed() < self.pressure_grace {
+            return;
+        }
+        let keep = usize::from(!critical);
+        if self.residents.lock().expect("residents lock").len() <= keep {
             return;
         }
         let Ok(mut slots) = self.worker.try_lock() else {
             return; // a generation is running; its worker is not idle
         };
-        let (keep_slots, gone): (Vec<_>, Vec<_>) =
-            slots.drain(..).partition(|s| s.last_used.elapsed() < keep);
+        let n = slots.len().saturating_sub(keep);
+        let gone: Vec<_> = slots.drain(..n).collect();
+        let reason = if critical {
+            "memory-pressure-critical"
+        } else {
+            "memory-pressure-warning"
+        };
+        for slot in gone {
+            self.unload(slot, reason);
+        }
+        self.publish_residents(&slots);
+    }
+
+    /// Unload residents idle past the keep-alive (monitor; non-blocking).
+    fn unload_expired(&self) {
+        let expired = |last_used: Instant, keep: Option<Duration>| {
+            keep.is_some_and(|k| last_used.elapsed() >= k)
+        };
+        let any = self
+            .residents
+            .lock()
+            .expect("residents lock")
+            .iter()
+            .any(|e| expired(e.last_used, e.keep_alive));
+        if !any {
+            return;
+        }
+        let Ok(mut slots) = self.worker.try_lock() else {
+            return; // a generation is running; its worker is not idle
+        };
+        let (keep_slots, gone): (Vec<_>, Vec<_>) = slots
+            .drain(..)
+            .partition(|s| !expired(s.last_used, s.keep_alive));
         *slots = keep_slots;
         for slot in gone {
             self.unload(slot, "idle");
@@ -1132,204 +1563,14 @@ impl Runtime {
         match self.engine_mode {
             EngineMode::Isolated => {
                 let mut slots = self.worker.lock().expect("worker lock");
-                let load_options = self.execution.load_json(self.engine_kind);
-                let requested =
-                    LoadedModelKey::new(self.engine_kind, plan, artifact, load_options.as_ref());
-                let reusable = |w: &WorkerSlot| -> bool {
-                    {
-                        let identity_ok = w.key.satisfies(&requested);
-                        let retention_ok = reuse_fits_retained(
-                            plan,
-                            w.retained_weight_bytes,
-                            w.retained_workspace_bytes,
-                            w.retained_state_bytes,
-                        );
-                        if identity_ok && !retention_ok {
-                            self.logger.warn(
-                                "REUSE_DECLINED_RETENTION",
-                                [
-                                    (
-                                        "retained_weight_bytes".to_string(),
-                                        serde_json::json!(w.retained_weight_bytes),
-                                    ),
-                                    (
-                                        "retained_workspace_bytes".to_string(),
-                                        serde_json::json!(w.retained_workspace_bytes),
-                                    ),
-                                    (
-                                        "retained_state_bytes".to_string(),
-                                        serde_json::json!(w.retained_state_bytes),
-                                    ),
-                                    (
-                                        "plan_weights_allowance_bytes".to_string(),
-                                        serde_json::json!(plan
-                                            .budget
-                                            .reservation_breakdown
-                                            .weights
-                                            .bytes()
-                                            .saturating_add(
-                                                plan.budget
-                                                    .reservation_breakdown
-                                                    .io_buffers
-                                                    .bytes()
-                                            )),
-                                    ),
-                                    (
-                                        "plan_workspaces_reservation_bytes".to_string(),
-                                        serde_json::json!(plan
-                                            .budget
-                                            .reservation_breakdown
-                                            .workspaces
-                                            .bytes()),
-                                    ),
-                                ]
-                                .into_iter()
-                                .collect(),
-                            );
-                        }
-                        identity_ok && retention_ok
-                    }
-                };
-                if let Some(index) = slots.iter().position(&reusable) {
-                    // Most recently used goes last.
-                    let slot = slots.remove(index);
-                    slots.push(slot);
-                    // Warm reuse: the loaded model identity and prepared
-                    // capacities satisfy this request; no reload, no new
-                    // session state (KV state is allocated per request).
-                    self.logger.info(
-                        "WORKER_REUSED",
-                        [
-                            ("request_id".to_string(), serde_json::json!(request_id)),
-                            (
-                                "prepared_context".to_string(),
-                                serde_json::json!(requested.prepared_context_total),
-                            ),
-                        ]
-                        .into_iter()
-                        .collect(),
-                    );
-                } else {
-                    // A resident of the same model that cannot serve this
-                    // plan is replaced, never loaded twice.
-                    let (stale, others): (Vec<_>, Vec<_>) = slots
-                        .drain(..)
-                        .partition(|w| w.key.artifact_id == requested.artifact_id);
-                    *slots = others;
-                    for old in stale {
-                        self.unload(old, "reload");
-                    }
-                    // Residency admission (ADR-012 step 4): the residents'
-                    // charges plus this load's fit the residency budget and
-                    // the count fits the cap, else idle residents leave
-                    // least recently used first.
-                    let charge = plan.budget.admitted_total().bytes();
-                    loop {
-                        let held: u64 = slots.iter().map(|w| w.charged_bytes).sum();
-                        let over_count = slots.len() >= self.max_loaded_models;
-                        let over_budget = held.saturating_add(charge) > self.default_budget.bytes();
-                        if slots.is_empty() || !(over_count || over_budget) {
-                            break;
-                        }
-                        let lru = slots.remove(0);
-                        self.unload(lru, if over_count { "capacity" } else { "budget" });
-                    }
-                    self.publish_residents(&slots);
-                    set_state("warming");
-                    let mut worker = IsolatedWorker::spawn(
-                        &self.worker_exe,
-                        &self.layout.tmp_dir(),
-                        self.engine_kind,
-                    )?;
-                    self.worker_generations.fetch_add(1, Ordering::Relaxed);
-                    let note = worker.load(plan, artifact, load_options.as_ref())?;
-                    // Resolved settings, acknowledged by the worker right
-                    // after load (the worker is idle here): an explicit
-                    // request must match exactly or the run is refused.
-                    let (_, _, ack_stats) = worker.stats()?;
-                    let acknowledged = self.execution.acknowledged(
-                        self.engine_kind,
-                        &worker.resolved_kernels,
-                        ack_stats.as_ref().unwrap_or(&BackendStats::default()),
-                    )?;
-                    // Plan acknowledgement (B3): the worker's prepared KV
-                    // state must fit what the admitted plan reserved. A
-                    // worker that would allocate more than the plan priced
-                    // fails closed before any request runs on it.
-                    let kv_prepared = ack_stats
-                        .as_ref()
-                        .and_then(|s| s.kv_state_bytes)
-                        .unwrap_or(0);
-                    let retained_weight = ack_stats
-                        .as_ref()
-                        .and_then(|s| s.retained_weight_bytes)
-                        .unwrap_or(0);
-                    let retained_workspace = ack_stats
-                        .as_ref()
-                        .and_then(|s| s.retained_workspace_bytes)
-                        .unwrap_or(0);
-                    let retained_state = ack_stats
-                        .as_ref()
-                        .and_then(|s| s.retained_state_bytes)
-                        .unwrap_or(0);
-                    let kv_reserved = plan.budget.reservation_breakdown.kv_state.bytes();
-                    if kv_prepared > kv_reserved {
-                        return Err(TuckmillError::new(
-                            ErrorCode::InvalidPlan,
-                            format!(
-                                "the worker prepared {} of KV state for context {} but the plan reserved only {}; refusing to run on an understated plan",
-                                tuckmill_manifest::units::Bytes(kv_prepared),
-                                plan.context.total_context,
-                                tuckmill_manifest::units::Bytes(kv_reserved)
-                            ),
-                        )
-                        .with_action(
-                            "Rebuild the plan from the worker's resolved KV representation.",
-                        ));
-                    }
-                    self.logger.info(
-                        "WORKER_RESOLVED",
-                        [
-                            (
-                                "kernels".to_string(),
-                                serde_json::json!(acknowledged.kernel_impl),
-                            ),
-                            (
-                                "storage".to_string(),
-                                serde_json::json!(acknowledged.storage_mode),
-                            ),
-                            (
-                                "numerical_profile".to_string(),
-                                serde_json::json!(acknowledged.numerical_profile),
-                            ),
-                            ("kv_state_bytes".to_string(), serde_json::json!(kv_prepared)),
-                            (
-                                "kv_reserved_bytes".to_string(),
-                                serde_json::json!(kv_reserved),
-                            ),
-                        ]
-                        .into_iter()
-                        .collect(),
-                    );
-                    self.logger.info(
-                        "WORKER_LOADED",
-                        [("note".to_string(), serde_json::json!(note))]
-                            .into_iter()
-                            .collect(),
-                    );
-                    slots.push(WorkerSlot {
-                        key: requested,
-                        retained_weight_bytes: retained_weight,
-                        retained_workspace_bytes: retained_workspace,
-                        retained_state_bytes: retained_state,
-                        charged_bytes: charge,
-                        last_used: Instant::now(),
-                        worker,
-                    });
-                }
-                if let Some(last) = slots.last_mut() {
-                    last.last_used = Instant::now();
-                }
+                self.ensure_resident(
+                    &mut slots,
+                    plan,
+                    artifact,
+                    request_id,
+                    request.keep_alive,
+                    &set_state,
+                )?;
                 self.publish_residents(&slots);
                 // Every request — fresh load or warm reuse — attaches the
                 // live worker's control queue to its own scoped holder, so a
@@ -1376,7 +1617,10 @@ impl Runtime {
                 if let Some(last) = slots.last_mut() {
                     last.last_used = Instant::now();
                 }
-                if self.keep_alive == Some(Duration::ZERO) {
+                if slots
+                    .last()
+                    .is_some_and(|w| w.keep_alive == Some(Duration::ZERO))
+                {
                     if let Some(last) = slots.pop() {
                         self.unload(last, "idle");
                     }
@@ -1508,6 +1752,7 @@ impl Runtime {
                 break;
             }
             self.unload_expired();
+            self.react_to_pressure(&self.signals.pressure());
             let now = Instant::now();
             let pressure = self.signals.pressure();
             let thermal = self.signals.thermal();
@@ -1755,6 +2000,8 @@ mod tests {
             allow_test_engine: kind == EngineKind::ReferenceTest,
             keep_alive: Some(crate::runtime::DEFAULT_KEEP_ALIVE),
             max_loaded_models: 1,
+            pressure_unload: true,
+            pressure_grace: Duration::from_secs(5),
         })
         .unwrap();
         (dir, runtime, signals)
@@ -1801,6 +2048,7 @@ mod tests {
                     seed: 42,
                     sampling: tuckmill_backend::SamplingPolicy::default(),
                     ignore_eos: false,
+                    keep_alive: None,
                 },
             )
             .unwrap();
@@ -1951,6 +2199,24 @@ mod tests {
         max_loaded_models: usize,
         budget: Bytes,
     ) -> (tempfile::TempDir, Arc<Runtime>) {
+        let (dir, runtime, _) = lifecycle_runtime_with(
+            worker_exe,
+            keep_alive,
+            max_loaded_models,
+            budget,
+            Duration::from_secs(5),
+        );
+        (dir, runtime)
+    }
+
+    /// [`lifecycle_runtime`] with the pressure grace and the mock signals.
+    fn lifecycle_runtime_with(
+        worker_exe: PathBuf,
+        keep_alive: Option<Duration>,
+        max_loaded_models: usize,
+        budget: Bytes,
+        pressure_grace: Duration,
+    ) -> (tempfile::TempDir, Arc<Runtime>, Arc<MockSignalSource>) {
         let dir = tempfile::tempdir().unwrap();
         let layout = StoreLayout::open(dir.path().join("store"));
         let registry = AdapterRegistry::builtin().unwrap();
@@ -1970,6 +2236,7 @@ mod tests {
             )
             .unwrap();
         }
+        let signals = Arc::new(MockSignalSource::new());
         let runtime = Runtime::open(RuntimeOptions {
             data_dir: Some(layout.root().to_path_buf()),
             engine_mode: EngineMode::Isolated,
@@ -1977,15 +2244,20 @@ mod tests {
             worker_exe: Some(worker_exe),
             queue_capacity: 2,
             default_budget: Some(budget),
-            signal_source: Some(Arc::new(MockSignalSource::new())),
+            signal_source: Some(signals.clone()),
             governor_poll: Duration::from_millis(30),
+            governor_config: GovernorConfig {
+                stability_interval: Duration::from_millis(150),
+                min_dwell: Duration::from_millis(20),
+            },
             allow_test_engine: true,
             keep_alive,
             max_loaded_models,
+            pressure_grace,
             ..Default::default()
         })
         .unwrap();
-        (dir, runtime)
+        (dir, runtime, signals)
     }
 
     /// The load plan of `alias` at the runtime's default budget.
@@ -2007,15 +2279,20 @@ mod tests {
     }
 
     fn lifecycle_run(runtime: &Arc<Runtime>, alias: &str) {
+        lifecycle_run_keep(runtime, alias, None);
+    }
+
+    fn lifecycle_run_keep(
+        runtime: &Arc<Runtime>,
+        alias: &str,
+        keep_alive: Option<Option<Duration>>,
+    ) {
         let (plan, artifact_ref) = lifecycle_plan(runtime, alias);
         let ticket = runtime.submit().unwrap();
+        let mut request = RunRequest::greedy(vec![5, 6], 3);
+        request.keep_alive = keep_alive;
         let run = runtime
-            .start_run(
-                &ticket,
-                plan,
-                artifact_ref,
-                RunRequest::greedy(vec![5, 6], 3),
-            )
+            .start_run(&ticket, plan, artifact_ref, request)
             .unwrap();
         let (reason, committed) = collect_run(&run, |_, _| {});
         assert_eq!((reason, committed), (FinishReason::Length, 3), "{alias}");
@@ -2079,6 +2356,112 @@ mod tests {
             assert!(loaded(&runtime).is_empty(), "keep-alive 0 unloads at once");
             assert_eq!(runtime.worker_generation(), i);
         }
+        runtime.shutdown();
+    }
+
+    fn wait_until(what: &str, mut done: impl FnMut() -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !done() {
+            assert!(Instant::now() < deadline, "timed out waiting: {what}");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    /// A request's keep-alive sticks to its model (Ollama semantics): a
+    /// short one unloads it after that idle time, status reports it and the
+    /// time left, `forever` keeps it, 0 unloads right after the request; a
+    /// preload loads ahead of the first request under the same admission;
+    /// a single model can be unloaded by id.
+    #[test]
+    fn per_request_keep_alive_preload_and_targeted_unload() {
+        let Some(worker_exe) = crate::test_worker_bin() else {
+            return;
+        };
+        let two_gib = Bytes::parse("2GiB").unwrap();
+        let (_dir, runtime) = lifecycle_runtime(worker_exe, None, 2, two_gib);
+        let (a, b) = (artifact_id(&runtime, "a"), artifact_id(&runtime, "b"));
+
+        // Preload with a keep-alive; the first request reuses it.
+        let (plan, artifact_ref) = lifecycle_plan(&runtime, "a");
+        runtime
+            .preload(&plan, &artifact_ref, Some(Some(Duration::from_secs(3600))))
+            .unwrap();
+        assert_eq!(runtime.worker_generation(), 1);
+        let status = runtime.status().loaded_models;
+        assert_eq!(status.len(), 1);
+        assert_eq!(status[0].keep_alive_ms, Some(3_600_000));
+        assert!(status[0].expires_in_ms.unwrap() <= 3_600_000);
+        lifecycle_run(&runtime, "a");
+        assert_eq!(
+            runtime.worker_generation(),
+            1,
+            "the request used the preload"
+        );
+
+        // A short keep-alive on a request sticks and expires.
+        lifecycle_run_keep(&runtime, "b", Some(Some(Duration::from_millis(200))));
+        assert_eq!(loaded(&runtime), vec![a.clone(), b.clone()]);
+        wait_until("b expires", || loaded(&runtime) == vec![a.clone()]);
+        lifecycle_run_keep(&runtime, "a", Some(None));
+        let status = runtime.status().loaded_models;
+        assert_eq!(status[0].keep_alive_ms, None, "forever");
+        assert_eq!(status[0].expires_in_ms, None);
+
+        // Zero unloads right after the request.
+        lifecycle_run_keep(&runtime, "b", Some(Some(Duration::ZERO)));
+        assert_eq!(loaded(&runtime), vec![a.clone()]);
+
+        // Targeted unload: a model that is not loaded unloads nothing.
+        assert_eq!(runtime.unload_model(&b), Some(0));
+        assert_eq!(runtime.unload_model(&a), Some(1));
+        assert!(loaded(&runtime).is_empty());
+        runtime.shutdown();
+    }
+
+    /// macOS memory pressure (ADR-012 step 4): a sustained warning unloads
+    /// idle models but the most recently used one, a critical level unloads
+    /// every idle model, and a load under pressure first unloads the other
+    /// idle models instead of stacking.
+    #[test]
+    fn memory_pressure_unloads_idle_models() {
+        let Some(worker_exe) = crate::test_worker_bin() else {
+            return;
+        };
+        let two_gib = Bytes::parse("2GiB").unwrap();
+        let (_dir, runtime, signals) = lifecycle_runtime_with(
+            worker_exe.clone(),
+            None,
+            2,
+            two_gib,
+            Duration::from_millis(100),
+        );
+        let (a, b) = (artifact_id(&runtime, "a"), artifact_id(&runtime, "b"));
+        lifecycle_run(&runtime, "a");
+        lifecycle_run(&runtime, "b");
+        assert_eq!(loaded(&runtime), vec![a.clone(), b.clone()]);
+        signals.set_pressure(crate::pressure::PressureLevel::Warning);
+        wait_until("warning keeps only the most recent", || {
+            loaded(&runtime) == vec![b.clone()]
+        });
+        signals.set_pressure(crate::pressure::PressureLevel::Critical);
+        wait_until("critical unloads everything idle", || {
+            loaded(&runtime).is_empty()
+        });
+        signals.set_pressure(crate::pressure::PressureLevel::Normal);
+        runtime.shutdown();
+
+        // Load under pressure (a long grace, so only the load acts).
+        let (_dir, runtime, signals) =
+            lifecycle_runtime_with(worker_exe, None, 2, two_gib, Duration::from_secs(600));
+        lifecycle_run(&runtime, "a");
+        signals.set_pressure(crate::pressure::PressureLevel::Warning);
+        lifecycle_run(&runtime, "b");
+        assert_eq!(
+            loaded(&runtime),
+            vec![artifact_id(&runtime, "b")],
+            "the load cleared the idle model first"
+        );
+        signals.set_pressure(crate::pressure::PressureLevel::Normal);
         runtime.shutdown();
     }
 
@@ -2347,6 +2730,7 @@ mod tests {
             seed: 0,
             sampling: tuckmill_backend::SamplingPolicy::default(),
             ignore_eos: false,
+            keep_alive: None,
         };
         assert!(validate_request_against_plan(&plan, &request(2, 100)).is_ok());
         assert_eq!(
