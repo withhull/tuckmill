@@ -54,6 +54,9 @@ prompt tokens, 512 tokens in and 256 out, ABBA rounds. Two idle runs at
 - **Decode** is at parity or ahead. llama.cpp's own decode in this harness
   varies between runs (about 66-85 tok/s), so this is not stated as a
   lead.
+- **Cold first request** (worker start, full-payload identity check, GPU
+  upload, first prefill): 1.13-1.26 s vs llama.cpp's 0.75-1.40 s in the
+  same harness (0.8B).
 - **Remaining prefill difference:** f16 vs f32 operand precision. TuckCore
   keeps f32 (ADR-011).
 - **Dense Qwen3-0.6B Q8_0** (at `4b7d2ae`, f16 KV on both engines): time
@@ -169,7 +172,7 @@ scripts/            build, test, demo, fetch-llama, bench-baseline
 
 ## Verification
 
-`scripts/test.sh` is the gate (497 tests at this revision). It runs
+`scripts/test.sh` is the gate (498 tests at this revision). It runs
 formatting, `clippy -D warnings` and the full suite:
 - adversarial GGUF and Safetensors fixtures;
 - planner math, governor semantics and import fault injection;

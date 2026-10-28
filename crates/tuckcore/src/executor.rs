@@ -376,17 +376,18 @@ impl InferenceBackend for TuckCore {
             )
             .with_action("Re-import the artifact; never execute drifted weights."));
         }
-        // Full-payload identity: one bounded streaming pass over the open
-        // file, compared against the store's recorded canonical digest.
-        // Drifted bytes must never execute; disabling is explicit and
+        // Full-payload identity: the store's canonical chunked digest of
+        // the open file (independent chunks hashed in parallel with
+        // positioned reads, bounded buffers), compared against the recorded
+        // one. Drifted bytes must never execute; disabling is explicit and
         // recorded.
         let verify_start = Instant::now();
         let content_verified = if verify_content_hash {
             match &artifact.content_hash {
                 Some(expected) => {
-                    let mut reader = std::io::BufReader::with_capacity(1 << 20, &artifact_file);
-                    let (actual, _) = tuckmill_manifest::digest::digest_reader(
-                        &mut reader,
+                    let (actual, _) = tuckmill_manifest::digest::digest_file(
+                        &artifact_file,
+                        opened_len,
                         tuckmill_manifest::digest::DEFAULT_CHUNK_BYTES,
                     )
                     .map_err(TuckmillError::from)?;
