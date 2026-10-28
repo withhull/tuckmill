@@ -69,6 +69,7 @@ pub fn dispatch(cmd: &Cmd, json: bool, data_dir: Option<&Path>) -> Result<ExitCo
             gpu_layers,
             kernels,
             storage,
+            speculative,
         } => run(
             model,
             prompt.clone(),
@@ -81,6 +82,7 @@ pub fn dispatch(cmd: &Cmd, json: bool, data_dir: Option<&Path>) -> Result<ExitCo
             *gpu_layers,
             kernels.as_deref(),
             storage.as_deref(),
+            *speculative,
             json,
             data_dir,
         ),
@@ -92,6 +94,7 @@ pub fn dispatch(cmd: &Cmd, json: bool, data_dir: Option<&Path>) -> Result<ExitCo
             gpu_layers,
             kernels,
             storage,
+            speculative,
         } => serve(
             *port,
             *allow_test_engine,
@@ -100,6 +103,7 @@ pub fn dispatch(cmd: &Cmd, json: bool, data_dir: Option<&Path>) -> Result<ExitCo
             *gpu_layers,
             kernels.as_deref(),
             storage.as_deref(),
+            *speculative,
             json,
             data_dir,
         ),
@@ -147,6 +151,7 @@ pub fn dispatch(cmd: &Cmd, json: bool, data_dir: Option<&Path>) -> Result<ExitCo
             storage,
             kv_precision,
             ignore_eos,
+            speculative,
         } => bench(
             model,
             suite,
@@ -162,6 +167,7 @@ pub fn dispatch(cmd: &Cmd, json: bool, data_dir: Option<&Path>) -> Result<ExitCo
             storage.as_deref(),
             kv_precision.as_deref(),
             *ignore_eos,
+            *speculative,
             json,
             data_dir,
         ),
@@ -287,6 +293,7 @@ fn execution_options(
     gpu_layers: Option<i32>,
     kernels: Option<&str>,
     storage: Option<&str>,
+    speculative: bool,
 ) -> Result<tuckmill_supervisor::options::ExecutionOptions> {
     use tuckmill_supervisor::options::ExecutionOptions;
     let (kind, _) = parse_engine(engine)?;
@@ -314,6 +321,7 @@ fn execution_options(
         kernels,
         storage,
         gpu_layers,
+        speculative: speculative.then_some(true),
         ..Default::default()
     };
     options.validate(kind)?;
@@ -854,6 +862,7 @@ fn run(
     gpu_layers: Option<i32>,
     kernels: Option<&str>,
     storage: Option<&str>,
+    speculative: bool,
     json: bool,
     data_dir: Option<&Path>,
 ) -> Result<ExitCode> {
@@ -861,7 +870,7 @@ fn run(
         data_dir,
         engine,
         allow_test_engine,
-        execution_options(engine, gpu_layers, kernels, storage)?,
+        execution_options(engine, gpu_layers, kernels, storage, speculative)?,
     )?;
     let budget = resolve_budget(&runtime, memory_budget)?;
     let (artifact, adapter) = runtime.resolve_artifact(model)?;
@@ -1083,6 +1092,7 @@ fn serve(
     gpu_layers: Option<i32>,
     kernels: Option<&str>,
     storage: Option<&str>,
+    speculative: bool,
     json: bool,
     data_dir: Option<&Path>,
 ) -> Result<ExitCode> {
@@ -1090,7 +1100,7 @@ fn serve(
         data_dir,
         engine,
         allow_test_engine,
-        execution_options(engine, gpu_layers, kernels, storage)?,
+        execution_options(engine, gpu_layers, kernels, storage, speculative)?,
     )?;
     let server = tuckmill_supervisor::api::ApiServer::bind(runtime.clone(), port, None)?;
     let addr = server.local_addr();
@@ -1180,6 +1190,7 @@ fn bench(
     storage: Option<&str>,
     kv_precision: Option<&str>,
     ignore_eos: bool,
+    speculative: bool,
     json: bool,
     data_dir: Option<&Path>,
 ) -> Result<ExitCode> {
@@ -1189,7 +1200,7 @@ fn bench(
             format!("unknown suite {suite:?}; this build provides standard-v1"),
         ));
     }
-    let mut execution = execution_options(engine, gpu_layers, kernels, storage)?;
+    let mut execution = execution_options(engine, gpu_layers, kernels, storage, speculative)?;
     if let Some(kv) = kv_precision {
         if !matches!(kv, "f32" | "f16") {
             return Err(TuckmillError::new(
@@ -1265,7 +1276,7 @@ fn verify(
     json: bool,
     data_dir: Option<&Path>,
 ) -> Result<ExitCode> {
-    let selection = execution_options("tuckcore", None, kernels, storage)?;
+    let selection = execution_options("tuckcore", None, kernels, storage, false)?;
     let runtime = open_runtime_with_options(data_dir, "tuckcore", false, selection.clone())?;
     let budget = resolve_budget(&runtime, memory_budget)?;
     let (artifact, adapter) = runtime.resolve_artifact(model)?;
@@ -1349,7 +1360,7 @@ fn stats(
     json: bool,
     data_dir: Option<&Path>,
 ) -> Result<ExitCode> {
-    let mut execution = execution_options(engine, None, kernels, storage)?;
+    let mut execution = execution_options(engine, None, kernels, storage, false)?;
     if !engine.starts_with("llama") {
         execution.profile = Some(true);
     }

@@ -1073,6 +1073,31 @@ fn qwen35_pinned_artifact_contract_when_available() {
     assert_eq!(v["synthetic_output"], false);
     let served = v["text"].as_str().expect("text").to_string();
 
+    // ADR-012 step 3: speculative greedy decoding through the worker gives
+    // the same text as plain greedy decoding (a longer continuation, so
+    // drafts are both accepted and rejected).
+    let continuation = |extra: &[&str]| -> String {
+        let mut args = vec![
+            "run",
+            "q35",
+            "--prompt",
+            "Write a short paragraph about rivers and why they matter.",
+            "--max-output",
+            "96",
+            "--engine",
+            "tuckcore",
+            "--kernels",
+            "metal",
+            "--json",
+        ];
+        args.extend_from_slice(extra);
+        let v: serde_json::Value = serde_json::from_str(&env.run_ok(&args)).expect("run json");
+        v["text"].as_str().expect("text").to_string()
+    };
+    let plain_text = continuation(&[]);
+    let spec_text = continuation(&["--speculative"]);
+    assert_eq!(spec_text, plain_text, "speculative == plain greedy text");
+
     // Greedy reference: the CPU oracle over the same reference-tokenized
     // prompt. The GPU path is qualified within 4.9e-4 of this oracle on
     // logits; greedy continuations must be identical token for token.

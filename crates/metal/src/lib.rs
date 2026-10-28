@@ -507,6 +507,38 @@ mod imp {
             err: *mut c_char,
             err_cap: usize,
         ) -> c_int;
+        pub fn tm_metal_qwen35_gdn_chunk_snap(
+            ctx: *mut TmMetalCtx,
+            q: *mut TmMetalBuffer,
+            k: *mut TmMetalBuffer,
+            v: *mut TmMetalBuffer,
+            gate: *mut TmMetalBuffer,
+            beta: *mut TmMetalBuffer,
+            state: *mut TmMetalBuffer,
+            out: *mut TmMetalBuffer,
+            snap: *mut TmMetalBuffer,
+            snap_t: u32,
+            heads: u32,
+            k_dim: u32,
+            v_dim: u32,
+            q_scale: f32,
+            n: u32,
+            qk_stride: u32,
+            v_stride: u32,
+            g_stride: u32,
+            err: *mut c_char,
+            err_cap: usize,
+        ) -> c_int;
+        pub fn tm_metal_qwen35_conv_chunk_shift(
+            ctx: *mut TmMetalCtx,
+            hist: *mut TmMetalBuffer,
+            x: *mut TmMetalBuffer,
+            channels: u32,
+            kern: u32,
+            n: u32,
+            err: *mut c_char,
+            err_cap: usize,
+        ) -> c_int;
         pub fn tm_metal_set_gdn_chunk_generic(ctx: *mut TmMetalCtx, generic: c_int) -> c_int;
         pub fn tm_metal_qwen35_rope_partial_chunk(
             ctx: *mut TmMetalCtx,
@@ -1182,6 +1214,105 @@ impl MetalContext {
                     strides.0,
                     strides.1,
                     strides.2,
+                    err.as_mut_ptr(),
+                    ERR_CAP,
+                )
+            };
+            (code, err)
+        })
+    }
+
+    /// `qwen35_gdn_chunk` that also writes the state after token `snap_t`
+    /// to `snap` (the rollback point of a speculative verify).
+    #[allow(clippy::too_many_arguments)]
+    pub fn qwen35_gdn_chunk_snap(
+        &self,
+        q: &MetalBuffer,
+        k: &MetalBuffer,
+        v: &MetalBuffer,
+        gate: &MetalBuffer,
+        beta: &MetalBuffer,
+        state: &MetalBuffer,
+        out: &MetalBuffer,
+        snap: (&MetalBuffer, u32),
+        heads: u32,
+        k_dim: u32,
+        v_dim: u32,
+        q_scale: f32,
+        n: u32,
+        strides: (u32, u32, u32),
+    ) -> Result<()> {
+        for (b, name) in [
+            (q, "q"),
+            (k, "k"),
+            (v, "v"),
+            (gate, "gate"),
+            (beta, "beta"),
+            (state, "state"),
+            (out, "out"),
+            (snap.0, "snap"),
+        ] {
+            self.check_owned(b, name)?;
+        }
+        let r = (
+            q.raw, k.raw, v.raw, gate.raw, beta.raw, state.raw, out.raw, snap.0.raw,
+        );
+        let snap_t = snap.1;
+        self.operate("qwen35_gdn_chunk_snap", move |ctx| {
+            let mut err = [0 as c_char; ERR_CAP];
+            // SAFETY: raw handles were validated against this context.
+            let code = unsafe {
+                imp::tm_metal_qwen35_gdn_chunk_snap(
+                    ctx,
+                    r.0,
+                    r.1,
+                    r.2,
+                    r.3,
+                    r.4,
+                    r.5,
+                    r.6,
+                    r.7,
+                    snap_t,
+                    heads,
+                    k_dim,
+                    v_dim,
+                    q_scale,
+                    n,
+                    strides.0,
+                    strides.1,
+                    strides.2,
+                    err.as_mut_ptr(),
+                    ERR_CAP,
+                )
+            };
+            (code, err)
+        })
+    }
+
+    /// The history refresh of `qwen35_conv_chunk` on its own: shift the
+    /// `[kern-1, channels]` history by the `n` rows of `x`.
+    pub fn qwen35_conv_chunk_shift(
+        &self,
+        hist: &MetalBuffer,
+        x: &MetalBuffer,
+        channels: u32,
+        kern: u32,
+        n: u32,
+    ) -> Result<()> {
+        self.check_owned(hist, "hist")?;
+        self.check_owned(x, "x")?;
+        let (hc, xc) = (hist.raw, x.raw);
+        self.operate("qwen35_conv_chunk_shift", move |ctx| {
+            let mut err = [0 as c_char; ERR_CAP];
+            // SAFETY: raw handles were validated against this context.
+            let code = unsafe {
+                imp::tm_metal_qwen35_conv_chunk_shift(
+                    ctx,
+                    hc,
+                    xc,
+                    channels,
+                    kern,
+                    n,
                     err.as_mut_ptr(),
                     ERR_CAP,
                 )

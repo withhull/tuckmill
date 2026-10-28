@@ -2254,6 +2254,7 @@ mod tests {
             tuckmill_tuckcore::engine::metal::EngineOptions {
                 kv: tuckmill_tuckcore::engine::metal::KvCache::F32,
                 prefix_cache: true,
+                mtp: false,
             },
         )
         .unwrap();

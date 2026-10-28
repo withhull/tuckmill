@@ -12,7 +12,7 @@ pub mod graph;
 pub mod metal;
 
 pub use graph::{
-    AttentionSpec, FfnSpec, GatedDeltaNetSpec, LayerSpec, MixerSpec, ModelGraph, Tensor,
+    AttentionSpec, FfnSpec, GatedDeltaNetSpec, LayerSpec, MixerSpec, ModelGraph, MtpSpec, Tensor,
 };
 
 use tuckmill_manifest::error::{ErrorCode, Result, TuckmillError};

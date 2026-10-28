@@ -1369,14 +1369,16 @@ kernel void tm_qwen35_gdn_chunk(device const float *q [[buffer(0)]],
                                 device const float *beta [[buffer(4)]],
                                 device float *state [[buffer(5)]],
                                 device float *out [[buffer(6)]],
-                                constant uint &k_dim [[buffer(7)]],
-                                constant uint &v_dim [[buffer(8)]],
-                                constant float &q_scale [[buffer(9)]],
-                                constant uint &heads [[buffer(10)]],
-                                constant uint &n [[buffer(11)]],
-                                constant uint &qk_stride [[buffer(12)]],
-                                constant uint &v_stride [[buffer(13)]],
-                                constant uint &g_stride [[buffer(14)]],
+                                    device float *snap [[buffer(7)]],
+                                constant uint &k_dim [[buffer(8)]],
+                                constant uint &v_dim [[buffer(9)]],
+                                constant float &q_scale [[buffer(10)]],
+                                constant uint &heads [[buffer(11)]],
+                                constant uint &n [[buffer(12)]],
+                                constant uint &qk_stride [[buffer(13)]],
+                                constant uint &v_stride [[buffer(14)]],
+                                constant uint &g_stride [[buffer(15)]],
+                                    constant uint &snap_t [[buffer(16)]],
                                 uint2 gid [[thread_position_in_grid]]) {
     const uint j = gid.x;
     const uint head = gid.y;
@@ -1405,6 +1407,13 @@ kernel void tm_qwen35_gdn_chunk(device const float *q [[buffer(0)]],
             acc += updated * (qq[i] * q_scale);
         }
         out[v_row + j] = acc;
+        if (t == snap_t) {
+            /* Rollback point (speculative verify): the state after token t. */
+            device float *snap_s = snap + (size_t)head * (size_t)sk * (size_t)sv;
+            for (uint i = 0; i < sk; ++i) {
+                snap_s[i * sv + j] = s[i * sv + j];
+            }
+        }
     }
 }
 
@@ -1504,14 +1513,16 @@ kernel void tm_qwen35_gdn_chunk_reg(device const float *q [[buffer(0)]],
                                     device const float *beta [[buffer(4)]],
                                     device float *state [[buffer(5)]],
                                     device float *out [[buffer(6)]],
-                                    constant uint &k_dim [[buffer(7)]],
-                                    constant uint &v_dim [[buffer(8)]],
-                                    constant float &q_scale [[buffer(9)]],
-                                    constant uint &heads [[buffer(10)]],
-                                    constant uint &n [[buffer(11)]],
-                                    constant uint &qk_stride [[buffer(12)]],
-                                    constant uint &v_stride [[buffer(13)]],
-                                    constant uint &g_stride [[buffer(14)]],
+                                    device float *snap [[buffer(7)]],
+                                    constant uint &k_dim [[buffer(8)]],
+                                    constant uint &v_dim [[buffer(9)]],
+                                    constant float &q_scale [[buffer(10)]],
+                                    constant uint &heads [[buffer(11)]],
+                                    constant uint &n [[buffer(12)]],
+                                    constant uint &qk_stride [[buffer(13)]],
+                                    constant uint &v_stride [[buffer(14)]],
+                                    constant uint &g_stride [[buffer(15)]],
+                                    constant uint &snap_t [[buffer(16)]],
                                     uint2 gid [[thread_position_in_grid]]) {
     constexpr uint RPL = SK / P;
     constexpr uint C = 32u / P;
@@ -1558,6 +1569,13 @@ kernel void tm_qwen35_gdn_chunk_reg(device const float *q [[buffer(0)]],
         if (part == 0u) {
             out[v_row + j] = acc;
         }
+        if (t == snap_t) {
+            /* Rollback point (speculative verify): the state after token t. */
+            device float *snap_s = snap + (size_t)head * (size_t)SK * (size_t)sv;
+            for (uint i = 0; i < RPL; ++i) {
+                snap_s[(r0 + i) * sv + j] = col[i];
+            }
+        }
     }
     for (uint i = 0; i < RPL; ++i) {
         s[(r0 + i) * sv + j] = col[i];
@@ -1571,11 +1589,12 @@ kernel void tm_qwen35_gdn_chunk_reg(device const float *q [[buffer(0)]],
     device const float *q [[buffer(0)]], device const float *k [[buffer(1)]],      \
         device const float *v [[buffer(2)]], device const float *gate [[buffer(3)]], \
         device const float *beta [[buffer(4)]], device float *state [[buffer(5)]],  \
-        device float *out [[buffer(6)]], constant uint &k_dim [[buffer(7)]],        \
-        constant uint &v_dim [[buffer(8)]], constant float &q_scale [[buffer(9)]],  \
-        constant uint &heads [[buffer(10)]], constant uint &n [[buffer(11)]],       \
-        constant uint &qk_stride [[buffer(12)]], constant uint &v_stride [[buffer(13)]], \
-        constant uint &g_stride [[buffer(14)]], uint2 gid [[thread_position_in_grid]]
+        device float *out [[buffer(6)]], device float *snap [[buffer(7)]],          \
+        constant uint &k_dim [[buffer(8)]], constant uint &v_dim [[buffer(9)]],     \
+        constant float &q_scale [[buffer(10)]], constant uint &heads [[buffer(11)]], \
+        constant uint &n [[buffer(12)]], constant uint &qk_stride [[buffer(13)]],   \
+        constant uint &v_stride [[buffer(14)]], constant uint &g_stride [[buffer(15)]], \
+        constant uint &snap_t [[buffer(16)]], uint2 gid [[thread_position_in_grid]]
 
 template [[host_name("tm_qwen35_gdn_chunk_k128")]] kernel void
 tm_qwen35_gdn_chunk_reg<128u, TM_GDN_LANES>(TM_GDN_REG_ARGS);

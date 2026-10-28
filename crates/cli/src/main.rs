@@ -145,6 +145,11 @@ enum Cmd {
         /// bounded buffers).
         #[arg(long)]
         storage: Option<String>,
+        /// TuckCore speculative greedy decoding with the artifact's MTP
+        /// head (ADR-012 step 3): greedy output is token-identical to plain
+        /// decoding; refused for artifacts without an MTP block.
+        #[arg(long)]
+        speculative: bool,
     },
 
     /// Serve the local API on loopback.
@@ -172,6 +177,11 @@ enum Cmd {
         /// bounded buffers).
         #[arg(long)]
         storage: Option<String>,
+        /// TuckCore speculative greedy decoding with the artifact's MTP
+        /// head (ADR-012 step 3): greedy output is token-identical to plain
+        /// decoding; refused for artifacts without an MTP block.
+        #[arg(long)]
+        speculative: bool,
     },
 
     /// Verify equivalence: identical token IDs through resident and
@@ -271,6 +281,11 @@ enum Cmd {
         /// is not meaningful).
         #[arg(long)]
         ignore_eos: bool,
+        /// TuckCore speculative greedy decoding with the artifact's MTP
+        /// head (ADR-012 step 3): greedy output is token-identical to plain
+        /// decoding; refused for artifacts without an MTP block.
+        #[arg(long)]
+        speculative: bool,
     },
 
     /// Show backend statistics and profile counters after a short probe run.

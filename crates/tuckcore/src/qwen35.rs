@@ -224,7 +224,23 @@ pub struct Qwen35Layout {
     /// format's convention (the pinned artifact is tied).
     pub output: Option<TensorRef>,
     pub layers: Vec<Qwen35Layer>,
+    /// The trailing MTP block (`nextn_predict_layers` = 1), if present.
+    pub mtp: Option<Qwen35Mtp>,
     pub state: Qwen35StateLayout,
+}
+
+/// A multi-token-prediction block: from the main model's hidden state at
+/// position i and the embedding of token i+1, it predicts token i+2
+/// (`enorm`/`hnorm` normalize the two inputs, `eh_proj` maps their
+/// concatenation back to the hidden width, one gated full-attention layer
+/// follows, then `shared_head_norm` and the shared output head).
+#[derive(Debug, Clone)]
+pub struct Qwen35Mtp {
+    pub layer: Qwen35Layer,
+    pub eh_proj: TensorRef,
+    pub enorm: TensorRef,
+    pub hnorm: TensorRef,
+    pub shared_head_norm: TensorRef,
 }
 
 impl Qwen35Layout {
@@ -250,6 +266,48 @@ impl Qwen35Layout {
 /// stack (an unrecognized tensor is a contract violation, not something to
 /// skip). Trailing non-served blocks (MTP/`nextn`) are excluded by the
 /// served-stack definition and may carry any tensors.
+/// The tensors of a gated full-attention layer `p(...)` (served stack and
+/// the MTP block share it, so their bindings cannot drift apart).
+fn full_attention(
+    index: &mut Index<'_>,
+    p: &dyn Fn(&str) -> String,
+    cfg: &Qwen35Config,
+    hidden: u64,
+) -> Result<Qwen35AttentionTensors> {
+    Ok(Qwen35AttentionTensors::Full {
+        q: index.take(
+            &p("attn_q.weight"),
+            &[hidden, cfg.heads * cfg.head_dim * 2],
+            "attention q (+gate)",
+        )?,
+        k: index.take(
+            &p("attn_k.weight"),
+            &[hidden, cfg.kv_heads * cfg.head_dim],
+            "attention k",
+        )?,
+        v: index.take(
+            &p("attn_v.weight"),
+            &[hidden, cfg.kv_heads * cfg.head_dim],
+            "attention v",
+        )?,
+        output: index.take(
+            &p("attn_output.weight"),
+            &[cfg.heads * cfg.head_dim, hidden],
+            "attention output",
+        )?,
+        q_norm: index.take(
+            &p("attn_q_norm.weight"),
+            &[cfg.head_dim],
+            "attention q norm",
+        )?,
+        k_norm: index.take(
+            &p("attn_k_norm.weight"),
+            &[cfg.head_dim],
+            "attention k norm",
+        )?,
+    })
+}
+
 pub fn resolve(
     inspection: &GgufInspection,
     registry: &AdapterRegistry,
@@ -531,38 +589,7 @@ pub fn resolve(
                 norm: index.take(&p("ssm_norm.weight"), &[cfg.gdn.head_v], "GDN norm")?,
                 out: index.take(&p("ssm_out.weight"), &[cfg.gdn.inner, hidden], "GDN out")?,
             },
-            Qwen35LayerKind::FullAttention => Qwen35AttentionTensors::Full {
-                q: index.take(
-                    &p("attn_q.weight"),
-                    &[hidden, cfg.heads * cfg.head_dim * 2],
-                    "attention q (+gate)",
-                )?,
-                k: index.take(
-                    &p("attn_k.weight"),
-                    &[hidden, cfg.kv_heads * cfg.head_dim],
-                    "attention k",
-                )?,
-                v: index.take(
-                    &p("attn_v.weight"),
-                    &[hidden, cfg.kv_heads * cfg.head_dim],
-                    "attention v",
-                )?,
-                output: index.take(
-                    &p("attn_output.weight"),
-                    &[cfg.heads * cfg.head_dim, hidden],
-                    "attention output",
-                )?,
-                q_norm: index.take(
-                    &p("attn_q_norm.weight"),
-                    &[cfg.head_dim],
-                    "attention q norm",
-                )?,
-                k_norm: index.take(
-                    &p("attn_k_norm.weight"),
-                    &[cfg.head_dim],
-                    "attention k norm",
-                )?,
-            },
+            Qwen35LayerKind::FullAttention => full_attention(&mut index, &p, &cfg, hidden)?,
         };
         layers_out.push(Qwen35Layer {
             attention,
@@ -578,6 +605,43 @@ pub fn resolve(
         });
     }
 
+    // A single trailing MTP (`nextn`) block, when the artifact carries one:
+    // a gated full-attention layer plus the next-token projection and
+    // norms (ADR-012 step 3). It is never part of the served stack.
+    let mtp = if cfg.block_count == cfg.layers + 1
+        && index.has(&format!("blk.{}.nextn.eh_proj.weight", cfg.layers))
+    {
+        let l = cfg.layers;
+        let p = |s: &str| format!("blk.{l}.{s}");
+        Some(Qwen35Mtp {
+            layer: Qwen35Layer {
+                attention: full_attention(&mut index, &p, &cfg, hidden)?,
+                attn_norm: index.take(&p("attn_norm.weight"), &[hidden], "MTP attn norm")?,
+                ffn_gate: index.take(&p("ffn_gate.weight"), &[hidden, cfg.ffn], "MTP ffn gate")?,
+                ffn_up: index.take(&p("ffn_up.weight"), &[hidden, cfg.ffn], "MTP ffn up")?,
+                ffn_down: index.take(&p("ffn_down.weight"), &[cfg.ffn, hidden], "MTP ffn down")?,
+                post_attn_norm: index.take(
+                    &p("post_attention_norm.weight"),
+                    &[hidden],
+                    "MTP post attention norm",
+                )?,
+            },
+            eh_proj: index.take(
+                &p("nextn.eh_proj.weight"),
+                &[hidden * 2, hidden],
+                "MTP eh_proj",
+            )?,
+            enorm: index.take(&p("nextn.enorm.weight"), &[hidden], "MTP enorm")?,
+            hnorm: index.take(&p("nextn.hnorm.weight"), &[hidden], "MTP hnorm")?,
+            shared_head_norm: index.take(
+                &p("nextn.shared_head_norm.weight"),
+                &[hidden],
+                "MTP shared head norm",
+            )?,
+        })
+    } else {
+        None
+    };
     let output_norm = index.take("output_norm.weight", &[hidden], "output norm")?;
     let output = if index.has("output.weight") {
         Some(index.take("output.weight", &[hidden, vocab], "output head")?)
@@ -594,6 +658,7 @@ pub fn resolve(
         output_norm,
         output,
         layers: layers_out,
+        mtp,
         state,
     };
     Ok((cfg, layout))

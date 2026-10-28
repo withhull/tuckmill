@@ -77,6 +77,11 @@ struct TuckCoreOptions {
     /// off so repeated prompts never become hidden cache hits.
     #[serde(default)]
     prefix_cache: Option<bool>,
+    /// Speculative greedy decoding with the artifact's MTP head (ADR-012
+    /// step 3); default off. Greedy output is token-identical to plain
+    /// decoding; refused for an artifact without an MTP block.
+    #[serde(default)]
+    speculative: Option<bool>,
 }
 
 struct Loaded {
@@ -886,6 +891,8 @@ fn run_session(
     // The pipelined step already queued (it computes the token after the
     // one being collected).
     let mut in_flight: Option<PendingToken> = None;
+    // A token a speculative cycle already verified (its accepted draft).
+    let mut verified: Option<u32> = None;
     let prompt_tokens = &req.prompt_tokens;
     let mut pos = spec.start;
     while pos < prompt_tokens.len() {
@@ -1038,6 +1045,20 @@ fn run_session(
                                 ErrorCode::Cancelled,
                                 "generation cancelled at a token boundary",
                             ));
+                        }
+                        // Speculative greedy (ADR-012 step 3): one cycle
+                        // yields the next token and, when the draft was
+                        // right, the one after it, both exactly the tokens
+                        // plain greedy decoding chooses.
+                        if let Some(t) = verified.take() {
+                            next = Some(Some(t));
+                            return Ok(());
+                        }
+                        if in_flight.is_none() && model.can_speculate() {
+                            let step = model.speculate_greedy(token)?;
+                            next = Some(step.first);
+                            verified = step.second;
+                            return Ok(());
                         }
                         let current = match in_flight.take() {
                             Some(p) => p,
@@ -1348,6 +1369,7 @@ impl TuckCore {
             &source,
             KvCache::F16,
             opts.prefix_cache.unwrap_or(true),
+            opts.speculative.unwrap_or(false),
             HYBRID_KERNEL_ID,
             ctx,
         )
@@ -1410,6 +1432,7 @@ impl TuckCore {
             &source,
             kv,
             opts.prefix_cache.unwrap_or(true),
+            opts.speculative.unwrap_or(false),
             QWEN3_ENGINE_KERNEL_ID,
             ctx,
         )
@@ -1428,6 +1451,7 @@ impl TuckCore {
         source: &dyn crate::engine::WeightSource,
         kv: KvCache,
         prefix_cache: bool,
+        speculative: bool,
         kernel_id: &str,
         ctx: EngineLoadContext,
     ) -> Result<String> {
@@ -1438,7 +1462,11 @@ impl TuckCore {
             )
         })?;
         let arch = graph.architecture.clone();
-        let engine_opts = EngineOptions { kv, prefix_cache };
+        let engine_opts = EngineOptions {
+            kv,
+            prefix_cache,
+            mtp: speculative,
+        };
         let alloc = engine_metal::alloc_plan_with(&graph, source, capacity, engine_opts)?;
         let reserved = &plan.budget.reservation_breakdown;
         for (class, need, have) in [
@@ -1503,6 +1531,11 @@ impl TuckCore {
                 "not verified (no digest recorded or verification disabled by option)"
             }
         ));
+        if speculative {
+            note.push_str(
+                "; speculative greedy decoding with the artifact's MTP head (drafts verified with the decode arithmetic; output token-identical to plain greedy decoding)",
+            );
+        }
         if let Some(extra) = tokenizer.pretokenizer_note() {
             note.push_str("; ");
             note.push_str(&extra);

@@ -137,3 +137,56 @@ honest labels, and the unified engine.
   client-side, four rounds): cold 0.87-0.93 s, hit 0.33-0.37 s (896
   positions resumed). Locally-calibrated; it includes rendering,
   tokenization and HTTP.
+
+## Step 3 record (2026-10-28): MTP speculative greedy decoding
+
+- **Scope.** Greedy requests on Qwen3.5 artifacts that carry the MTP block
+  (the pinned 0.8B does; the pinned 2B has none and is refused with a
+  typed error). Opt-in with `--speculative` on `run`, `serve` and `bench`.
+  Sampled requests keep plain decoding until exact rejection sampling
+  lands.
+- **Cycle.** The main model is at position p with the next input token
+  x_p known.
+  - The MTP head drafts d from the main hidden state at p-1 and the
+    embedding of x_p: `eh_proj([enorm(e); hnorm(final_norm(h)))`, then
+    one attention layer with its own KV rows, then the shared head.
+  - The main model verifies `[x_p, d]` as one 2-row chunk with the decode
+    arithmetic: per-row GEMMs (bit-identical to the GEMV, never the
+    matrix-unit GEMM), the chunk cores (gated bit-identical to the decode
+    cores), and per-row final norm and head.
+  - It commits a0 always, and a1 when a0 == d. A rejected draft restores
+    each Gated DeltaNet layer's recurrent and convolution state captured
+    after token 0. The recurrence kernel writes it at `snap_t`; the conv
+    history is shifted by token 0's row. Attention rows past the position
+    are rewritten later.
+  - One command buffer and one host read per cycle. The draft and the
+    MTP rows for accepted tokens share the next cycle's buffer.
+- **Prefill.** The MTP head runs over the prompt (row j pairs h(j-1) with
+  token j), so its KV rows are complete when decoding starts. The prefix
+  snapshot also keeps the boundary's hidden row.
+- **Conventions, chosen by measured acceptance** (pinned 0.8B, 64
+  tokens): `[e; h]` with h after the final norm 30/33, raw h 23/41, `[h;
+  e]` 0/63 either way. Every convention stays token-identical; the MTP
+  RoPE position is the hidden state's position (p-1), the one
+  alternative not measured.
+- **Admission.** MTP weights are artifact weights. Its KV rows,
+  rollback buffers and verify scratch are workspace, outside the
+  planner's served-stack KV (gated: ledger == plan, planner KV unchanged).
+- **Gate:**
+  - engine, fixture and pinned 0.8B: drafts from the head, always right,
+    always wrong, and alternating all give the plain greedy tokens. The
+    next decode step after speculation gives bit-identical logits to a
+    plain session over the same tokens. Prompts of 1, 5 and 131 tokens
+    (fixture) and 7 and 168 tokens (0.8B).
+  - worker end to end, pinned 0.8B: a 96-token chat continuation through
+    `run --speculative` equals `run` text exactly.
+  - `scripts/test.sh`: all checks passed.
+- **Measured** (pinned 0.8B, M3 8 GB, `tuckmill bench`, 512/256,
+  `--ignore-eos`, f16 KV, three alternating pairs, locally-calibrated):
+  decode 98.1-100.6 tok/s speculative vs 76.2-78.3 plain (≈1.30×); TTFT
+  0.310-0.323 s vs 0.292-0.299 s (+4%, the MTP rows over the prompt).
+  Acceptance depends on the text; the frozen synthetic workload is one
+  data point, not a general speedup.
+- **Not done.** Pipelined cycles (the host waits for each one), more than
+  one draft token, rollback by buffer swap instead of copy, and exact
+  rejection sampling for sampled requests.

@@ -2,7 +2,7 @@
 //! adapter only describes; it never executes.
 
 use super::graph::{
-    AttentionSpec, FfnSpec, GatedDeltaNetSpec, LayerSpec, MixerSpec, ModelGraph, Tensor,
+    AttentionSpec, FfnSpec, GatedDeltaNetSpec, LayerSpec, MixerSpec, ModelGraph, MtpSpec, Tensor,
 };
 use crate::model::{Qwen3Config, TensorNames};
 use crate::qwen35::{Qwen35AttentionTensors, Qwen35Config, Qwen35Layout};
@@ -19,70 +19,88 @@ pub fn qwen35(cfg: &Qwen35Config, layout: &Qwen35Layout) -> ModelGraph {
     let layers = layout
         .layers
         .iter()
-        .map(|layer| {
-            let mixer = match &layer.attention {
-                Qwen35AttentionTensors::Linear {
-                    qkv,
-                    gate,
-                    a,
-                    dt,
-                    alpha,
-                    beta,
-                    conv1d,
-                    norm,
-                    out,
-                } => MixerSpec::GatedDeltaNet(GatedDeltaNetSpec {
-                    qkv: t(qkv),
-                    z: t(gate),
-                    alpha: t(alpha),
-                    beta: t(beta),
-                    out: t(out),
-                    ssm_a: t(a),
-                    ssm_dt: t(dt),
-                    ssm_norm: t(norm),
-                    conv1d: t(conv1d),
-                    channels: cfg.conv_channels() as usize,
-                    groups: cfg.gdn.groups as usize,
-                    state_size: cfg.gdn.state_size as usize,
-                    head_v: cfg.gdn.head_v as usize,
-                    dt_rank: cfg.gdn.dt_rank as usize,
-                    conv_kernel: cfg.gdn.conv_kernel as usize,
-                }),
-                Qwen35AttentionTensors::Full {
-                    q,
-                    k,
-                    v,
-                    output,
-                    q_norm,
-                    k_norm,
-                } => MixerSpec::Attention(AttentionSpec {
-                    q: t(q),
-                    k: t(k),
-                    v: t(v),
-                    o: t(output),
-                    q_norm: Some(t(q_norm)),
-                    k_norm: Some(t(k_norm)),
-                    heads: cfg.heads as usize,
-                    kv_heads: cfg.kv_heads as usize,
-                    head_dim: cfg.head_dim as usize,
-                    rope_dims: cfg.rope_dims as usize,
-                    rope_base: cfg.rope_base,
-                    output_gate: true,
-                }),
-            };
-            LayerSpec {
-                pre_norm: t(&layer.attn_norm),
-                mixer,
-                post_norm: t(&layer.post_attn_norm),
-                ffn: FfnSpec::SwiGlu {
-                    gate: t(&layer.ffn_gate),
-                    up: t(&layer.ffn_up),
-                    down: t(&layer.ffn_down),
-                    width: cfg.ffn as usize,
-                },
-            }
-        })
+        .map(|layer| qwen35_layer(cfg, layer))
         .collect();
+    let mtp = layout.mtp.as_ref().map(|m| MtpSpec {
+        enorm: t(&m.enorm),
+        hnorm: t(&m.hnorm),
+        eh_proj: t(&m.eh_proj),
+        layer: qwen35_layer(cfg, &m.layer),
+        final_norm: t(&m.shared_head_norm),
+    });
+    qwen35_graph(cfg, layout, layers, mtp)
+}
+
+fn qwen35_layer(cfg: &Qwen35Config, layer: &crate::qwen35::Qwen35Layer) -> LayerSpec {
+    let mixer = match &layer.attention {
+        Qwen35AttentionTensors::Linear {
+            qkv,
+            gate,
+            a,
+            dt,
+            alpha,
+            beta,
+            conv1d,
+            norm,
+            out,
+        } => MixerSpec::GatedDeltaNet(GatedDeltaNetSpec {
+            qkv: t(qkv),
+            z: t(gate),
+            alpha: t(alpha),
+            beta: t(beta),
+            out: t(out),
+            ssm_a: t(a),
+            ssm_dt: t(dt),
+            ssm_norm: t(norm),
+            conv1d: t(conv1d),
+            channels: cfg.conv_channels() as usize,
+            groups: cfg.gdn.groups as usize,
+            state_size: cfg.gdn.state_size as usize,
+            head_v: cfg.gdn.head_v as usize,
+            dt_rank: cfg.gdn.dt_rank as usize,
+            conv_kernel: cfg.gdn.conv_kernel as usize,
+        }),
+        Qwen35AttentionTensors::Full {
+            q,
+            k,
+            v,
+            output,
+            q_norm,
+            k_norm,
+        } => MixerSpec::Attention(AttentionSpec {
+            q: t(q),
+            k: t(k),
+            v: t(v),
+            o: t(output),
+            q_norm: Some(t(q_norm)),
+            k_norm: Some(t(k_norm)),
+            heads: cfg.heads as usize,
+            kv_heads: cfg.kv_heads as usize,
+            head_dim: cfg.head_dim as usize,
+            rope_dims: cfg.rope_dims as usize,
+            rope_base: cfg.rope_base,
+            output_gate: true,
+        }),
+    };
+    LayerSpec {
+        pre_norm: t(&layer.attn_norm),
+        mixer,
+        post_norm: t(&layer.post_attn_norm),
+        ffn: FfnSpec::SwiGlu {
+            gate: t(&layer.ffn_gate),
+            up: t(&layer.ffn_up),
+            down: t(&layer.ffn_down),
+            width: cfg.ffn as usize,
+        },
+    }
+}
+
+fn qwen35_graph(
+    cfg: &Qwen35Config,
+    layout: &Qwen35Layout,
+    layers: Vec<LayerSpec>,
+    mtp: Option<MtpSpec>,
+) -> ModelGraph {
     ModelGraph {
         architecture: "qwen35".to_string(),
         hidden: cfg.hidden as usize,
@@ -96,6 +114,7 @@ pub fn qwen35(cfg: &Qwen35Config, layout: &Qwen35Layout) -> ModelGraph {
             .as_ref()
             .map(t)
             .unwrap_or(t(&layout.token_embd)),
+        mtp,
         eos_token_id: cfg.eos_token_id,
     }
 }
@@ -167,6 +186,7 @@ pub fn qwen3(cfg: &Qwen3Config, names: &TensorNames, insp: &GgufInspection) -> R
             Some(output) => index(output)?,
             None => embedding,
         },
+        mtp: None,
         eos_token_id: cfg.eos_token_id,
     })
 }

@@ -71,6 +71,29 @@ pub enum Stage {
     Layer(usize),
 }
 
+/// How a chunk of rows runs through the blocks.
+#[derive(Debug, Clone, Copy)]
+struct ChunkMode {
+    /// Mixer cores chunk-wide (default) or per token on the decode kernels.
+    chunk_core: bool,
+    /// Every projection on the per-row GEMMs, bit-identical to the decode
+    /// GEMV (a speculative verify), instead of the matrix-unit GEMM.
+    exact: bool,
+    /// Capture each Gated DeltaNet layer's state after the chunk's first
+    /// token (the rollback point of a speculative verify).
+    capture: bool,
+}
+
+impl ChunkMode {
+    fn prefill(chunk_core: bool) -> Self {
+        Self {
+            chunk_core,
+            exact: false,
+            capture: false,
+        }
+    }
+}
+
 // ---------------------------------------------------------------- tensors --
 
 fn vector_len(src: &dyn WeightSource, t: Tensor) -> Result<usize> {
@@ -139,14 +162,21 @@ impl Matrix {
         }
     }
 
-    /// `Y[b] = W X[b]` for `b < batch`. F16 and batch 1 keep the GEMV's
-    /// per-row arithmetic (in slices of at most `GEMM_MAX_BATCH` tokens);
-    /// Q8_0 batches of 2 or more use the SIMD-group matrix units in one
-    /// launch (tolerance-qualified, ADR-008 Addendum 16).
-    fn gemm(&self, gpu: &Qwen35Gpu, x: &MetalBuffer, y: &MetalBuffer, batch: u32) -> Result<()> {
+    /// `Y[b] = W X[b]` for `b < batch`. F16, batch 1 and `exact` keep the
+    /// GEMV's per-row arithmetic (in slices of at most `GEMM_MAX_BATCH`
+    /// tokens); other Q8_0 batches of 2 or more use the SIMD-group matrix
+    /// units in one launch (tolerance-qualified, ADR-008 Addendum 16).
+    fn gemm(
+        &self,
+        gpu: &Qwen35Gpu,
+        x: &MetalBuffer,
+        y: &MetalBuffer,
+        batch: u32,
+        exact: bool,
+    ) -> Result<()> {
         let ctx = gpu.context();
         let (rows, cols) = (self.out_dim as u32, self.in_dim as u32);
-        if self.type_id == 8 && (2..=GEMM_MMA_MAX_BATCH).contains(&batch) {
+        if !exact && self.type_id == 8 && (2..=GEMM_MMA_MAX_BATCH).contains(&batch) {
             return ctx.q8_0_gemm_mma(&self.buf, x, y, rows, cols, batch, 0, 0);
         }
         let mut t0 = 0u32;
@@ -464,13 +494,20 @@ impl SwiGluBlock {
     }
 
     /// `x += ffn(h)` for the `n` chunk rows of `s.h2` / `s.x`.
-    fn prefill(&self, gpu: &Qwen35Gpu, s: &PrefillScratch, n: usize, hidden: usize) -> Result<()> {
+    fn prefill(
+        &self,
+        gpu: &Qwen35Gpu,
+        s: &PrefillScratch,
+        n: usize,
+        hidden: usize,
+        exact: bool,
+    ) -> Result<()> {
         let ctx = gpu.context();
         let nn = n as u32;
-        self.gate.gemm(gpu, &s.h2, &s.g, nn)?;
-        self.up.gemm(gpu, &s.h2, &s.u, nn)?;
+        self.gate.gemm(gpu, &s.h2, &s.g, nn, exact)?;
+        self.up.gemm(gpu, &s.h2, &s.u, nn, exact)?;
         ctx.silu_mul(&s.g, &s.u, &s.g, (n * self.width) as u32)?;
-        self.down.gemm(gpu, &s.g, &s.d2, nn)?;
+        self.down.gemm(gpu, &s.g, &s.d2, nn, exact)?;
         ctx.f32_axpy(&s.d2, &s.x, 1.0, (n * hidden) as u32)
     }
 }
@@ -494,6 +531,9 @@ struct GdnBlock {
     /// Prefix-cache snapshot of `state` / `hist` at a chunk boundary
     /// (ADR-012 step 2); absent when the prefix cache is disabled.
     snapshot: Option<(MetalBuffer, MetalBuffer)>,
+    /// `state` / `hist` after the first token of a speculative verify,
+    /// restored when its draft is rejected; absent without speculation.
+    rollback: Option<(MetalBuffer, MetalBuffer)>,
     qkv_out: MetalBuffer,
     conv_y: MetalBuffer,
     q: MetalBuffer,
@@ -547,7 +587,7 @@ impl GdnBlock {
     fn plan(
         s: &GatedDeltaNetSpec,
         src: &dyn WeightSource,
-        prefix_cache: bool,
+        opts: EngineOptions,
         p: &mut Plan,
     ) -> Result<()> {
         Self::check_supported(s)?;
@@ -558,10 +598,15 @@ impl GdnBlock {
             p.weights_f32(vector_len(src, v)?);
         }
         let (state, hist) = Self::state_elems(s);
-        let copies = if prefix_cache { 2 } else { 1 };
+        let copies = if opts.prefix_cache { 2 } else { 1 };
         for _ in 0..copies {
             p.state_f32(state);
             p.state_f32(hist);
+        }
+        if opts.mtp {
+            // Rollback buffers: rewritten by every verify, so scratch.
+            p.scratch_f32(state);
+            p.scratch_f32(hist);
         }
         for elems in Self::scratch_elems(s) {
             p.scratch_f32(elems);
@@ -574,15 +619,19 @@ impl GdnBlock {
         src: &dyn WeightSource,
         s: &GatedDeltaNetSpec,
         eps: f32,
-        prefix_cache: bool,
+        opts: EngineOptions,
     ) -> Result<Self> {
         Self::check_supported(s)?;
         let (state, hist) = Self::state_elems(s);
-        let snapshot = if prefix_cache {
-            Some((zeros(gpu, state)?, zeros(gpu, hist)?))
-        } else {
-            None
+        let pair = |on: bool| -> Result<Option<(MetalBuffer, MetalBuffer)>> {
+            Ok(if on {
+                Some((zeros(gpu, state)?, zeros(gpu, hist)?))
+            } else {
+                None
+            })
         };
+        let snapshot = pair(opts.prefix_cache)?;
+        let rollback = pair(opts.mtp)?;
         let [qkv_out, conv_y, q, k, v, z_out, alpha_out, beta_raw, beta_out, gate, o, gated] =
             Self::scratch_elems(s);
         Ok(Self {
@@ -598,6 +647,7 @@ impl GdnBlock {
             state: zeros(gpu, state)?,
             hist: zeros(gpu, hist)?,
             snapshot,
+            rollback,
             qkv_out: zeros(gpu, qkv_out)?,
             conv_y: zeros(gpu, conv_y)?,
             q: zeros(gpu, q)?,
@@ -641,6 +691,22 @@ impl GdnBlock {
         Ok(())
     }
 
+    /// Restore the state captured after the first token of the last
+    /// speculative verify (its draft was rejected).
+    fn roll_back(&self, gpu: &Qwen35Gpu) -> Result<()> {
+        let Some((rb_state, rb_hist)) = &self.rollback else {
+            return Err(TuckmillError::new(
+                ErrorCode::Internal,
+                "rollback requested on a block loaded without speculation",
+            ));
+        };
+        let ctx = gpu.context();
+        for (rb, live) in [(rb_state, &self.state), (rb_hist, &self.hist)] {
+            ctx.copy_f32(rb, 0, live, 0, (live.len() / 4) as u32)?;
+        }
+        Ok(())
+    }
+
     /// One token: `proj = mixer(h)`.
     fn decode(&self, gpu: &Qwen35Gpu, h: &MetalBuffer, proj: &MetalBuffer) -> Result<()> {
         self.qkv.gemv(gpu, h, &self.qkv_out)?;
@@ -659,18 +725,25 @@ impl GdnBlock {
         gpu: &Qwen35Gpu,
         s: &PrefillScratch,
         n: usize,
-        chunk_core: bool,
+        mode: ChunkMode,
     ) -> Result<()> {
         let ctx = gpu.context();
         let spec = &self.spec;
         let nn = n as u32;
-        self.qkv.gemm(gpu, &s.h, &s.a, nn)?;
-        self.z.gemm(gpu, &s.h, &s.b, nn)?;
-        self.alpha.gemm(gpu, &s.h, &s.c, nn)?;
-        self.beta.gemm(gpu, &s.h, &s.d, nn)?;
-        if chunk_core {
-            self.core_chunk(gpu, s, n)?;
-            return self.out.gemm(gpu, &s.e, &s.proj, nn);
+        let exact = mode.exact;
+        self.qkv.gemm(gpu, &s.h, &s.a, nn, exact)?;
+        self.z.gemm(gpu, &s.h, &s.b, nn, exact)?;
+        self.alpha.gemm(gpu, &s.h, &s.c, nn, exact)?;
+        self.beta.gemm(gpu, &s.h, &s.d, nn, exact)?;
+        if mode.chunk_core {
+            self.core_chunk(gpu, s, n, mode.capture)?;
+            return self.out.gemm(gpu, &s.e, &s.proj, nn, exact);
+        }
+        if mode.capture {
+            return Err(TuckmillError::new(
+                ErrorCode::Internal,
+                "rollback capture needs the chunk-wide core",
+            ));
         }
         let ch = spec.channels;
         let vz = spec.head_v * spec.dt_rank;
@@ -683,18 +756,47 @@ impl GdnBlock {
             self.core(gpu)?;
             ctx.copy_f32(&self.gated, 0, &s.e, (i * vz) as u32, vz as u32)?;
         }
-        self.out.gemm(gpu, &s.e, &s.proj, nn)
+        self.out.gemm(gpu, &s.e, &s.proj, nn, exact)
     }
 
     /// The core over all `n` chunk tokens at once, from the projected rows
     /// `s.a` (qkv), `s.b` (z), `s.c` (alpha), `s.d` (raw beta) to `s.e`
-    /// (gated), with exactly [`Self::core`]'s per-element arithmetic.
-    fn core_chunk(&self, gpu: &Qwen35Gpu, s: &PrefillScratch, n: usize) -> Result<()> {
+    /// (gated), with exactly [`Self::core`]'s per-element arithmetic. With
+    /// `capture`, the recurrent state and convolution history after the
+    /// first token are also written to the rollback buffers.
+    fn core_chunk(
+        &self,
+        gpu: &Qwen35Gpu,
+        s: &PrefillScratch,
+        n: usize,
+        capture: bool,
+    ) -> Result<()> {
         let ctx = gpu.context();
         let spec = &self.spec;
         let nn = n as u32;
         let key = (spec.groups * spec.state_size) as u32;
         let value = (spec.head_v * spec.dt_rank) as u32;
+        let rollback = if capture {
+            let Some(rb) = &self.rollback else {
+                return Err(TuckmillError::new(
+                    ErrorCode::Internal,
+                    "rollback capture on a block loaded without speculation",
+                ));
+            };
+            // History after token 0 = the history before the chunk shifted
+            // by token 0's input row.
+            ctx.copy_f32(&self.hist, 0, &rb.1, 0, (self.hist.len() / 4) as u32)?;
+            ctx.qwen35_conv_chunk_shift(
+                &rb.1,
+                &s.a,
+                spec.channels as u32,
+                spec.conv_kernel as u32,
+                1,
+            )?;
+            Some(rb)
+        } else {
+            None
+        };
         ctx.qwen35_conv_chunk(
             &self.hist,
             &s.a,
@@ -719,21 +821,41 @@ impl GdnBlock {
             spec.dt_rank as u32,
             nn,
         )?;
-        ctx.qwen35_gdn_chunk(
-            &s.gq,
-            &s.gk,
-            &s.gv,
-            &s.ggate,
-            &s.gbeta,
-            &self.state,
-            &s.gout,
-            spec.groups as u32,
-            spec.state_size as u32,
-            spec.head_v as u32,
-            1.0 / (spec.state_size as f32).sqrt(),
-            nn,
-            (key, value, spec.dt_rank as u32),
-        )?;
+        let q_scale = 1.0 / (spec.state_size as f32).sqrt();
+        let strides = (key, value, spec.dt_rank as u32);
+        match rollback {
+            Some(rb) => ctx.qwen35_gdn_chunk_snap(
+                &s.gq,
+                &s.gk,
+                &s.gv,
+                &s.ggate,
+                &s.gbeta,
+                &self.state,
+                &s.gout,
+                (&rb.0, 0),
+                spec.groups as u32,
+                spec.state_size as u32,
+                spec.head_v as u32,
+                q_scale,
+                nn,
+                strides,
+            )?,
+            None => ctx.qwen35_gdn_chunk(
+                &s.gq,
+                &s.gk,
+                &s.gv,
+                &s.ggate,
+                &s.gbeta,
+                &self.state,
+                &s.gout,
+                spec.groups as u32,
+                spec.state_size as u32,
+                spec.head_v as u32,
+                q_scale,
+                nn,
+                strides,
+            )?,
+        }
         gpu.gated_norm_dev(
             &s.gout,
             &s.b,
@@ -987,17 +1109,18 @@ impl AttentionBlock {
         s: &PrefillScratch,
         n: usize,
         pos0: u32,
-        chunk_core: bool,
+        mode: ChunkMode,
     ) -> Result<()> {
         let ctx = gpu.context();
         let spec = &self.spec;
         let nn = n as u32;
-        self.q_w.gemm(gpu, &s.h, &s.a, nn)?;
-        self.k_w.gemm(gpu, &s.h, &s.b, nn)?;
-        self.v_w.gemm(gpu, &s.h, &s.c, nn)?;
-        if chunk_core {
+        let exact = mode.exact;
+        self.q_w.gemm(gpu, &s.h, &s.a, nn, exact)?;
+        self.k_w.gemm(gpu, &s.h, &s.b, nn, exact)?;
+        self.v_w.gemm(gpu, &s.h, &s.c, nn, exact)?;
+        if mode.chunk_core {
             self.core_chunk(gpu, s, n, pos0)?;
-            return self.o_w.gemm(gpu, &s.e, &s.proj, nn);
+            return self.o_w.gemm(gpu, &s.e, &s.proj, nn, exact);
         }
         let aw = spec.heads * spec.head_dim;
         let qgw = if spec.output_gate { aw * 2 } else { aw };
@@ -1010,7 +1133,7 @@ impl AttentionBlock {
             self.core(gpu, pos0 + i as u32)?;
             ctx.copy_f32(&self.attn, 0, &s.e, (i * aw) as u32, aw as u32)?;
         }
-        self.o_w.gemm(gpu, &s.e, &s.proj, nn)
+        self.o_w.gemm(gpu, &s.e, &s.proj, nn, exact)
     }
 
     /// The core over all `n` chunk queries at positions `pos0..`, from the
@@ -1217,7 +1340,7 @@ impl Layer {
         p.scratch_f32(graph.hidden); // h2
         p.scratch_f32(graph.hidden); // proj
         match &spec.mixer {
-            MixerSpec::GatedDeltaNet(g) => GdnBlock::plan(g, src, opts.prefix_cache, p)?,
+            MixerSpec::GatedDeltaNet(g) => GdnBlock::plan(g, src, opts, p)?,
             MixerSpec::Attention(a) => AttentionBlock::plan(a, src, capacity, opts.kv, p)?,
         }
         SwiGluBlock::plan(&spec.ffn, graph.hidden, src, p)
@@ -1238,13 +1361,9 @@ impl Layer {
             h2: zeros(gpu, graph.hidden)?,
             proj: zeros(gpu, graph.hidden)?,
             mixer: match &spec.mixer {
-                MixerSpec::GatedDeltaNet(g) => Mixer::Gdn(Box::new(GdnBlock::load(
-                    gpu,
-                    src,
-                    g,
-                    graph.eps,
-                    opts.prefix_cache,
-                )?)),
+                MixerSpec::GatedDeltaNet(g) => {
+                    Mixer::Gdn(Box::new(GdnBlock::load(gpu, src, g, graph.eps, opts)?))
+                }
                 MixerSpec::Attention(a) => Mixer::Attention(Box::new(AttentionBlock::load(
                     gpu, src, a, graph.eps, capacity, opts.kv,
                 )?)),
@@ -1266,6 +1385,15 @@ impl Layer {
     fn copy_snapshot(&self, gpu: &Qwen35Gpu, save: bool) -> Result<()> {
         match &self.mixer {
             Mixer::Gdn(b) => b.copy_snapshot(gpu, save),
+            Mixer::Attention(_) => Ok(()),
+        }
+    }
+
+    /// Undo the second token of a rejected speculative verify (recurrent
+    /// layers; attention rows past the position are simply rewritten).
+    fn roll_back(&self, gpu: &Qwen35Gpu) -> Result<()> {
+        match &self.mixer {
+            Mixer::Gdn(b) => b.roll_back(gpu),
             Mixer::Attention(_) => Ok(()),
         }
     }
@@ -1298,19 +1426,181 @@ impl Layer {
         pos0: u32,
         hidden: usize,
         eps: f32,
-        chunk_core: bool,
+        mode: ChunkMode,
     ) -> Result<()> {
         let ctx = gpu.context();
         let nn = n as u32;
         ctx.rmsnorm(&s.x, &self.pre_norm, &s.h, nn, hidden as u32, eps)?;
         match &self.mixer {
-            Mixer::Gdn(b) => b.prefill(gpu, s, n, chunk_core)?,
-            Mixer::Attention(b) => b.prefill(gpu, s, n, pos0, chunk_core)?,
+            Mixer::Gdn(b) => b.prefill(gpu, s, n, mode)?,
+            Mixer::Attention(b) => b.prefill(gpu, s, n, pos0, mode)?,
         }
         ctx.f32_axpy(&s.proj, &s.x, 1.0, (n * hidden) as u32)?;
         ctx.rmsnorm(&s.x, &self.post_norm, &s.h2, nn, hidden as u32, eps)?;
-        self.ffn.prefill(gpu, s, n, hidden)
+        self.ffn.prefill(gpu, s, n, hidden, mode.exact)
     }
+}
+
+// --------------------------------------------------------------------- MTP --
+
+/// How the MTP head reads its inputs. The artifact does not record these
+/// conventions; they only change the draft (never the served output), so
+/// they are chosen by measured acceptance (ADR-012 step 3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MtpConvention {
+    /// `[enorm(e); hnorm(h)]` (true) or `[hnorm(h); enorm(e)]`.
+    pub embedding_first: bool,
+    /// The main hidden state after the model's final norm (true) or the
+    /// raw residual stream.
+    pub hidden_post_norm: bool,
+}
+
+impl Default for MtpConvention {
+    fn default() -> Self {
+        Self {
+            embedding_first: true,
+            hidden_post_norm: true,
+        }
+    }
+}
+
+/// Draft token slot and the two verify slots of [`MtpHead::ids`].
+const SLOT_DRAFT: u32 = 0;
+const SLOT_VERIFY: u32 = 1;
+
+/// The multi-token-prediction head and the buffers of speculative greedy
+/// decoding (ADR-012 step 3).
+struct MtpHead {
+    enorm: MetalBuffer,
+    hnorm: MetalBuffer,
+    final_norm: MetalBuffer,
+    eh_proj: Matrix,
+    /// One attention layer with its own KV rows (MTP positions).
+    layer: Layer,
+    /// `[PREFILL_BATCH, hidden]` next-token embeddings of the MTP rows.
+    e: MetalBuffer,
+    /// `[PREFILL_BATCH, hidden]` main hidden states of the MTP rows.
+    hin: MetalBuffer,
+    /// `[PREFILL_BATCH, 2 * hidden]` concatenated projection input.
+    cat: MetalBuffer,
+    /// `[2, hidden]` main hidden states of the rows the next draft runs.
+    hid: MetalBuffer,
+    /// Prefix-cache snapshot of `hid` row 0 (with the prefix cache).
+    hid_snap: Option<MetalBuffer>,
+    /// `[2, vocab]` verify logits.
+    logits: MetalBuffer,
+    /// Draft and verify token ids.
+    ids: MetalBuffer,
+}
+
+impl MtpHead {
+    fn scratch_elems(graph: &ModelGraph) -> [usize; 6] {
+        let (h, b) = (graph.hidden, PREFILL_BATCH);
+        [b * h, b * h, b * 2 * h, 2 * h, 2 * graph.vocab, 3]
+    }
+
+    fn plan(
+        spec: &super::graph::MtpSpec,
+        graph: &ModelGraph,
+        src: &dyn WeightSource,
+        capacity: usize,
+        opts: EngineOptions,
+        p: &mut Plan,
+    ) -> Result<()> {
+        for v in [spec.enorm, spec.hnorm, spec.final_norm] {
+            p.weights_f32(vector_len(src, v)?);
+        }
+        p.weights += Matrix::plan(src, spec.eh_proj)?;
+        // Everything else is an optional speculation buffer outside the
+        // planner's served-stack KV, so it is priced as workspace (the
+        // head's KV rows included).
+        let mut layer = Plan::default();
+        Layer::plan(&spec.layer, graph, src, capacity, opts, &mut layer)?;
+        p.weights += layer.weights;
+        p.scratch += layer.state + layer.scratch;
+        for elems in Self::scratch_elems(graph) {
+            p.scratch_f32(elems);
+        }
+        if opts.prefix_cache {
+            p.scratch_f32(graph.hidden);
+        }
+        Ok(())
+    }
+
+    fn load(
+        gpu: &Qwen35Gpu,
+        src: &dyn WeightSource,
+        spec: &super::graph::MtpSpec,
+        graph: &ModelGraph,
+        capacity: usize,
+        opts: EngineOptions,
+    ) -> Result<Self> {
+        let [e, hin, cat, hid, logits, ids] = Self::scratch_elems(graph);
+        Ok(Self {
+            enorm: vector(gpu, src, spec.enorm)?,
+            hnorm: vector(gpu, src, spec.hnorm)?,
+            final_norm: vector(gpu, src, spec.final_norm)?,
+            eh_proj: Matrix::load(gpu, src, spec.eh_proj)?,
+            layer: Layer::load(gpu, src, &spec.layer, graph, capacity, opts)?,
+            e: zeros(gpu, e)?,
+            hin: zeros(gpu, hin)?,
+            cat: zeros(gpu, cat)?,
+            hid: zeros(gpu, hid)?,
+            hid_snap: if opts.prefix_cache {
+                Some(zeros(gpu, graph.hidden)?)
+            } else {
+                None
+            },
+            logits: zeros(gpu, logits)?,
+            ids: zeros(gpu, ids)?,
+        })
+    }
+
+    /// Run `m` MTP rows at positions `pos0..` from `e` / `hin` (rows
+    /// `0..m`); the outputs are left in `s.x` rows `0..m`.
+    #[allow(clippy::too_many_arguments)]
+    fn rows(
+        &self,
+        gpu: &Qwen35Gpu,
+        s: &PrefillScratch,
+        m: usize,
+        pos0: u32,
+        main_final_norm: &MetalBuffer,
+        conv: MtpConvention,
+        hidden: usize,
+        eps: f32,
+    ) -> Result<()> {
+        let ctx = gpu.context();
+        let (mm, hh) = (m as u32, hidden as u32);
+        ctx.rmsnorm(&self.e, &self.enorm, &self.e, mm, hh, eps)?;
+        if conv.hidden_post_norm {
+            ctx.rmsnorm(&self.hin, main_final_norm, &self.hin, mm, hh, eps)?;
+        }
+        ctx.rmsnorm(&self.hin, &self.hnorm, &self.hin, mm, hh, eps)?;
+        let (e_off, h_off) = if conv.embedding_first {
+            (0, hh)
+        } else {
+            (hh, 0)
+        };
+        for r in 0..mm {
+            ctx.copy_f32(&self.e, r * hh, &self.cat, 2 * r * hh + e_off, hh)?;
+            ctx.copy_f32(&self.hin, r * hh, &self.cat, 2 * r * hh + h_off, hh)?;
+        }
+        self.eh_proj.gemm(gpu, &self.cat, &s.x, mm, false)?;
+        self.layer
+            .prefill(gpu, s, m, pos0, hidden, eps, ChunkMode::prefill(true))
+    }
+}
+
+/// One speculative greedy cycle's result: `first` is the main model's
+/// token after the input token (always committed); `second` follows it
+/// when the draft matched `first` (`accepted`). `None` tokens mean every
+/// logit was NaN.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SpecStep {
+    pub first: Option<u32>,
+    pub second: Option<u32>,
+    pub accepted: bool,
 }
 
 // ------------------------------------------------------------------ engine --
@@ -1336,6 +1626,10 @@ pub struct EngineOptions {
     /// boundary, so a request that extends the snapshotted prefix resumes
     /// there instead of prefilling it again.
     pub prefix_cache: bool,
+    /// Load the model's multi-token-prediction block and the buffers of
+    /// speculative greedy decoding (ADR-012 step 3). Refused for a graph
+    /// without an MTP block.
+    pub mtp: bool,
 }
 
 impl Default for EngineOptions {
@@ -1343,6 +1637,7 @@ impl Default for EngineOptions {
         Self {
             kv: KvCache::F16,
             prefix_cache: false,
+            mtp: false,
         }
     }
 }
@@ -1369,10 +1664,26 @@ pub fn alloc_plan_with(
     p.scratch_f32(ARGMAX_PARTIAL_BYTES / 4); // argmax partials
     p.scratch_f32(2); // token slots (pipelined greedy)
     PrefillScratch::plan(graph, capacity, &mut p);
+    if opts.mtp {
+        MtpHead::plan(mtp_spec(graph)?, graph, src, capacity, opts, &mut p)?;
+    }
     Ok(GpuAllocPlan {
         weights: p.weights,
         state: p.state,
         scratch: p.scratch,
+    })
+}
+
+fn mtp_spec(graph: &ModelGraph) -> Result<&super::graph::MtpSpec> {
+    graph.mtp.as_ref().ok_or_else(|| {
+        TuckmillError::new(
+            ErrorCode::UnsupportedArchitecture,
+            format!(
+                "{} artifact has no multi-token-prediction block; speculative decoding needs one",
+                graph.architecture
+            ),
+        )
+        .with_action("Serve without speculation; the draft head is never substituted.")
     })
 }
 
@@ -1406,6 +1717,13 @@ pub struct EngineModel {
     /// Whether the prefix cache was allocated (see [`EngineOptions`]).
     prefix_cache: bool,
     prefix: std::cell::RefCell<PrefixState>,
+    /// The draft head (with [`EngineOptions::mtp`]).
+    mtp: Option<MtpHead>,
+    /// Tokens of the MTP rows the next draft runs first (their hidden
+    /// states are `MtpHead::hid` rows); the last is the next input token.
+    /// Empty when speculation cannot continue the session.
+    mtp_pending: std::cell::RefCell<Vec<u32>>,
+    mtp_convention: std::cell::Cell<MtpConvention>,
 }
 
 /// The prefix cache's host-side bookkeeping. The snapshot is valid only
@@ -1486,6 +1804,18 @@ impl EngineModel {
         let argmax_partial = zeros(&gpu, ARGMAX_PARTIAL_BYTES / 4)?;
         let token_ids = zeros(&gpu, 2)?;
         let prefill = PrefillScratch::load(&gpu, &graph, capacity)?;
+        let mtp = if opts.mtp {
+            Some(MtpHead::load(
+                &gpu,
+                src,
+                mtp_spec(&graph)?,
+                &graph,
+                capacity,
+                opts,
+            )?)
+        } else {
+            None
+        };
         Ok(Self {
             gpu,
             layers,
@@ -1508,6 +1838,9 @@ impl EngineModel {
             chunk_core: std::cell::Cell::new(true),
             prefix_cache: opts.prefix_cache,
             prefix: Default::default(),
+            mtp,
+            mtp_pending: Default::default(),
+            mtp_convention: Default::default(),
         })
     }
 
@@ -1566,8 +1899,12 @@ impl EngineModel {
         self.prefill_in_flight.borrow_mut().clear();
         // Zeroing the KV planes invalidates the prefix snapshot.
         *self.prefix.borrow_mut() = PrefixState::default();
+        self.mtp_pending.borrow_mut().clear();
         for layer in &self.layers {
             layer.reset()?;
+        }
+        if let Some(mtp) = &self.mtp {
+            mtp.layer.reset()?;
         }
         self.positions.set(0);
         self.session_valid.set(true);
@@ -1605,11 +1942,12 @@ impl EngineModel {
         } else {
             self.drain()?;
             self.prefill_in_flight.borrow_mut().clear();
+            self.mtp_pending.borrow_mut().clear();
             let restore = || -> Result<()> {
                 for layer in &self.layers {
                     layer.copy_snapshot(&self.gpu, false)?;
                 }
-                Ok(())
+                self.mtp_snapshot(false)
             };
             if let Err(e) = self.gpu.grouped(restore) {
                 self.session_valid.set(false);
@@ -1631,6 +1969,189 @@ impl EngineModel {
 
     fn head(&self) -> &Matrix {
         self.head.as_ref().unwrap_or(&self.embedding)
+    }
+
+    /// Save or restore the MTP head's prefix state: the main hidden state
+    /// at the boundary's last position (its KV rows below stay in place).
+    fn mtp_snapshot(&self, save: bool) -> Result<()> {
+        let Some(mtp) = &self.mtp else {
+            return Ok(());
+        };
+        let Some(snap) = &mtp.hid_snap else {
+            return Err(TuckmillError::new(
+                ErrorCode::Internal,
+                "MTP prefix snapshot requested without the prefix cache",
+            ));
+        };
+        let ctx = self.gpu.context();
+        let hh = self.graph.hidden as u32;
+        if save {
+            ctx.copy_f32(&mtp.hid, 0, snap, 0, hh)
+        } else {
+            ctx.copy_f32(snap, 0, &mtp.hid, 0, hh)
+        }
+    }
+
+    /// Whether the session can continue with [`Self::speculate_greedy`].
+    pub fn can_speculate(&self) -> bool {
+        self.mtp.is_some()
+            && !self.mtp_pending.borrow().is_empty()
+            && self.positions.get() + 2 <= self.capacity
+    }
+
+    /// Choose the MTP input conventions (acceptance experiments). Drafts
+    /// change; served tokens never do.
+    pub fn set_mtp_convention(&self, conv: MtpConvention) {
+        self.mtp_convention.set(conv);
+    }
+
+    /// One speculative greedy cycle (ADR-012 step 3) after `token`, the
+    /// last token this session produced: the MTP head drafts the token
+    /// after next, then the main model verifies `[token, draft]` in one
+    /// chunk with the decode arithmetic (per-row GEMMs, the decode cores),
+    /// so `first` is bit-for-bit the token a decode step would choose, and
+    /// `second` (only when the draft equals `first`) the token the decode
+    /// step after it would choose. A rejected draft rolls the recurrent
+    /// state back to after `token`.
+    pub fn speculate_greedy(&self, token: u32) -> Result<SpecStep> {
+        self.speculate(token, None)
+    }
+
+    /// [`Self::speculate_greedy`] with a host-chosen draft instead of the
+    /// MTP head's (verification of accept and reject paths).
+    pub fn speculate_with_draft(&self, token: u32, draft: u32) -> Result<SpecStep> {
+        self.speculate(token, Some(draft))
+    }
+
+    fn speculate(&self, token: u32, forced: Option<u32>) -> Result<SpecStep> {
+        self.ensure_valid()?;
+        let Some(mtp) = &self.mtp else {
+            return Err(TuckmillError::new(
+                ErrorCode::InvalidRequest,
+                "speculation needs an engine loaded with the MTP head",
+            ));
+        };
+        let pending = self.mtp_pending.borrow().clone();
+        if pending.last() != Some(&token) {
+            return Err(TuckmillError::new(
+                ErrorCode::InvalidRequest,
+                "speculation must continue the session's last greedy token",
+            )
+            .with_action("Start speculation right after a greedy prefill or speculative step."));
+        }
+        let result = (|| {
+            let draft_check = forced.unwrap_or(0);
+            let p = self.check_tokens(&[token, draft_check])?;
+            let m = pending.len();
+            let (hidden, eps) = (self.graph.hidden, self.graph.eps);
+            let hh = hidden as u32;
+            let conv = self.mtp_convention.get();
+            let s = &self.prefill;
+            let ctx = self.gpu.context();
+            let encode = || -> Result<()> {
+                // Draft: the pending MTP rows end at position p - 1.
+                for (r, t) in pending.iter().enumerate() {
+                    self.embedding
+                        .row_into(&self.gpu, *t, &mtp.e, (r * hidden) as u32)?;
+                }
+                ctx.copy_f32(&mtp.hid, 0, &mtp.hin, 0, m as u32 * hh)?;
+                mtp.rows(
+                    &self.gpu,
+                    s,
+                    m,
+                    (p - m) as u32,
+                    &self.final_norm,
+                    conv,
+                    hidden,
+                    eps,
+                )?;
+                ctx.copy_f32(&s.x, (m as u32 - 1) * hh, &self.x, 0, hh)?;
+                ctx.rmsnorm(&self.x, &mtp.final_norm, &self.h, 1, hh, eps)?;
+                self.head().gemv(&self.gpu, &self.h, &self.logits_buf)?;
+                ctx.argmax_f32(
+                    &self.logits_buf,
+                    self.graph.vocab as u32,
+                    &self.argmax_partial,
+                    &mtp.ids,
+                    SLOT_DRAFT,
+                )?;
+                // Verify [token, draft] with the decode arithmetic.
+                self.embedding.row_into(&self.gpu, token, &s.x, 0)?;
+                match forced {
+                    Some(d) => self.embedding.row_into(&self.gpu, d, &s.x, hh)?,
+                    None => {
+                        self.embedding
+                            .row_indirect(&self.gpu, &mtp.ids, SLOT_DRAFT, &self.x)?;
+                        ctx.copy_f32(&self.x, 0, &s.x, hh, hh)?;
+                    }
+                }
+                let mode = ChunkMode {
+                    chunk_core: true,
+                    exact: true,
+                    capture: true,
+                };
+                for layer in &self.layers {
+                    layer.prefill(&self.gpu, s, 2, p as u32, hidden, eps, mode)?;
+                }
+                ctx.copy_f32(&s.x, 0, &mtp.hid, 0, 2 * hh)?;
+                ctx.rmsnorm(&s.x, &self.final_norm, &s.h, 2, hh, eps)?;
+                self.head().gemm(&self.gpu, &s.h, &mtp.logits, 2, true)?;
+                let vocab = self.graph.vocab as u32;
+                for r in 0..2u32 {
+                    ctx.copy_f32(&mtp.logits, r * vocab, &self.logits_buf, 0, vocab)?;
+                    ctx.argmax_f32(
+                        &self.logits_buf,
+                        vocab,
+                        &self.argmax_partial,
+                        &mtp.ids,
+                        SLOT_VERIFY + r,
+                    )?;
+                }
+                Ok(())
+            };
+            if self.grouped.get() {
+                self.gpu.grouped(encode)?;
+            } else {
+                encode()?;
+            }
+            let mut b = [0u8; 12];
+            mtp.ids.download(0, &mut b)?;
+            let id = |i: usize| {
+                let v = u32::from_le_bytes([b[4 * i], b[4 * i + 1], b[4 * i + 2], b[4 * i + 3]]);
+                (v != ARGMAX_NONE).then_some(v)
+            };
+            let draft = forced.or(id(SLOT_DRAFT as usize));
+            let (first, second) = (id(SLOT_VERIFY as usize), id(SLOT_VERIFY as usize + 1));
+            let accepted = first.is_some() && first == draft;
+            let mut next = self.mtp_pending.borrow_mut();
+            next.clear();
+            if accepted {
+                self.positions.set(p + 2);
+                if let (Some(a0), Some(a1)) = (first, second) {
+                    next.extend([a0, a1]);
+                }
+            } else {
+                // The queue orders the rollback before any later work.
+                self.gpu.grouped(|| {
+                    for layer in &self.layers {
+                        layer.roll_back(&self.gpu)?;
+                    }
+                    Ok(())
+                })?;
+                self.positions.set(p + 1);
+                next.extend(first);
+            }
+            Ok(SpecStep {
+                first,
+                second: if accepted { second } else { None },
+                accepted,
+            })
+        })();
+        if result.is_err() {
+            self.session_valid.set(false);
+            self.mtp_pending.borrow_mut().clear();
+        }
+        result
     }
 
     fn ensure_valid(&self) -> Result<()> {
@@ -1766,6 +2287,7 @@ impl EngineModel {
     /// [`Self::forward_token_greedy`].
     pub fn submit_greedy(&self, input: GreedyInput) -> Result<PendingToken> {
         self.ensure_valid()?;
+        self.mtp_pending.borrow_mut().clear();
         let result = (|| {
             let pos = match input {
                 GreedyInput::Token(t) => self.check_tokens(&[t])?,
@@ -1851,6 +2373,7 @@ impl EngineModel {
         mut on_stage: impl FnMut(Stage, &MetalBuffer) -> Result<()>,
     ) -> Result<()> {
         self.ensure_valid()?;
+        self.mtp_pending.borrow_mut().clear();
         let result = (|| {
             let pos = self.check_tokens(&[token])?;
             let (hidden, eps) = (self.graph.hidden, self.graph.eps);
@@ -1926,7 +2449,7 @@ impl EngineModel {
             let (hidden, eps) = (self.graph.hidden, self.graph.eps);
             let want_logits = !matches!(out, Out::None);
             let greedy = matches!(out, Out::Greedy(_));
-            let chunk_core = self.chunk_core.get();
+            let mode = ChunkMode::prefill(self.chunk_core.get());
             // Snapshot when this chunk ends exactly at the planned boundary
             // and the session holds the planned tokens up to it.
             let snapshot_here = {
@@ -1950,20 +2473,64 @@ impl EngineModel {
                         .row_into(&self.gpu, *token, &s.x, (i * hidden) as u32)?;
                 }
                 for layer in &self.layers {
-                    layer.prefill(&self.gpu, s, n, pos as u32, hidden, eps, chunk_core)?;
+                    layer.prefill(&self.gpu, s, n, pos as u32, hidden, eps, mode)?;
                 }
+                let ctx = self.gpu.context();
+                let hh = hidden as u32;
+                // MTP rows of this chunk (they reuse the prefill scratch, so
+                // their inputs are gathered first).
+                let mtp_rows = match &self.mtp {
+                    Some(mtp) => {
+                        // Row j pairs h(pos + j - 1) with token j; the first
+                        // prompt token has no hidden state before it.
+                        let first = usize::from(pos == 0);
+                        for (r, t) in tokens[first..].iter().enumerate() {
+                            self.embedding
+                                .row_into(&self.gpu, *t, &mtp.e, (r * hidden) as u32)?;
+                        }
+                        if first == 0 {
+                            ctx.copy_f32(&mtp.hid, 0, &mtp.hin, 0, hh)?;
+                        }
+                        if n > 1 {
+                            ctx.copy_f32(
+                                &s.x,
+                                0,
+                                &mtp.hin,
+                                (1 - first) as u32 * hh,
+                                (n - 1) as u32 * hh,
+                            )?;
+                        }
+                        ctx.copy_f32(&s.x, (n - 1) as u32 * hh, &mtp.hid, 0, hh)?;
+                        Some((mtp, n - first, pos + first - 1))
+                    }
+                    None => None,
+                };
                 if snapshot_here {
                     for layer in &self.layers {
                         layer.copy_snapshot(&self.gpu, true)?;
                     }
+                    self.mtp_snapshot(true)?;
                 }
                 if want_logits {
-                    let ctx = self.gpu.context();
-                    ctx.copy_f32(&s.x, ((n - 1) * hidden) as u32, &self.x, 0, hidden as u32)?;
-                    ctx.rmsnorm(&self.x, &self.final_norm, &self.h, 1, hidden as u32, eps)?;
+                    ctx.copy_f32(&s.x, ((n - 1) * hidden) as u32, &self.x, 0, hh)?;
+                    ctx.rmsnorm(&self.x, &self.final_norm, &self.h, 1, hh, eps)?;
                     self.head().gemv(&self.gpu, &self.h, &self.logits_buf)?;
                     if greedy {
                         self.encode_argmax(token_slot(pos + n - 1))?;
+                    }
+                }
+                if let Some((mtp, m, mpos)) = mtp_rows {
+                    if m > 0 {
+                        mtp.rows(
+                            &self.gpu,
+                            s,
+                            m,
+                            mpos as u32,
+                            &self.final_norm,
+                            self.mtp_convention.get(),
+                            hidden,
+                            eps,
+                        )?;
                     }
                 }
                 Ok(())
@@ -1973,9 +2540,19 @@ impl EngineModel {
             } else {
                 encode()?;
             }
+            // Speculation continues only after a greedy final chunk.
+            let mut spec_from = None;
             if want_logits {
                 // The download waits for all committed work.
-                self.deliver(out, pos + n - 1)?;
+                let greedy_out = match out {
+                    Out::Greedy(next) => {
+                        self.deliver(Out::Greedy(&mut *next), pos + n - 1)?;
+                        spec_from = *next;
+                        Ok(())
+                    }
+                    other => self.deliver(other, pos + n - 1),
+                };
+                greedy_out?;
                 self.prefill_in_flight.borrow_mut().clear();
             } else {
                 // Without logits nothing waits here: the queue orders the
@@ -1985,6 +2562,13 @@ impl EngineModel {
                     .push_back(self.gpu.context().committed_dispatches());
             }
             self.positions.set(pos + n);
+            {
+                let mut pending = self.mtp_pending.borrow_mut();
+                pending.clear();
+                if self.mtp.is_some() {
+                    pending.extend(spec_from);
+                }
+            }
             if snapshot_here {
                 let mut p = self.prefix.borrow_mut();
                 p.tokens = p.planned.take().unwrap_or_default();
@@ -3031,6 +3615,7 @@ mod qwen3_tests {
                 EngineOptions {
                     kv,
                     prefix_cache: false,
+                    mtp: false,
                 },
             )
             .unwrap();
@@ -3050,6 +3635,7 @@ mod qwen3_tests {
                 EngineOptions {
                     kv,
                     prefix_cache: false,
+                    mtp: false,
                 },
             )
             .unwrap();
@@ -3136,6 +3722,7 @@ mod qwen3_real_tests {
             EngineOptions {
                 kv,
                 prefix_cache: false,
+                mtp: false,
             },
         )
         .unwrap();
@@ -3148,6 +3735,7 @@ mod qwen3_real_tests {
             EngineOptions {
                 kv,
                 prefix_cache: false,
+                mtp: false,
             },
         )
         .unwrap();
@@ -3273,6 +3861,7 @@ mod prefix_cache_tests {
         let on = EngineOptions {
             kv: KvCache::F16,
             prefix_cache: true,
+            mtp: false,
         };
         let plan = alloc_plan_with(&graph, source, capacity, on).unwrap();
         let off_plan = alloc_plan_with(&graph, source, capacity, EngineOptions::default()).unwrap();
@@ -3383,5 +3972,273 @@ mod prefix_cache_tests {
         }
         let source = ArtifactTensorSource::open(&path).unwrap();
         check(&source, 90_000, 1000);
+    }
+}
+
+#[cfg(test)]
+mod mtp_tests {
+    use super::*;
+    use crate::qwen35_forward::{ArtifactTensorSource, TensorSource};
+    use tuckmill_manifest::testing::{write_synthetic, SyntheticConfig};
+
+    fn gpu_or_skip() -> bool {
+        if tuckmill_metal::probe().available {
+            return true;
+        }
+        assert!(
+            std::env::var("TUCKMILL_REQUIRE_METAL").is_err(),
+            "TUCKMILL_REQUIRE_METAL is set but no Metal device is available"
+        );
+        eprintln!("skipping: no Metal device");
+        false
+    }
+
+    fn bits(v: &[f32]) -> Vec<u32> {
+        v.iter().map(|x| x.to_bits()).collect()
+    }
+
+    fn load(source: &ArtifactTensorSource, capacity: usize) -> EngineModel {
+        let graph = crate::engine::adapters::qwen35(source.config(), source.layout());
+        let opts = EngineOptions {
+            mtp: true,
+            ..EngineOptions::default()
+        };
+        let plan = alloc_plan_with(&graph, source, capacity, opts).unwrap();
+        let off = alloc_plan_with(&graph, source, capacity, EngineOptions::default()).unwrap();
+        assert_eq!(plan.state, off.state, "speculation adds no planner KV");
+        assert!(plan.weights > off.weights && plan.scratch > off.scratch);
+        let model = EngineModel::load_with(
+            Qwen35Gpu::open().unwrap(),
+            graph,
+            source,
+            capacity,
+            plan.total(),
+            opts,
+        )
+        .unwrap();
+        assert_eq!(model.allocated_bytes(), plan.total(), "ledger == plan");
+        model
+    }
+
+    /// Greedy prefill of `prompt` (aligned chunks); the first generated token.
+    fn prefill(model: &EngineModel, prompt: &[u32]) -> u32 {
+        model.reset().unwrap();
+        let chunks: Vec<&[u32]> = prompt.chunks(PREFILL_BATCH).collect();
+        let mut first = None;
+        for (c, chunk) in chunks.iter().enumerate() {
+            if c + 1 == chunks.len() {
+                first = model.prefill_chunk_greedy(chunk).unwrap();
+            } else {
+                model.prefill_chunk(chunk, false, &mut Vec::new()).unwrap();
+            }
+        }
+        first.expect("finite logits")
+    }
+
+    /// Plain greedy decoding: `n` tokens after the prompt.
+    fn plain(model: &EngineModel, prompt: &[u32], n: usize) -> Vec<u32> {
+        let mut out = vec![prefill(model, prompt)];
+        while out.len() < n {
+            let t = *out.last().unwrap();
+            out.push(model.forward_token_greedy(t).unwrap().expect("finite"));
+        }
+        out
+    }
+
+    /// How a speculative run chooses its drafts.
+    #[derive(Clone, Copy, Debug)]
+    enum Drafts {
+        /// The MTP head's own.
+        Head,
+        /// The true next tokens (every draft accepted).
+        Oracle,
+        /// Always wrong (every draft rejected).
+        Wrong,
+        /// Right on even cycles, wrong on odd ones.
+        Alternating,
+    }
+
+    /// Speculative greedy decoding of at least `n` tokens; returns the
+    /// tokens and the number of accepted drafts over the cycles run.
+    fn speculative(
+        model: &EngineModel,
+        prompt: &[u32],
+        n: usize,
+        drafts: Drafts,
+        reference: &[u32],
+    ) -> (Vec<u32>, usize, usize) {
+        let mut out = vec![prefill(model, prompt)];
+        let (mut accepted, mut cycles) = (0, 0);
+        let vocab = model.graph().vocab as u32;
+        while out.len() < n {
+            let t = *out.last().unwrap();
+            let truth = reference[out.len()];
+            let step = match drafts {
+                Drafts::Head => model.speculate_greedy(t),
+                Drafts::Oracle => model.speculate_with_draft(t, truth),
+                Drafts::Wrong => model.speculate_with_draft(t, (truth + 1) % vocab),
+                Drafts::Alternating if cycles % 2 == 0 => model.speculate_with_draft(t, truth),
+                Drafts::Alternating => model.speculate_with_draft(t, (truth + 1) % vocab),
+            }
+            .unwrap();
+            cycles += 1;
+            out.push(step.first.expect("finite"));
+            if step.accepted {
+                accepted += 1;
+                out.push(step.second.expect("finite"));
+            } else {
+                assert_eq!(step.second, None, "a rejected cycle commits one token");
+            }
+            assert_eq!(
+                model.positions(),
+                prompt.len() + out.len() - 1,
+                "every committed token but the last is in the session"
+            );
+        }
+        (out, accepted, cycles)
+    }
+
+    /// ADR-012 step 3 gate: speculative greedy output is token-identical to
+    /// plain greedy decoding whatever the drafts, and the session state it
+    /// leaves (recurrent state after rollbacks, KV rows) gives bit-identical
+    /// logits on the next decode step.
+    fn check(source: &ArtifactTensorSource, prompts: &[Vec<u32>], n: usize, policies: &[Drafts]) {
+        let capacity = prompts.iter().map(Vec::len).max().unwrap() + n + 8;
+        let model = load(source, capacity);
+        for prompt in prompts {
+            let reference = plain(&model, prompt, n + 2);
+            for &drafts in policies {
+                let (out, accepted, cycles) = speculative(&model, prompt, n, drafts, &reference);
+                assert_eq!(
+                    out[..],
+                    reference[..out.len()],
+                    "prompt {}, {drafts:?}: tokens identical to plain greedy",
+                    prompt.len()
+                );
+                match drafts {
+                    Drafts::Oracle => assert_eq!(accepted, cycles),
+                    Drafts::Wrong => assert_eq!(accepted, 0),
+                    _ => {}
+                }
+                eprintln!(
+                    "prompt {}, {drafts:?}: {accepted}/{cycles} drafts accepted, {} tokens",
+                    prompt.len(),
+                    out.len()
+                );
+                // Next decode step from the speculative session vs a plain
+                // session that consumed the same tokens.
+                let last = *out.last().unwrap();
+                let mut spec_logits = Vec::new();
+                model.forward_token(last, &mut spec_logits).unwrap();
+                let _ = prefill(&model, prompt);
+                let mut plain_logits = Vec::new();
+                for t in &out {
+                    model.forward_token(*t, &mut plain_logits).unwrap();
+                }
+                assert_eq!(
+                    bits(&spec_logits),
+                    bits(&plain_logits),
+                    "prompt {}, {drafts:?}: state after speculation, bit for bit",
+                    prompt.len()
+                );
+            }
+        }
+        // The input conventions change only the drafts (ADR-012 step 3):
+        // every one stays token-identical; the acceptance rates printed
+        // here are what chose the default.
+        let reference = plain(&model, &prompts[0], n + 2);
+        for embedding_first in [true, false] {
+            for hidden_post_norm in [true, false] {
+                let conv = MtpConvention {
+                    embedding_first,
+                    hidden_post_norm,
+                };
+                model.set_mtp_convention(conv);
+                let (out, accepted, cycles) =
+                    speculative(&model, &prompts[0], n, Drafts::Head, &reference);
+                assert_eq!(
+                    out[..],
+                    reference[..out.len()],
+                    "{conv:?}: identical tokens"
+                );
+                eprintln!("{conv:?}: {accepted}/{cycles} drafts accepted");
+            }
+        }
+        model.set_mtp_convention(MtpConvention::default());
+        // Speculation continues only its own session.
+        let t = prefill(&model, &prompts[0]);
+        assert!(
+            model.speculate_greedy(t + 1).is_err(),
+            "wrong token refused"
+        );
+        let t = prefill(&model, &prompts[0]);
+        model.forward_token_greedy(t).unwrap();
+        assert!(!model.can_speculate(), "a plain step ends speculation");
+    }
+
+    #[test]
+    fn speculative_greedy_is_token_identical_on_the_fixture() {
+        if !gpu_or_skip() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("q35.gguf");
+        write_synthetic(&path, &SyntheticConfig::tiny_qwen35()).unwrap();
+        let source = ArtifactTensorSource::open(&path).unwrap();
+        let vocab = source.config().vocab as u32;
+        let prompts: Vec<Vec<u32>> = [1usize, 5, PREFILL_BATCH + 3]
+            .iter()
+            .map(|&len| {
+                (0..len as u32)
+                    .map(|i| (i * 37 + 5) % (vocab - 8))
+                    .collect()
+            })
+            .collect();
+        check(
+            &source,
+            &prompts,
+            24,
+            &[
+                Drafts::Head,
+                Drafts::Oracle,
+                Drafts::Wrong,
+                Drafts::Alternating,
+            ],
+        );
+    }
+
+    #[test]
+    fn speculative_greedy_is_token_identical_on_the_pinned_artifact() {
+        let Some(path) = std::env::var("TUCKMILL_QWEN35_GGUF")
+            .ok()
+            .map(std::path::PathBuf::from)
+            .filter(|p| p.exists())
+        else {
+            eprintln!("skipping: TUCKMILL_QWEN35_GGUF not set");
+            return;
+        };
+        if !gpu_or_skip() {
+            return;
+        }
+        let source = ArtifactTensorSource::open(&path).unwrap();
+        let prompts: Vec<Vec<u32>> = [7usize, PREFILL_BATCH + 40]
+            .iter()
+            .map(|&len| {
+                (0..len as u32)
+                    .map(|i| 1000 + (i * 7919 + 13) % 90_000)
+                    .collect()
+            })
+            .collect();
+        check(
+            &source,
+            &prompts,
+            64,
+            &[
+                Drafts::Head,
+                Drafts::Oracle,
+                Drafts::Wrong,
+                Drafts::Alternating,
+            ],
+        );
     }
 }

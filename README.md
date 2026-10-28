@@ -31,7 +31,7 @@ statements in [docs/claims.md](docs/claims.md).
   loaded at runtime, never vendored, and is both the comparison oracle and
   the speed baseline.
 - **Not built yet**: GPU partial residency and streaming, MoE execution,
-  speculative decoding, prefix caching, K-quant kernels.
+  K-quant kernels, speculative sampling (greedy speculation is built).
 - **Hardware exercised**: one MacBook Air M3 8 GB. Other tiers are pending.
 
 ### Measured against llama.cpp (Qwen3.5-0.8B Q8_0, M3 8 GB)
@@ -115,6 +115,7 @@ constrained machines, not the architecture.
 | Governor: Normal / Constrained / Paused / Draining / Failed, driven by real memory-pressure and thermal signals | ✅ |
 | Qwen3.5 hybrid on Metal (unified engine): Gated DeltaNet and gated attention, packed f16 KV, batched prefill, device greedy sampling | ✅ experimental; chat and raw completion (pinned 0.8B and 2B templates, text-only subset, thinking off by default) |
 | Prefix cache (unified engine, ADR-012): a prompt that extends the previous request's prefix resumes from a snapshot, bit-identical to a cold prefill | ✅ experimental; 984-token chat 0.87-0.93 s cold vs 0.33-0.37 s on a hit (0.8B, indicative); off in `bench` |
+| MTP speculative greedy decoding (unified engine, ADR-012): `--speculative` drafts with the artifact's MTP head and verifies with the decode arithmetic, token-identical to plain greedy | ✅ experimental; 0.8B decode 98-101 vs 76-78 tok/s plain, TTFT +4% (`bench` 512/256, ignore-EOS, indicative); the 2B has no MTP block |
 | Dense Qwen3 on Metal (unified engine): f32 or packed f16 KV, batched prefill, device greedy sampling | ✅ experimental; qualified on the pinned Qwen3-0.6B (CPU oracle and llama.cpp envelopes) |
 | Dense Qwen3 on CPU: scalar f32 oracle and NEON Q8_0/F16 kernel, bounded weight streaming | ✅ experimental |
 | Formats executed | CPU: F32, F16, BF16, Q8_0, Q4_0, Q4_1. Metal: Q8_0, F16. K-quants and IQ formats are refused |
@@ -162,13 +163,13 @@ native/llamaref     narrow C shim over pinned llama.cpp
 kernels/            kernel work-package registry
 adapters/           model-family adapter specs
 benchmarks/         standard-v1 workload and per-tier results
-docs/adr/           architecture decisions (ADR-001..011)
+docs/adr/           architecture decisions (ADR-001..012)
 scripts/            build, test, demo, fetch-llama, bench-baseline
 ```
 
 ## Verification
 
-`scripts/test.sh` is the gate (490 tests at this revision). It runs
+`scripts/test.sh` is the gate (497 tests at this revision). It runs
 formatting, `clippy -D warnings` and the full suite:
 - adversarial GGUF and Safetensors fixtures;
 - planner math, governor semantics and import fault injection;

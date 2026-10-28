@@ -341,6 +341,21 @@ int tm_metal_qwen35_gdn_chunk(tm_metal_ctx *ctx, tm_metal_buffer *q, tm_metal_bu
                               uint32_t k_dim, uint32_t v_dim, float q_scale, uint32_t n,
                               uint32_t qk_stride, uint32_t v_stride, uint32_t g_stride,
                               char *err, size_t err_cap);
+/* tm_metal_qwen35_gdn_chunk that also writes the state after token `snap_t`
+ * (0 <= snap_t < n) to `snap` (same shape as `state`): the rollback point of
+ * a speculative verify. Arithmetic and outputs are those of the plain call. */
+int tm_metal_qwen35_gdn_chunk_snap(tm_metal_ctx *ctx, tm_metal_buffer *q, tm_metal_buffer *k,
+                                   tm_metal_buffer *v, tm_metal_buffer *gate,
+                                   tm_metal_buffer *beta, tm_metal_buffer *state,
+                                   tm_metal_buffer *out, tm_metal_buffer *snap, uint32_t snap_t,
+                                   uint32_t heads, uint32_t k_dim, uint32_t v_dim, float q_scale,
+                                   uint32_t n, uint32_t qk_stride, uint32_t v_stride,
+                                   uint32_t g_stride, char *err, size_t err_cap);
+/* Shift a convolution history [kern-1, channels] by the n rows of `x` (the
+ * history refresh of tm_metal_qwen35_conv_chunk on its own). */
+int tm_metal_qwen35_conv_chunk_shift(tm_metal_ctx *ctx, tm_metal_buffer *hist,
+                                     tm_metal_buffer *x, uint32_t channels, uint32_t kern,
+                                     uint32_t n, char *err, size_t err_cap);
 
 /* Chunk-wide gated attention core (engine prefill): RoPE, packed f16 KV
  * store and causal attention for `n` tokens at positions pos0..pos0+n-1,

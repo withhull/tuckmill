@@ -43,6 +43,11 @@ pub struct ExecutionOptions {
     /// cache hits.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prefix_cache: Option<bool>,
+    /// TuckCore speculative greedy decoding with the artifact's MTP head
+    /// (ADR-012 step 3; engine default off). Greedy output is
+    /// token-identical to plain decoding.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub speculative: Option<bool>,
 }
 
 impl ExecutionOptions {
@@ -88,6 +93,12 @@ impl ExecutionOptions {
                     return Err(TuckmillError::new(
                         ErrorCode::InvalidRequest,
                         "the prefix cache option applies to the tuckcore engine",
+                    ));
+                }
+                if self.speculative.is_some() {
+                    return Err(TuckmillError::new(
+                        ErrorCode::InvalidRequest,
+                        "--speculative applies to the tuckcore engine (MTP speculative decoding)",
                     ));
                 }
                 if let Some(n) = self.gpu_layers {
@@ -144,6 +155,9 @@ impl ExecutionOptions {
                 }
                 if let Some(v) = self.prefix_cache {
                     obj.insert("prefix_cache".into(), Value::from(v));
+                }
+                if let Some(v) = self.speculative {
+                    obj.insert("speculative".into(), Value::from(v));
                 }
             }
             EngineKind::LlamaCpp => {

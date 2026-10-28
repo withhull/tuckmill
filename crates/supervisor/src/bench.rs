@@ -413,6 +413,12 @@ pub fn run_standard_bench(
                 .into(),
         );
     }
+    if runtime.execution_options().speculative == Some(true) {
+        caveats.push(
+            "TuckCore speculative greedy decoding (MTP head, ADR-012 step 3): output tokens are identical to plain greedy decoding; decode throughput depends on the draft acceptance rate of this workload"
+                .into(),
+        );
+    }
     if options.ignore_eos {
         caveats.push(
             "ignore-EOS workload: the model's end-of-sequence token did not end generation, so every engine generated the full output count; decode throughput is comparable, output text past EOS is not meaningful"

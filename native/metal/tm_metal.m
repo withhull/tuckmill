@@ -2044,6 +2044,24 @@ int tm_metal_qwen35_conv_chunk(tm_metal_ctx *ctx, tm_metal_buffer *hist, tm_meta
                             "qwen35_conv_chunk_shift");
 }
 
+int tm_metal_qwen35_conv_chunk_shift(tm_metal_ctx *ctx, tm_metal_buffer *hist,
+                                     tm_metal_buffer *x, uint32_t channels, uint32_t kern,
+                                     uint32_t n, char *err, size_t err_cap) {
+    if (channels == 0 || kern < 2 || n == 0) {
+        return tm_fail(err, err_cap, TM_METAL_ERR_UNSUPPORTED,
+                       @"qwen35_conv_chunk_shift: channels, n must be positive and kernel >= 2");
+    }
+    size_t row = (size_t)channels * 4u;
+    tm_arg_buffer bufs[2] = {
+        {hist, (size_t)(kern - 1u) * row, "conv_chunk_shift.hist"},
+        {x, (size_t)n * row, "conv_chunk_shift.x"},
+    };
+    uint32_t consts[3] = {channels, kern, n};
+    return tm_dispatch_args(ctx, ctx->pso_q35_conv_chunk_shift, bufs, 2, consts, 3,
+                            MTLSizeMake(channels, 1, 1), MTLSizeMake(64, 1, 1), err, err_cap,
+                            "qwen35_conv_chunk_shift");
+}
+
 int tm_metal_qwen35_split_qkv_chunk(tm_metal_ctx *ctx, tm_metal_buffer *y, tm_metal_buffer *q,
                                     tm_metal_buffer *k, tm_metal_buffer *v, uint32_t width,
                                     uint32_t n, char *err, size_t err_cap) {
@@ -2095,12 +2113,27 @@ int tm_metal_qwen35_gdn_chunk(tm_metal_ctx *ctx, tm_metal_buffer *q, tm_metal_bu
                               uint32_t k_dim, uint32_t v_dim, float q_scale, uint32_t n,
                               uint32_t qk_stride, uint32_t v_stride, uint32_t g_stride,
                               char *err, size_t err_cap) {
+    /* No rollback point: the state buffer stands in for the snapshot and
+     * snap_t never matches. */
+    return tm_metal_qwen35_gdn_chunk_snap(ctx, q, k, v, gate, beta, state, out, state, UINT32_MAX,
+                                          heads, k_dim, v_dim, q_scale, n, qk_stride, v_stride,
+                                          g_stride, err, err_cap);
+}
+
+int tm_metal_qwen35_gdn_chunk_snap(tm_metal_ctx *ctx, tm_metal_buffer *q, tm_metal_buffer *k,
+                                   tm_metal_buffer *v, tm_metal_buffer *gate,
+                                   tm_metal_buffer *beta, tm_metal_buffer *state,
+                                   tm_metal_buffer *out, tm_metal_buffer *snap, uint32_t snap_t,
+                                   uint32_t heads, uint32_t k_dim, uint32_t v_dim, float q_scale,
+                                   uint32_t n, uint32_t qk_stride, uint32_t v_stride,
+                                   uint32_t g_stride, char *err, size_t err_cap) {
     if (heads == 0 || k_dim == 0 || v_dim == 0 || n == 0 || qk_stride < heads * k_dim ||
-        v_stride < heads * v_dim || g_stride < heads) {
+        v_stride < heads * v_dim || g_stride < heads ||
+        (snap_t != UINT32_MAX && snap_t >= n)) {
         return tm_fail(err, err_cap, TM_METAL_ERR_UNSUPPORTED,
-                       @"qwen35_gdn_chunk: invalid geometry or strides");
+                       @"qwen35_gdn_chunk: invalid geometry, strides or rollback token");
     }
-    tm_arg_buffer bufs[7] = {
+    tm_arg_buffer bufs[8] = {
         {q, (size_t)n * qk_stride * 4u, "gdn_chunk.q"},
         {k, (size_t)n * qk_stride * 4u, "gdn_chunk.k"},
         {v, (size_t)n * v_stride * 4u, "gdn_chunk.v"},
@@ -2108,12 +2141,14 @@ int tm_metal_qwen35_gdn_chunk(tm_metal_ctx *ctx, tm_metal_buffer *q, tm_metal_bu
         {beta, (size_t)n * g_stride * 4u, "gdn_chunk.beta"},
         {state, (size_t)heads * k_dim * v_dim * 4u, "gdn_chunk.state"},
         {out, (size_t)n * v_stride * 4u, "gdn_chunk.out"},
+        {snap, (size_t)heads * k_dim * v_dim * 4u, "gdn_chunk.snap"},
     };
-    /* Constants by buffer index: 7 k_dim, 8 v_dim, 9 q_scale (f32 bits),
-     * 10 heads, 11 n, 12-14 strides. */
+    /* Constants by buffer index: 8 k_dim, 9 v_dim, 10 q_scale (f32 bits),
+     * 11 heads, 12 n, 13-15 strides, 16 snap_t (the token after which the
+     * state is also written to `snap`; UINT32_MAX: never). */
     uint32_t scale_bits;
     memcpy(&scale_bits, &q_scale, sizeof scale_bits);
-    uint32_t consts[8] = {k_dim, v_dim, scale_bits, heads, n, qk_stride, v_stride, g_stride};
+    uint32_t consts[9] = {k_dim, v_dim, scale_bits, heads, n, qk_stride, v_stride, g_stride, snap_t};
     /* Register-resident state column, split across TM_GDN_LANES lanes,
      * when the key dimension has an instantiation (see kernels.metal). */
     const bool reg = k_dim == 128u && (v_dim % (32u / TM_GDN_LANES)) == 0u &&
@@ -2122,7 +2157,7 @@ int tm_metal_qwen35_gdn_chunk(tm_metal_ctx *ctx, tm_metal_buffer *q, tm_metal_bu
     NSUInteger lanes = reg ? (NSUInteger)v_dim * TM_GDN_LANES : (NSUInteger)v_dim;
     /* The lane-split kernel maps lanes in whole SIMD groups of 32. */
     NSUInteger tg = lanes < 32u ? lanes : 32u;
-    return tm_dispatch_args(ctx, pso, bufs, 7, consts, 8, MTLSizeMake(lanes, heads, 1),
+    return tm_dispatch_args(ctx, pso, bufs, 8, consts, 9, MTLSizeMake(lanes, heads, 1),
                             MTLSizeMake(tg, 1, 1), err, err_cap, "qwen35_gdn_chunk");
 }
 

@@ -85,6 +85,24 @@ pub struct LayerSpec {
     pub ffn: FfnSpec,
 }
 
+/// A multi-token-prediction head (ADR-012 step 3): from the main model's
+/// hidden state at position i and the embedding of token i+1, it drafts
+/// token i+2. Drafts are only proposals; the main model verifies every one,
+/// so the served output never depends on this head.
+#[derive(Debug, Clone, PartialEq)]
+pub struct MtpSpec {
+    /// Norm of the next token's embedding.
+    pub enorm: Tensor,
+    /// Norm of the main model's hidden state.
+    pub hnorm: Tensor,
+    /// `[enorm(e); hnorm(h)]` (2 x hidden) -> hidden.
+    pub eh_proj: Tensor,
+    /// One transformer layer with its own KV.
+    pub layer: LayerSpec,
+    /// Norm before the shared output head.
+    pub final_norm: Tensor,
+}
+
 /// The complete served computation of a model.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ModelGraph {
@@ -99,5 +117,7 @@ pub struct ModelGraph {
     pub final_norm: Tensor,
     /// Output projection; the embedding itself when the artifact ties them.
     pub head: Tensor,
+    /// Draft head for speculative decoding, when the artifact carries one.
+    pub mtp: Option<MtpSpec>,
     pub eos_token_id: Option<u32>,
 }
