@@ -45,6 +45,10 @@ prompt tokens, 512 tokens in and 256 out, ABBA rounds. Two idle runs at
 | Time to first token | 0.272 s (both runs) | 0.269-0.300 s | 94-106% of llama.cpp per pair |
 | Decode | 84.2-84.3 tok/s | 66.8-84.7 tok/s | 0.99-1.26× per pair |
 
+- **Rerun at `ab44d68`** (0.8B, idle Mac, pressure normal): decode 82.4
+  vs 67.4 tok/s (paired 1.23), time to first token 0.279 vs 0.287 s
+  (paired 0.99): unchanged by Gemma 3, the lifecycle work and the
+  attention-window kernels.
 - **Gemma 3 1B Q8_0** (one run, f16 KV, ignore-EOS): decode 57.1 vs
   63.7 tok/s (paired 0.896), time to first token 368 vs 331 ms (paired
   1.11×). Just under the 90% decode bar, before any tuning.
