@@ -78,7 +78,17 @@ pub struct RuntimeOptions {
     /// compared against this request after every load, and a substitution
     /// fails closed.
     pub execution: crate::options::ExecutionOptions,
+    /// How long an idle loaded model stays resident (ADR-012 step 4);
+    /// `None` keeps it until it must make room or the runtime shuts down,
+    /// zero unloads it after each request.
+    pub keep_alive: Option<Duration>,
+    /// Most models resident at once; every load is also admitted against
+    /// the residency budget (the default budget).
+    pub max_loaded_models: usize,
 }
+
+/// Default keep-alive of an idle loaded model.
+pub const DEFAULT_KEEP_ALIVE: Duration = Duration::from_secs(300);
 
 impl Default for RuntimeOptions {
     fn default() -> Self {
@@ -98,6 +108,8 @@ impl Default for RuntimeOptions {
             monitor: true,
             allow_test_engine: false,
             execution: crate::options::ExecutionOptions::default(),
+            keep_alive: Some(DEFAULT_KEEP_ALIVE),
+            max_loaded_models: 1,
         }
     }
 }
@@ -207,6 +219,29 @@ pub struct RuntimeStatus {
     /// Worker spawns (model loads). Equivalent consecutive requests keep
     /// this flat; see the loaded-model key (B4).
     pub worker_generation: u64,
+    /// Resident models, least recently used first (ADR-012 step 4).
+    pub loaded_models: Vec<LoadedModelStatus>,
+}
+
+/// One resident model in [`RuntimeStatus`].
+#[derive(Debug, Clone, Serialize)]
+pub struct LoadedModelStatus {
+    pub artifact_id: String,
+    pub pid: u32,
+    /// The load plan's admitted total (R + U + H) charged to the residency
+    /// budget while this model stays loaded.
+    pub charged_bytes: u64,
+    /// Milliseconds since this model last served a request.
+    pub idle_ms: u64,
+}
+
+/// Lock-free view of a resident worker (status never waits on a run).
+#[derive(Debug, Clone)]
+struct ResidentEntry {
+    artifact_id: String,
+    pid: u32,
+    charged_bytes: u64,
+    last_used: Instant,
 }
 
 pub struct Runtime {
@@ -226,7 +261,12 @@ pub struct Runtime {
     engine_kind: EngineKind,
     pub(crate) worker_exe: PathBuf,
     in_process: Mutex<ReferenceTestEngine>,
-    worker: Mutex<Option<WorkerSlot>>,
+    /// Resident workers, least recently used first (ADR-012 step 4).
+    worker: Mutex<Vec<WorkerSlot>>,
+    /// Snapshot of `worker` for status and the idle check.
+    residents: Mutex<Vec<ResidentEntry>>,
+    keep_alive: Option<Duration>,
+    max_loaded_models: usize,
     pub policy: PlannerPolicy,
     pub default_budget: Bytes,
     pub default_context: u64,
@@ -361,6 +401,9 @@ struct WorkerSlot {
     /// the backend allocates KV per request). Reuse requires it to fit the
     /// current plan's KV reservation.
     retained_state_bytes: u64,
+    /// The load plan's admitted total, charged to the residency budget.
+    charged_bytes: u64,
+    last_used: Instant,
 }
 
 /// Stable identity of a loaded model in a worker (B4). Built from immutable
@@ -432,6 +475,12 @@ impl Runtime {
             ));
         }
         options.execution.validate(options.engine_kind)?;
+        if options.max_loaded_models == 0 {
+            return Err(TuckmillError::new(
+                ErrorCode::InvalidConfiguration,
+                "max_loaded_models must be at least 1",
+            ));
+        }
         let layout = match options.data_dir {
             Some(dir) => StoreLayout::open(dir),
             None => StoreLayout::resolve()?,
@@ -477,7 +526,10 @@ impl Runtime {
                 std::env::current_exe().unwrap_or_else(|_| PathBuf::from("tuckmill"))
             }),
             in_process: Mutex::new(ReferenceTestEngine::new()),
-            worker: Mutex::new(None),
+            worker: Mutex::new(Vec::new()),
+            residents: Mutex::new(Vec::new()),
+            keep_alive: options.keep_alive,
+            max_loaded_models: options.max_loaded_models,
             policy: options.policy,
             default_budget,
             default_context: options.default_context,
@@ -621,7 +673,95 @@ impl Runtime {
             device: self.device.clone(),
             worker_pid: self.worker_pid(),
             worker_generation: self.worker_generation(),
+            loaded_models: self
+                .residents
+                .lock()
+                .expect("residents lock")
+                .iter()
+                .map(|e| LoadedModelStatus {
+                    artifact_id: e.artifact_id.clone(),
+                    pid: e.pid,
+                    charged_bytes: e.charged_bytes,
+                    idle_ms: e.last_used.elapsed().as_millis() as u64,
+                })
+                .collect(),
         }
+    }
+
+    /// Publish the resident set (caller holds the worker lock): the status
+    /// snapshot, and the monitored pid (the most recently used worker).
+    fn publish_residents(&self, slots: &[WorkerSlot]) {
+        *self.residents.lock().expect("residents lock") = slots
+            .iter()
+            .map(|s| ResidentEntry {
+                artifact_id: s.key.artifact_id.as_str().to_string(),
+                pid: s.worker.pid(),
+                charged_bytes: s.charged_bytes,
+                last_used: s.last_used,
+            })
+            .collect();
+        let pid = slots.last().map_or(0, |s| s.worker.pid());
+        self.worker_pid.store(pid, Ordering::Relaxed);
+    }
+
+    /// Stop a resident worker (its process exits and releases its memory).
+    fn unload(&self, slot: WorkerSlot, reason: &str) {
+        self.logger.info(
+            "MODEL_UNLOADED",
+            [
+                (
+                    "artifact_id".to_string(),
+                    serde_json::json!(slot.key.artifact_id.as_str()),
+                ),
+                ("pid".to_string(), serde_json::json!(slot.worker.pid())),
+                ("reason".to_string(), serde_json::json!(reason)),
+                (
+                    "charged_bytes".to_string(),
+                    serde_json::json!(slot.charged_bytes),
+                ),
+            ]
+            .into_iter()
+            .collect(),
+        );
+        drop(slot);
+    }
+
+    /// Unload every idle resident model now. `None` when a generation holds
+    /// the workers (nothing is idle to unload; this never waits on it).
+    pub fn unload_idle(&self) -> Option<usize> {
+        let mut slots = self.worker.try_lock().ok()?;
+        let n = slots.len();
+        for slot in slots.drain(..) {
+            self.unload(slot, "request");
+        }
+        self.publish_residents(&slots);
+        Some(n)
+    }
+
+    /// Unload residents idle past the keep-alive (monitor; non-blocking).
+    fn unload_expired(&self) {
+        let Some(keep) = self.keep_alive else {
+            return;
+        };
+        let expired = self
+            .residents
+            .lock()
+            .expect("residents lock")
+            .iter()
+            .any(|e| e.last_used.elapsed() >= keep);
+        if !expired {
+            return;
+        }
+        let Ok(mut slots) = self.worker.try_lock() else {
+            return; // a generation is running; its worker is not idle
+        };
+        let (keep_slots, gone): (Vec<_>, Vec<_>) =
+            slots.drain(..).partition(|s| s.last_used.elapsed() < keep);
+        *slots = keep_slots;
+        for slot in gone {
+            self.unload(slot, "idle");
+        }
+        self.publish_residents(&slots);
     }
 
     /// Gate execution per selected backend:
@@ -660,8 +800,8 @@ impl Runtime {
 
     /// Measured backend statistics from the live worker, when one exists.
     pub fn backend_stats(&self) -> Option<BackendStats> {
-        let mut slot = self.worker.lock().ok()?;
-        let slot = slot.as_mut()?;
+        let mut slots = self.worker.lock().ok()?;
+        let slot = slots.last_mut()?;
         match slot.worker.stats() {
             Ok((_, _, backend)) => backend,
             Err(_) => None,
@@ -681,8 +821,8 @@ impl Runtime {
     /// May wait for the worker lock: streaming paths must use the run-scoped
     /// snapshot (`ActiveRun::identity`) instead, never this.
     pub fn engine_identity(&self) -> tuckmill_manifest::records::EngineIdentity {
-        if let Ok(slot) = self.worker.lock() {
-            if let Some(s) = slot.as_ref() {
+        if let Ok(slots) = self.worker.lock() {
+            if let Some(s) = slots.last() {
                 return worker_identity(&s.worker);
             }
         }
@@ -991,12 +1131,12 @@ impl Runtime {
         let prompt_len = request.prompt_tokens.len() as u64;
         match self.engine_mode {
             EngineMode::Isolated => {
-                let mut slot = self.worker.lock().expect("worker lock");
+                let mut slots = self.worker.lock().expect("worker lock");
                 let load_options = self.execution.load_json(self.engine_kind);
                 let requested =
                     LoadedModelKey::new(self.engine_kind, plan, artifact, load_options.as_ref());
-                let need_spawn = match slot.as_ref() {
-                    Some(w) => {
+                let reusable = |w: &WorkerSlot| -> bool {
+                    {
                         let identity_ok = w.key.satisfies(&requested);
                         let retention_ok = reuse_fits_retained(
                             plan,
@@ -1047,14 +1187,54 @@ impl Runtime {
                                 .collect(),
                             );
                         }
-                        !identity_ok || !retention_ok
+                        identity_ok && retention_ok
                     }
-                    None => true,
                 };
-                if need_spawn {
-                    if let Some(old) = slot.take() {
-                        drop(old);
+                if let Some(index) = slots.iter().position(&reusable) {
+                    // Most recently used goes last.
+                    let slot = slots.remove(index);
+                    slots.push(slot);
+                    // Warm reuse: the loaded model identity and prepared
+                    // capacities satisfy this request; no reload, no new
+                    // session state (KV state is allocated per request).
+                    self.logger.info(
+                        "WORKER_REUSED",
+                        [
+                            ("request_id".to_string(), serde_json::json!(request_id)),
+                            (
+                                "prepared_context".to_string(),
+                                serde_json::json!(requested.prepared_context_total),
+                            ),
+                        ]
+                        .into_iter()
+                        .collect(),
+                    );
+                } else {
+                    // A resident of the same model that cannot serve this
+                    // plan is replaced, never loaded twice.
+                    let (stale, others): (Vec<_>, Vec<_>) = slots
+                        .drain(..)
+                        .partition(|w| w.key.artifact_id == requested.artifact_id);
+                    *slots = others;
+                    for old in stale {
+                        self.unload(old, "reload");
                     }
+                    // Residency admission (ADR-012 step 4): the residents'
+                    // charges plus this load's fit the residency budget and
+                    // the count fits the cap, else idle residents leave
+                    // least recently used first.
+                    let charge = plan.budget.admitted_total().bytes();
+                    loop {
+                        let held: u64 = slots.iter().map(|w| w.charged_bytes).sum();
+                        let over_count = slots.len() >= self.max_loaded_models;
+                        let over_budget = held.saturating_add(charge) > self.default_budget.bytes();
+                        if slots.is_empty() || !(over_count || over_budget) {
+                            break;
+                        }
+                        let lru = slots.remove(0);
+                        self.unload(lru, if over_count { "capacity" } else { "budget" });
+                    }
+                    self.publish_residents(&slots);
                     set_state("warming");
                     let mut worker = IsolatedWorker::spawn(
                         &self.worker_exe,
@@ -1137,42 +1317,31 @@ impl Runtime {
                             .into_iter()
                             .collect(),
                     );
-                    self.worker_pid.store(worker.pid(), Ordering::Relaxed);
-                    *slot = Some(WorkerSlot {
+                    slots.push(WorkerSlot {
                         key: requested,
                         retained_weight_bytes: retained_weight,
                         retained_workspace_bytes: retained_workspace,
                         retained_state_bytes: retained_state,
+                        charged_bytes: charge,
+                        last_used: Instant::now(),
                         worker,
                     });
-                } else {
-                    // Warm reuse: the loaded model identity and prepared
-                    // capacities satisfy this request; no reload, no new
-                    // session state (KV state is allocated per request).
-                    self.logger.info(
-                        "WORKER_REUSED",
-                        [
-                            ("request_id".to_string(), serde_json::json!(request_id)),
-                            (
-                                "prepared_context".to_string(),
-                                serde_json::json!(requested.prepared_context_total),
-                            ),
-                        ]
-                        .into_iter()
-                        .collect(),
-                    );
                 }
+                if let Some(last) = slots.last_mut() {
+                    last.last_used = Instant::now();
+                }
+                self.publish_residents(&slots);
                 // Every request — fresh load or warm reuse — attaches the
                 // live worker's control queue to its own scoped holder, so a
                 // governor command reaches the backend even when the worker
                 // was reused (Gate B review: the reuse branch used to leave
                 // it None and throttling was labelled without a command).
                 if let Ok(mut slot_controls) = controls.lock() {
-                    *slot_controls = Some(slot.as_ref().expect("worker slot").worker.controls());
+                    *slot_controls = Some(slots.last().expect("worker slot").worker.controls());
                 }
                 // Publish the resolved identity for streaming consumers.
-                let _ = identity.set(worker_identity(&slot.as_ref().expect("worker slot").worker));
-                let WorkerSlot { worker, .. } = slot.as_mut().expect("worker slot");
+                let _ = identity.set(worker_identity(&slots.last().expect("worker slot").worker));
+                let WorkerSlot { worker, .. } = slots.last_mut().expect("worker slot");
                 let mut token_tx = |index: u64, text: &str| -> bool {
                     // Interim status only (release ordinal, not a token
                     // count); the authoritative visible-token count arrives
@@ -1204,6 +1373,16 @@ impl Runtime {
                     &mut on_state,
                 )?;
                 committed.store(outcome.committed, Ordering::Relaxed);
+                if let Some(last) = slots.last_mut() {
+                    last.last_used = Instant::now();
+                }
+                if self.keep_alive == Some(Duration::ZERO) {
+                    if let Some(last) = slots.pop() {
+                        self.unload(last, "idle");
+                    }
+                }
+                self.publish_residents(&slots);
+                drop(slots);
                 self.finish_run(
                     request_id, session_id, plan, prompt_len, &outcome, started, tx,
                 )?;
@@ -1328,6 +1507,7 @@ impl Runtime {
             if stop.load(Ordering::Relaxed) {
                 break;
             }
+            self.unload_expired();
             let now = Instant::now();
             let pressure = self.signals.pressure();
             let thermal = self.signals.thermal();
@@ -1467,10 +1647,11 @@ impl Runtime {
         if let Some(handle) = self.monitor_thread.lock().expect("monitor lock").take() {
             let _ = handle.join();
         }
-        if let Some(slot) = self.worker.lock().expect("worker lock").take() {
-            drop(slot);
+        let mut slots = self.worker.lock().expect("worker lock");
+        for slot in slots.drain(..) {
+            self.unload(slot, "shutdown");
         }
-        self.worker_pid.store(0, Ordering::Relaxed);
+        self.publish_residents(&slots);
     }
 }
 
@@ -1572,6 +1753,8 @@ mod tests {
             },
             monitor: true,
             allow_test_engine: kind == EngineKind::ReferenceTest,
+            keep_alive: Some(crate::runtime::DEFAULT_KEEP_ALIVE),
+            max_loaded_models: 1,
         })
         .unwrap();
         (dir, runtime, signals)
@@ -1758,6 +1941,227 @@ mod tests {
             !earlier.satisfies(&tampered),
             "artifact identity change must force a reload"
         );
+    }
+
+    /// A runtime over two distinct fixture artifacts ("a", "b") with the
+    /// given lifecycle settings (ADR-012 step 4).
+    fn lifecycle_runtime(
+        worker_exe: PathBuf,
+        keep_alive: Option<Duration>,
+        max_loaded_models: usize,
+        budget: Bytes,
+    ) -> (tempfile::TempDir, Arc<Runtime>) {
+        let dir = tempfile::tempdir().unwrap();
+        let layout = StoreLayout::open(dir.path().join("store"));
+        let registry = AdapterRegistry::builtin().unwrap();
+        for alias in ["a", "b"] {
+            let src = dir.path().join(format!("{alias}.gguf"));
+            let mut cfg = SyntheticConfig::tiny_qwen3();
+            cfg.name = format!("lifecycle-{alias}");
+            write_synthetic(&src, &cfg).unwrap();
+            tuckmill_store::import::import_local(
+                &layout,
+                &registry,
+                &src,
+                &tuckmill_store::import::ImportOptions {
+                    alias: Some(alias.into()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        }
+        let runtime = Runtime::open(RuntimeOptions {
+            data_dir: Some(layout.root().to_path_buf()),
+            engine_mode: EngineMode::Isolated,
+            engine_kind: EngineKind::ReferenceTest,
+            worker_exe: Some(worker_exe),
+            queue_capacity: 2,
+            default_budget: Some(budget),
+            signal_source: Some(Arc::new(MockSignalSource::new())),
+            governor_poll: Duration::from_millis(30),
+            allow_test_engine: true,
+            keep_alive,
+            max_loaded_models,
+            ..Default::default()
+        })
+        .unwrap();
+        (dir, runtime)
+    }
+
+    /// The load plan of `alias` at the runtime's default budget.
+    fn lifecycle_plan(
+        runtime: &Runtime,
+        alias: &str,
+    ) -> (ExecutionPlan, tuckmill_backend::ArtifactRef) {
+        let (artifact, adapter) = runtime.resolve_artifact(alias).unwrap();
+        let plan = runtime
+            .plan_for(&artifact, &adapter, runtime.default_budget, 2048, 64)
+            .unwrap();
+        let id = aliases::resolve_reference(&runtime.layout, alias).unwrap();
+        let record = aliases::load_manifest(&runtime.layout, &id).unwrap();
+        let artifact_ref = tuckmill_backend::ArtifactRef::from_record(
+            &record,
+            &runtime.layout.artifact_payload_path(&record.artifact_id),
+        );
+        (plan, artifact_ref)
+    }
+
+    fn lifecycle_run(runtime: &Arc<Runtime>, alias: &str) {
+        let (plan, artifact_ref) = lifecycle_plan(runtime, alias);
+        let ticket = runtime.submit().unwrap();
+        let run = runtime
+            .start_run(
+                &ticket,
+                plan,
+                artifact_ref,
+                RunRequest::greedy(vec![5, 6], 3),
+            )
+            .unwrap();
+        let (reason, committed) = collect_run(&run, |_, _| {});
+        assert_eq!((reason, committed), (FinishReason::Length, 3), "{alias}");
+    }
+
+    fn loaded(runtime: &Runtime) -> Vec<String> {
+        runtime
+            .status()
+            .loaded_models
+            .into_iter()
+            .map(|m| m.artifact_id)
+            .collect()
+    }
+
+    fn artifact_id(runtime: &Runtime, alias: &str) -> String {
+        aliases::resolve_reference(&runtime.layout, alias)
+            .unwrap()
+            .as_str()
+            .to_string()
+    }
+
+    /// ADR-012 step 4: an idle model unloads after its keep-alive (the
+    /// worker process exits) and the next request loads it again; a zero
+    /// keep-alive unloads after every request.
+    #[test]
+    fn idle_models_unload_after_keep_alive_and_reload_on_demand() {
+        let Some(worker_exe) = crate::test_worker_bin() else {
+            return;
+        };
+        let (_dir, runtime) = lifecycle_runtime(
+            worker_exe.clone(),
+            Some(Duration::from_millis(200)),
+            1,
+            Bytes::parse("2GiB").unwrap(),
+        );
+        lifecycle_run(&runtime, "a");
+        assert_eq!(loaded(&runtime), vec![artifact_id(&runtime, "a")]);
+        let pid = runtime.worker_pid().expect("a live worker");
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !loaded(&runtime).is_empty() {
+            assert!(Instant::now() < deadline, "idle model never unloaded");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(runtime.worker_pid(), None);
+        // The worker process is gone (signal 0 probes existence).
+        // SAFETY: kill(2) with signal 0 sends nothing.
+        let alive = unsafe { libc::kill(pid as i32, 0) } == 0;
+        assert!(!alive, "the unloaded worker process exited");
+        lifecycle_run(&runtime, "a");
+        assert_eq!(runtime.worker_generation(), 2, "reloaded on demand");
+        runtime.shutdown();
+
+        let (_dir, runtime) = lifecycle_runtime(
+            worker_exe,
+            Some(Duration::ZERO),
+            1,
+            Bytes::parse("2GiB").unwrap(),
+        );
+        for i in 1..=3 {
+            lifecycle_run(&runtime, "a");
+            assert!(loaded(&runtime).is_empty(), "keep-alive 0 unloads at once");
+            assert_eq!(runtime.worker_generation(), i);
+        }
+        runtime.shutdown();
+    }
+
+    /// ADR-012 step 4: models stay resident together up to the cap and the
+    /// residency budget; past either, the least recently used idle model
+    /// leaves; an explicit unload empties the set.
+    #[test]
+    fn resident_set_respects_the_model_cap_and_the_budget() {
+        let Some(worker_exe) = crate::test_worker_bin() else {
+            return;
+        };
+        let two_gib = Bytes::parse("2GiB").unwrap();
+        let (a, b) = {
+            let (_dir, probe) = lifecycle_runtime(worker_exe.clone(), None, 2, two_gib);
+            let ids = (artifact_id(&probe, "a"), artifact_id(&probe, "b"));
+            probe.shutdown();
+            ids
+        };
+
+        // Cap 2, budget fits both: alternating requests load each once.
+        let (_dir, runtime) = lifecycle_runtime(worker_exe.clone(), None, 2, two_gib);
+        for alias in ["a", "b", "a", "b"] {
+            lifecycle_run(&runtime, alias);
+        }
+        assert_eq!(runtime.worker_generation(), 2, "both stay resident");
+        assert_eq!(loaded(&runtime), vec![a.clone(), b.clone()], "LRU order");
+        let charged: u64 = runtime
+            .status()
+            .loaded_models
+            .iter()
+            .map(|m| m.charged_bytes)
+            .sum();
+        assert!(charged <= two_gib.bytes(), "the set fits the budget");
+        assert_eq!(runtime.unload_idle(), Some(2));
+        assert!(loaded(&runtime).is_empty());
+        runtime.shutdown();
+
+        // Cap 1: every switch unloads the other model.
+        let (_dir, runtime) = lifecycle_runtime(worker_exe.clone(), None, 1, two_gib);
+        for alias in ["a", "b", "a"] {
+            lifecycle_run(&runtime, alias);
+        }
+        assert_eq!(runtime.worker_generation(), 3);
+        assert_eq!(loaded(&runtime), vec![a.clone()]);
+        runtime.shutdown();
+
+        // Cap 2 but a budget that holds only one of them: the budget wins.
+        let tight = {
+            let (_dir, probe) = lifecycle_runtime(worker_exe.clone(), None, 2, two_gib);
+            let ca = lifecycle_plan(&probe, "a")
+                .0
+                .budget
+                .admitted_total()
+                .bytes();
+            let cb = lifecycle_plan(&probe, "b")
+                .0
+                .budget
+                .admitted_total()
+                .bytes();
+            probe.shutdown();
+            Bytes(ca.max(cb) + (ca.min(cb) / 2))
+        };
+        let (_dir, runtime) = lifecycle_runtime(worker_exe, None, 2, tight);
+        let ca = lifecycle_plan(&runtime, "a")
+            .0
+            .budget
+            .admitted_total()
+            .bytes();
+        let cb = lifecycle_plan(&runtime, "b")
+            .0
+            .budget
+            .admitted_total()
+            .bytes();
+        assert!(
+            ca <= tight.bytes() && cb <= tight.bytes() && ca + cb > tight.bytes(),
+            "budget {tight} holds one model ({ca}, {cb}) but not both"
+        );
+        lifecycle_run(&runtime, "a");
+        lifecycle_run(&runtime, "b");
+        assert_eq!(loaded(&runtime), vec![b], "a left to make room");
+        assert_eq!(runtime.worker_generation(), 2);
+        runtime.shutdown();
+        let _ = a;
     }
 
     #[test]

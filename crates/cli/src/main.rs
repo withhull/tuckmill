@@ -164,6 +164,14 @@ enum Cmd {
         /// Start and exit immediately (used by tests to validate binding).
         #[arg(long, hide = true)]
         probe_only: bool,
+        /// How long an idle loaded model stays resident: a duration such as
+        /// 30s, 5m or 1h, 0 to unload after every request, or forever.
+        #[arg(long, default_value = "5m")]
+        keep_alive: String,
+        /// Most models resident at once (each load is also admitted against
+        /// the memory budget; idle models leave least recently used first).
+        #[arg(long, default_value_t = 1)]
+        max_loaded_models: usize,
         /// llama.cpp GPU offload layers (Metal performance baseline ONLY;
         /// never for arithmetic diagnostics). Requires --engine llama.
         #[arg(long)]

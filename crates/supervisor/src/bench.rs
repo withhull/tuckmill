@@ -643,6 +643,8 @@ mod tests {
             },
             monitor: true,
             allow_test_engine: true,
+            keep_alive: Some(crate::runtime::DEFAULT_KEEP_ALIVE),
+            max_loaded_models: 1,
         })
         .unwrap();
         (dir, runtime)

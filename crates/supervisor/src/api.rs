@@ -469,6 +469,25 @@ fn handle_connection(
             );
             Ok(())
         }
+        ("POST", "/control/unload") => {
+            // Unload every idle resident model now (ADR-012 step 4). A
+            // running generation is never interrupted: its worker is busy.
+            match runtime.unload_idle() {
+                Some(n) => {
+                    let _ =
+                        respond_json(&mut stream, 200, "OK", &serde_json::json!({"unloaded": n}));
+                }
+                None => respond_error(
+                    &mut stream,
+                    &TuckmillError::new(
+                        ErrorCode::QueueFull,
+                        "a generation is running; its model is not idle",
+                    )
+                    .with_action("Retry after the active request finishes, or cancel it first."),
+                ),
+            }
+            Ok(())
+        }
         ("POST", "/control/cancel") => {
             let cancelled = runtime.cancel_active();
             let _ = respond_json(

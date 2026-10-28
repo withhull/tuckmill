@@ -190,3 +190,51 @@ honest labels, and the unified engine.
 - **Not done.** Pipelined cycles (the host waits for each one), more than
   one draft token, rollback by buffer swap instead of copy, and exact
   rejection sampling for sampled requests.
+
+## Step 4 design (2026-10-28): model lifecycle
+
+- **Resident set.** The supervisor holds a set of loaded workers (one
+  process each), most recently used last, instead of one slot. A request
+  reuses a resident worker under the existing rules (loaded-model key
+  plus retained allocations that fit the current plan). One generation
+  runs at a time, as before.
+- **Admission of the set.** Each resident is charged its load plan's full
+  admitted total (R + U + H). A new load is admitted only when the
+  residents' charges plus its own fit the residency budget (the runtime's
+  default budget B) and the count fits `--max-loaded-models` (default 1).
+  Otherwise idle residents are unloaded least recently used first until
+  it fits. A plan that does not fit B alone is refused as before, so
+  eviction never makes room by truncating anything.
+- **Keep-alive.** `serve --keep-alive` (default 5m; `0` unloads after each
+  request; `forever` never unloads). The monitor unloads idle residents
+  past their keep-alive with a non-blocking lock, so control paths never
+  wait on a generation. `POST /control/unload` unloads every idle
+  resident now.
+- **Observability.** `/control/status` lists the loaded models (artifact,
+  pid, charged bytes, idle time) from a snapshot that needs no worker
+  lock. Every load and unload is logged with its reason (`idle`,
+  `capacity`, `budget`, `request`, `shutdown`).
+- **Not in this step.** Unloading on memory-pressure signals, and
+  per-request keep-alive fields (the chat schema stays the strict
+  OpenAI subset).
+
+## Step 4 record (2026-10-28): model lifecycle
+
+- **Code.** `Runtime` holds a resident set of workers (least recently
+  used first) with `RuntimeOptions { keep_alive, max_loaded_models }`;
+  `serve --keep-alive 5m|0|forever --max-loaded-models N`;
+  `POST /control/unload`; `loaded_models` in `/control/status`;
+  `MODEL_UNLOADED` log entries with their reason.
+- **Gate:**
+  - isolated-worker tests: an idle model unloads after a 200 ms
+    keep-alive, its process exits, and the next request reloads it.
+    Keep-alive 0 unloads after every request.
+  - cap 2 with a budget that fits both: alternating requests load each
+    model once (generation 2, LRU order). Cap 1: every switch reloads.
+    Cap 2 with a budget sized for one model: the budget unloads the
+    other. `unload_idle` empties the set.
+  - keep-alive parsing unit test; `scripts/test.sh`: all checks passed
+    (501 tests).
+- **Real model** (pinned 0.8B through `serve --keep-alive 3s`, one chat
+  request): resident at 1.58 GB charged against the 2 GiB budget, then
+  unloaded 2-4 s idle (2 s monitor poll), logged with reason `idle`.

@@ -83,7 +83,7 @@ tuckmill plan my-model                             # admission, mode, assumption
 tuckmill run my-model --prompt "..." --engine tuckcore --kernels metal
 tuckmill verify my-model --reference               # TuckCore vs llama.cpp logits
 tuckmill bench my-model --engine tuckcore          # labeled benchmark record
-tuckmill serve --engine tuckcore --kernels metal   # loopback API (127.0.0.1:8378)
+tuckmill serve --engine tuckcore --kernels metal   # loopback API (127.0.0.1:8378); --keep-alive 5m
 scripts/bench-baseline.sh model.gguf               # ABBA: TuckCore vs llama.cpp
 ```
 
@@ -118,6 +118,7 @@ constrained machines, not the architecture.
 | Governor: Normal / Constrained / Paused / Draining / Failed, driven by real memory-pressure and thermal signals | ✅ |
 | Qwen3.5 hybrid on Metal (unified engine): Gated DeltaNet and gated attention, packed f16 KV, batched prefill, device greedy sampling | ✅ experimental; chat and raw completion (pinned 0.8B and 2B templates, text-only subset, thinking off by default) |
 | Prefix cache (unified engine, ADR-012): a prompt that extends the previous request's prefix resumes from a snapshot, bit-identical to a cold prefill | ✅ experimental; 984-token chat 0.87-0.93 s cold vs 0.33-0.37 s on a hit (0.8B, indicative); off in `bench` |
+| Model lifecycle (ADR-012): `serve --keep-alive 5m` unloads idle models; `--max-loaded-models N` keeps several resident only when they fit the budget together, unloading the least recently used first; `POST /control/unload` | ✅ experimental |
 | MTP speculative greedy decoding (unified engine, ADR-012): `--speculative` drafts with the artifact's MTP head and verifies with the decode arithmetic, token-identical to plain greedy | ✅ experimental; 0.8B decode 98-101 vs 76-78 tok/s plain, TTFT +4% (`bench` 512/256, ignore-EOS, indicative); the 2B has no MTP block |
 | Dense Qwen3 on Metal (unified engine): f32 or packed f16 KV, batched prefill, device greedy sampling | ✅ experimental; qualified on the pinned Qwen3-0.6B (CPU oracle and llama.cpp envelopes) |
 | Dense Qwen3 on CPU: scalar f32 oracle and NEON Q8_0/F16 kernel, bounded weight streaming | ✅ experimental |
@@ -172,7 +173,7 @@ scripts/            build, test, demo, fetch-llama, bench-baseline
 
 ## Verification
 
-`scripts/test.sh` is the gate (498 tests at this revision). It runs
+`scripts/test.sh` is the gate (501 tests at this revision). It runs
 formatting, `clippy -D warnings` and the full suite:
 - adversarial GGUF and Safetensors fixtures;
 - planner math, governor semantics and import fault injection;
